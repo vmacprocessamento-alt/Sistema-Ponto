@@ -488,8 +488,16 @@ class _FakeDocument:
     def set(self, data):
         self._store.setdefault(self._collection, {})[self.id] = dict(data)
 
+    def create(self, data):
+        if self.id in self._store.setdefault(self._collection, {}):
+            raise main.AlreadyExists("documento ja existe")
+        self.set(data)
+
     def update(self, data):
         self._store[self._collection][self.id].update(data)
+
+    def delete(self):
+        self._store.setdefault(self._collection, {}).pop(self.id, None)
 
 
 class _FakeQuery:
@@ -503,13 +511,22 @@ class _FakeQuery:
     def where(self, field, op, value):
         return _FakeQuery(self._store, self._collection, self._filters + ((field, op, value),))
 
+    @staticmethod
+    def _matches(doc_id, data, field, op, value):
+        # "__name__" compara o id do documento (o valor e uma referencia).
+        if field == "__name__":
+            current, value = doc_id, value.id
+        else:
+            current = data.get(field)
+        if op == "==":
+            return current == value
+        if current is None:
+            return False
+        return current <= value if op == "<=" else current >= value
+
     def stream(self):
         for doc_id, data in list(self._store.setdefault(self._collection, {}).items()):
-            ok = True
-            for field, op, value in self._filters:
-                current = data.get(field)
-                ok = ok and (current == value if op == "==" else current is not None and current >= value)
-            if ok:
+            if all(self._matches(doc_id, data, *item) for item in self._filters):
                 yield _FakeSnapshot(self._store, self._collection, doc_id)
 
     def document(self, doc_id=None):
@@ -986,6 +1003,520 @@ class ExcelExportTest(unittest.TestCase):
         self.assertIsNone(ws["A37"].value)
         self.assertIsNone(ws["I37"].value)
         self.assert_signature_block(ws)
+
+
+@needs_main
+class DailyEntryTest(unittest.TestCase):
+    """Modo diaria: uma diaria por pessoa por dia, pelo relogio do servidor."""
+
+    user = {"id": "u1", "role": "employee", "name": "Diarista", "daily_mode": True}
+
+    def setUp(self):
+        self.db = _FakeDb()
+        patches = [
+            mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+            mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.now = main._local_now().replace(microsecond=0)
+
+    def add(self, user=None, **payload):
+        return asyncio.run(main.create_daily_entry_endpoint(
+            main.DailyEntryRequest(**payload), user or self.user,
+        ))
+
+    def entries(self):
+        return self.db.store.get("daily_entries", {})
+
+    def test_only_daily_mode_users(self):
+        for user in ({**self.user, "daily_mode": False}, {"id": "u2", "role": "employee"}):
+            with self.assertRaises(main.HTTPException) as ctx:
+                self.add(user)
+            self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(self.entries(), {})
+
+    def test_one_entry_per_day(self):
+        first = self.add()
+        self.assertEqual(first["status"], "created")
+        today = self.now.date().isoformat()
+        self.assertEqual(first["date"], today)
+        self.assertEqual(list(self.entries()), [f"u1_{today}"])
+        # A hora mandada pelo app nao vale fora do offline: o dia e o do servidor.
+        second = self.add(timestamp="2020-01-01T08:00:00")
+        self.assertEqual(second["status"], "existing")
+        self.assertEqual(second["registered_at"], first["registered_at"])
+        self.assertEqual(len(self.entries()), 1)
+
+    def test_offline_entry_counts_on_the_tap_day(self):
+        yesterday = self.now - timedelta(days=1)
+        response = self.add(offline=True, timestamp=yesterday.isoformat())
+        self.assertEqual(response["status"], "created")
+        self.assertEqual(response["date"], yesterday.date().isoformat())
+        self.assertTrue(response["synced_from_offline"])
+        # Reenvio da fila: a mesma diaria.
+        self.assertEqual(self.add(offline=True, timestamp=yesterday.isoformat())["status"], "existing")
+
+    def test_offline_entry_outside_window_is_refused(self):
+        for at in (self.now - timedelta(days=8), self.now + timedelta(hours=1), None):
+            with self.assertRaises(main.HTTPException) as ctx:
+                self.add(offline=True, timestamp=at.isoformat() if at else None)
+            self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(self.entries(), {})
+
+    def test_list_reads_only_the_period_of_the_user(self):
+        store = self.db.store.setdefault("daily_entries", {})
+        for user_id, day in (("u1", "2026-09-28"), ("u1", "2026-10-01"), ("u1", "2026-10-15"),
+                             ("u1", "2026-10-29"), ("u2", "2026-10-02")):
+            store[f"{user_id}_{day}"] = {"user_id": user_id, "date": day}
+
+        def listing(user, **params):
+            return asyncio.run(main.list_daily_entries_endpoint(user=user, **params))["entries"]
+
+        own = listing(self.user, start="2026-09-29", end="2026-10-28")
+        self.assertEqual([entry["date"] for entry in own], ["2026-10-01", "2026-10-15"])
+        admin = {"id": "a1", "role": "admin"}
+        other = listing(admin, start="2026-09-29", end="2026-10-28", user_id="u2")
+        self.assertEqual([entry["id"] for entry in other], ["u2_2026-10-02"])
+        for params in ({"user_id": "u2"}, {"start": "2026-10-28", "end": "2026-10-01"},
+                       {"start": "2026-10-xx"}):
+            with self.assertRaises(main.HTTPException):
+                listing(self.user, **{"start": "2026-10-01", "end": "2026-10-28", **params})
+
+
+@needs_main
+class AdminDailyEntryTest(unittest.TestCase):
+    """Admin lanca e apaga diarias, com motivo e auditoria."""
+
+    admin = {"id": "a1", "role": "admin", "name": "Admin", "email": "a@x"}
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.db.store["users"] = {"u1": {"name": "Diarista", "role": "employee", "daily_mode": True}}
+        patches = [
+            mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+            mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.today = main._local_now().date()
+
+    def add(self, day, admin=None, user_id="u1", reason="esqueceu de marcar"):
+        payload = main.AdminDailyEntryCreateRequest(user_id=user_id, date=day.isoformat(), reason=reason)
+        return asyncio.run(main.admin_create_daily_entry_endpoint(payload, admin or self.admin))
+
+    def delete(self, entry_id, admin=None, reason="marcou por engano"):
+        payload = main.AdminDailyEntryDeleteRequest(reason=reason)
+        return asyncio.run(main.admin_delete_daily_entry_endpoint(entry_id, payload, admin or self.admin))
+
+    def status_of(self, call, *args, **kwargs):
+        with self.assertRaises(main.HTTPException) as ctx:
+            call(*args, **kwargs)
+        return ctx.exception.status_code
+
+    def audits(self):
+        return list(self.db.store.get("system_audits", {}).values())
+
+    def test_admin_adds_past_day_once(self):
+        day = self.today - timedelta(days=3)
+        response = self.add(day)
+        entry_id = f"u1_{day.isoformat()}"
+        self.assertEqual(response["id"], entry_id)
+        stored = self.db.store["daily_entries"][entry_id]
+        self.assertTrue(stored["created_by_admin"])
+        self.assertEqual((stored["user_name"], stored["admin_reason"]), ("Diarista", "esqueceu de marcar"))
+        self.assertEqual(self.audits()[0]["action"], "admin_add_daily_entry")
+        # O mesmo dia de novo: ja existe.
+        self.assertEqual(self.status_of(self.add, day), 409)
+
+    def test_add_refuses_future_unknown_user_blank_reason_and_manager(self):
+        self.assertEqual(self.status_of(self.add, self.today + timedelta(days=1)), 400)
+        self.assertEqual(self.status_of(self.add, self.today, user_id="nao-existe"), 404)
+        self.assertEqual(self.status_of(self.add, self.today, reason="  "), 400)
+        manager = {"id": "g1", "role": "manager", "name": "Gestor"}
+        self.assertEqual(self.status_of(self.add, self.today, admin=manager), 403)
+        self.assertNotIn("daily_entries", {k for k, v in self.db.store.items() if v})
+
+    def test_admin_deletes_with_audit(self):
+        self.add(self.today)
+        entry_id = f"u1_{self.today.isoformat()}"
+        self.assertEqual(self.delete(entry_id)["status"], "deleted")
+        self.assertNotIn(entry_id, self.db.store["daily_entries"])
+        audit = self.audits()[-1]
+        self.assertEqual((audit["action"], audit["reason"]), ("admin_delete_daily_entry", "marcou por engano"))
+        self.assertEqual(audit["entry"]["id"], entry_id)
+        self.assertEqual(self.status_of(self.delete, entry_id), 404)
+
+    def test_delete_needs_admin_and_reason(self):
+        self.add(self.today)
+        entry_id = f"u1_{self.today.isoformat()}"
+        manager = {"id": "g1", "role": "manager", "name": "Gestor"}
+        self.assertEqual(self.status_of(self.delete, entry_id, admin=manager), 403)
+        self.assertEqual(self.status_of(self.delete, entry_id, reason=""), 400)
+        self.assertIn(entry_id, self.db.store["daily_entries"])
+
+
+@needs_main
+class DailyStandardDayTest(unittest.TestCase):
+    """Dia padrao da diaria. Os mesmos casos estao em
+    frontend/test/daily_entries_test.dart: a Dash e a folha dao o mesmo horario."""
+
+    cases = [
+        ("Diarista Teste", date(2026, 10, 1), 8, [("08:00", "12:00"), ("13:00", "17:00")]),
+        ("José Ação", date(2026, 10, 17), 8, [("08:00", "12:00"), ("13:15", "17:15")]),
+        ("José Ação", date(2026, 10, 18), 7.5, [("08:30", "12:30"), ("13:45", "17:15")]),
+        ("Ana", date(2026, 10, 19), 4, [("08:30", "12:30")]),
+    ]
+
+    def test_reference_days(self):
+        for name, day, hours, expected in self.cases:
+            sessions = main.daily_standard_sessions(name, day, hours)
+            self.assertEqual(
+                [(start.strftime("%H:%M"), end.strftime("%H:%M")) for start, end in sessions],
+                expected, (name, day),
+            )
+
+
+@needs_main
+class DailyModeExportTest(unittest.TestCase):
+    """Exportacao do modo diaria: aba com os dias e a folha padrao."""
+
+    def data(self, **overrides):
+        values = {
+            "employee_name": "Diarista Teste",
+            "employee_role": "employee",
+            "month": "10",
+            "year": "2026",
+            "is_campo": True,
+            "daily_records": [],
+            "daily_mode": True,
+            # 30/09 fica fora do mes; a data repetida conta uma vez.
+            "daily_dates": ["2026-10-05", "2026-10-01", "2026-10-05", "2026-09-30", "2026-10-18"],
+            "daily_hours": 8.0,
+        }
+        values.update(overrides)
+        return main.ExportData(**values)
+
+    def workbook(self, **overrides):
+        import openpyxl
+
+        try:
+            path = main.generate_excel_file(self.data(**overrides))
+        except FileNotFoundError as exc:
+            self.skipTest(str(exc))
+        self.addCleanup(os.unlink, path)
+        workbook = openpyxl.load_workbook(path)
+        self.addCleanup(workbook.close)
+        return workbook
+
+    def test_standard_day_on_each_daily_entry(self):
+        records = main.daily_mode_records(self.data())
+        self.assertEqual([record.date for record in records], ["2026-10-01", "2026-10-05", "2026-10-18"])
+        for record in records:
+            self.assertIn(record.check_in, ("08:00", "08:30"))
+            pair = main.ExportRecord(date=record.date, check_in=record.check_in, check_out=record.check_out,
+                                     break_start=record.break_start, break_end=record.break_end)
+            self.assertEqual(main.session_minutes(pair), 480)
+        # Mesmo nome e mesma data: mesmos horarios em toda exportacao.
+        again = main.daily_mode_records(self.data())
+        self.assertEqual([r.model_dump() for r in records], [r.model_dump() for r in again])
+
+    def test_short_or_invalid_daily_hours(self):
+        short = main.daily_mode_records(self.data(daily_hours=4))
+        self.assertTrue(all(r.break_start is None and main.session_minutes(r) == 240 for r in short))
+        for hours in (None, 0, 30):
+            default = main.daily_mode_records(self.data(daily_hours=hours))
+            self.assertTrue(all(main.session_minutes(r) == 480 for r in default))
+
+    def test_excel_has_daily_sheet_and_timesheet(self):
+        workbook = self.workbook()
+        self.assertEqual(workbook.sheetnames, ["Diárias", "Folha de Ponto"])
+        daily = workbook["Diárias"]
+        timesheet = workbook["Folha de Ponto"]
+        self.assertEqual(workbook.active.title, "Diárias")
+        self.assertTrue(daily.sheet_view.tabSelected)
+        self.assertFalse(timesheet.sheet_view.tabSelected)
+
+        self.assertEqual(daily["A3"].value, "Colaborador: Diarista Teste")
+        self.assertEqual(daily["A4"].value, "Função: Aux. Geral")
+        self.assertEqual(daily["A5"].value, "Período: Outubro/2026")
+        rows = [
+            (daily.cell(row=r, column=1).value, daily.cell(row=r, column=2).value.date(),
+             daily.cell(row=r, column=3).value)
+            for r in range(8, 11)
+        ]
+        self.assertEqual(rows, [
+            (1, date(2026, 10, 1), "Quinta-feira"),
+            (2, date(2026, 10, 5), "Segunda-feira"),
+            (3, date(2026, 10, 18), "Domingo"),
+        ])
+        self.assertEqual((daily["A12"].value, daily["C12"].value), ("Total de diárias", 3))
+        self.assertEqual(daily.print_area, "'Diárias'!$A$1:$C$12")
+
+        # Folha padrao: horario nos dias com diaria (linha 9 = dia 01) e so neles.
+        self.assertIn(timesheet["C9"].value, ("08:00", "08:30"))
+        self.assertIsNotNone(timesheet["F9"].value)
+        self.assertIn(timesheet["C13"].value, ("08:00", "08:30"))
+        self.assertIn(timesheet["C26"].value, ("08:00", "08:30"))
+        self.assertIsNone(timesheet["C10"].value)
+        self.assertEqual(timesheet["N34"].value, "=SUM(I9:I39)")
+        self.assertEqual(timesheet.print_area, "'Folha de Ponto'!$A$1:$P$39")
+
+    def test_excel_without_entries(self):
+        workbook = self.workbook(daily_dates=[])
+        daily = workbook["Diárias"]
+        self.assertEqual((daily["A9"].value, daily["C9"].value), ("Total de diárias", 0))
+        self.assertIsNone(workbook["Folha de Ponto"]["C9"].value)
+
+    def test_filename_and_html(self):
+        data = self.data()
+        self.assertEqual(main.excel_download_filename(data), "Folha_Ponto_Diarista Teste_10_diarias.xlsx")
+        path = main.generate_batch_html_file([data])
+        self.addCleanup(os.unlink, path)
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn('<span class="badge diaria">Diária</span>', content)
+        self.assertIn("Modo diaria - 3 diaria(s) no periodo", content)
+
+
+@needs_main
+class AdminDailyModeUpdateTest(unittest.TestCase):
+    admin = {"id": "a1", "role": "admin", "name": "Admin", "email": "a@x"}
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.db.store["users"] = {"u1": {"name": "Pessoa", "role": "employee", "daily_mode": True}}
+
+        class AuthError(Exception):
+            pass
+
+        auth = types.SimpleNamespace(
+            update_user=lambda *args, **kwargs: None,
+            EmailAlreadyExistsError=AuthError,
+            UserNotFoundError=AuthError,
+        )
+        patches = [
+            mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+            mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")),
+            mock.patch.object(main, "firebase_auth", auth),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def save(self, role="employee", **extra):
+        payload = main.AdminUserUpdateRequest(
+            name="Pessoa", email="p@x.com", role=role, job_title="Aux. Geral",
+            daily_hours=8.0, cpf="", **extra,
+        )
+        asyncio.run(main.update_user_admin_endpoint("u1", payload, self.admin))
+        return self.db.store["users"]["u1"]
+
+    def test_daily_mode_is_saved(self):
+        self.assertFalse(self.save(daily_mode=False)["daily_mode"])
+        self.assertTrue(self.save(daily_mode=True)["daily_mode"])
+
+    def test_old_app_without_field_keeps_it(self):
+        self.assertTrue(self.save()["daily_mode"])
+
+    def test_intern_never_in_daily_mode(self):
+        self.assertFalse(self.save(role="intern", daily_mode=True)["daily_mode"])
+
+
+# CPF valido de teste (digitos verificadores certos).
+VALID_CPF = "52998224725"
+
+
+class _FakeAuth:
+    """firebase_auth de mentira: contas por uid, com e-mail e senha."""
+
+    class EmailAlreadyExistsError(Exception):
+        pass
+
+    class UserNotFoundError(Exception):
+        pass
+
+    def __init__(self):
+        self.accounts = {}
+        self._ids = itertools.count(1)
+
+    def create_user(self, email, password, display_name=None):
+        if any(account["email"] == email for account in self.accounts.values()):
+            raise self.EmailAlreadyExistsError(email)
+        uid = f"new{next(self._ids)}"
+        self.accounts[uid] = {"email": email, "password": password, "disabled": False}
+        return types.SimpleNamespace(uid=uid)
+
+    def get_user(self, uid):
+        if uid not in self.accounts:
+            raise self.UserNotFoundError(uid)
+        return types.SimpleNamespace(uid=uid, email=self.accounts[uid]["email"])
+
+    def update_user(self, uid, **fields):
+        if uid not in self.accounts:
+            raise self.UserNotFoundError(uid)
+        self.accounts[uid].update(fields)
+
+    def delete_user(self, uid):
+        self.accounts.pop(uid, None)
+
+
+@needs_main
+class CpfRulesTest(unittest.TestCase):
+    def test_valid_and_invalid_cpf(self):
+        self.assertTrue(main.is_valid_cpf(VALID_CPF))
+        for value in ("52998224724", "11111111111", "5299822472", "", "abcdefghijk"):
+            self.assertFalse(main.is_valid_cpf(value), value)
+        self.assertEqual(main.cpf_digits("529.982.247-25"), VALID_CPF)
+        self.assertEqual(main.format_cpf(VALID_CPF), "529.982.247-25")
+
+    def test_login_emails(self):
+        self.assertEqual(main._login_emails(" Ana@X.com ", VALID_CPF), ("ana@x.com", "ana@x.com"))
+        self.assertEqual(
+            main._login_emails("", VALID_CPF),
+            ("", f"{VALID_CPF}@{main.CPF_LOGIN_EMAIL_DOMAIN}"),
+        )
+        for email, digits in (("sem-arroba", VALID_CPF), ("", "123")):
+            with self.assertRaises(main.HTTPException):
+                main._login_emails(email, digits)
+
+
+@needs_main
+class CpfAccessTest(unittest.TestCase):
+    """Login por CPF, cadastro pelo admin e troca de senha no primeiro acesso."""
+
+    admin = {"id": "a1", "role": "admin", "name": "Admin", "email": "a@x"}
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.auth = _FakeAuth()
+        self.passwords_ok = {}
+        main._login_failures.clear()
+
+        async def check_password(email, password):
+            account = next(a for a in self.auth.accounts.values() if a["email"] == email)
+            if account.get("disabled"):
+                return "disabled"
+            return "ok" if account["password"] == password else "invalid"
+
+        patches = [
+            mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+            mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")),
+            mock.patch.object(main, "firebase_auth", self.auth),
+            mock.patch.object(main, "_check_firebase_password", check_password),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(main._login_failures.clear)
+
+    def create(self, admin=None, **fields):
+        payload = main.AdminUserCreateRequest(**{"name": "Pessoa Nova", "cpf": "529.982.247-25", **fields})
+        return asyncio.run(main.create_user_admin_endpoint(payload, admin or self.admin))
+
+    def login(self, cpf, password, ip="1.2.3.4"):
+        request = types.SimpleNamespace(headers={"x-real-ip": ip}, client=None)
+        return asyncio.run(main.cpf_login_endpoint(main.CpfLoginRequest(cpf=cpf, password=password), request))
+
+    def status_of(self, call, *args, **kwargs):
+        with self.assertRaises(main.HTTPException) as ctx:
+            call(*args, **kwargs)
+        return ctx.exception.status_code, ctx.exception.detail
+
+    def test_admin_creates_user_with_default_password(self):
+        response = self.create(daily_mode=True)
+        uid = response["id"]
+        self.assertEqual((response["cpf"], response["default_password"]), ("529.982.247-25", "123456"))
+        profile = self.db.store["users"][uid]
+        self.assertTrue(profile["must_change_password"])
+        self.assertTrue(profile["daily_mode"])
+        self.assertEqual((profile["email"], profile["cpf_digits"], profile["job_title"]), ("", VALID_CPF, "Aux. Geral"))
+        # Sem e-mail, a conta usa o interno do CPF.
+        self.assertEqual(self.auth.accounts[uid]["email"], f"{VALID_CPF}@{main.CPF_LOGIN_EMAIL_DOMAIN}")
+        self.assertEqual(self.auth.accounts[uid]["password"], "123456")
+
+    def test_create_refuses_duplicate_invalid_cpf_and_manager(self):
+        self.create()
+        self.assertEqual(self.status_of(self.create, cpf="52998224725")[0], 409)
+        self.assertEqual(self.status_of(self.create, cpf="12345678900")[0], 400)
+        manager = {"id": "g1", "role": "manager", "name": "Gestor"}
+        self.assertEqual(self.status_of(self.create, admin=manager, cpf="11144477735")[0], 403)
+        self.assertEqual(len(self.auth.accounts), 1)
+
+    def test_login_by_cpf_in_any_format(self):
+        uid = self.create(email="pessoa@x.com")["id"]
+        self.assertEqual(self.login("52998224725", "123456"), {"email": "pessoa@x.com"})
+        # Cadastro antigo gravava "529.982.247.25".
+        self.db.store["users"][uid]["cpf"] = "529.982.247.25"
+        self.assertEqual(self.login("529.982.247-25", "123456"), {"email": "pessoa@x.com"})
+
+    def test_wrong_password_and_unknown_cpf_look_the_same(self):
+        self.create()
+        wrong = self.status_of(self.login, VALID_CPF, "errada")
+        unknown = self.status_of(self.login, "11144477735", "123456")
+        self.assertEqual(wrong, unknown)
+        self.assertEqual(wrong[0], 401)
+
+    def test_disabled_and_duplicate(self):
+        uid = self.create()["id"]
+        self.auth.accounts[uid]["disabled"] = True
+        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 403)
+        self.db.store["users"]["outro"] = {"cpf": VALID_CPF}
+        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 409)
+
+    def test_too_many_failures_block_for_a_while(self):
+        self.create()
+        for _ in range(main._LOGIN_MAX_FAILURES):
+            self.status_of(self.login, VALID_CPF, "errada")
+        # Bloqueado mesmo com a senha certa, e de outro aparelho (por CPF).
+        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456", ip="9.9.9.9")[0], 429)
+
+    def change(self, user, password):
+        payload = main.OwnPasswordChangeRequest(new_password=password)
+        return asyncio.run(main.change_own_password_endpoint(payload, user))
+
+    def test_first_access_password_change(self):
+        uid = self.create()["id"]
+        user = {"id": uid, **self.db.store["users"][uid]}
+        for bad in ("123456", "12345", VALID_CPF):
+            self.assertEqual(self.status_of(self.change, user, bad)[0], 400)
+        self.assertEqual(self.change(user, "minhaSenha9")["status"], "success")
+        self.assertEqual(self.auth.accounts[uid]["password"], "minhaSenha9")
+        self.assertFalse(self.db.store["users"][uid]["must_change_password"])
+        self.assertEqual(self.login(VALID_CPF, "minhaSenha9"), {"email": f"{VALID_CPF}@{main.CPF_LOGIN_EMAIL_DOMAIN}"})
+
+    def update(self, uid, **fields):
+        values = {
+            "name": "Pessoa Nova", "email": "", "role": "employee", "job_title": "Aux. Geral",
+            "daily_hours": 8.0, "cpf": "529.982.247-25",
+        }
+        values.update(fields)
+        asyncio.run(main.update_user_admin_endpoint(uid, main.AdminUserUpdateRequest(**values), self.admin))
+        return self.db.store["users"][uid]
+
+    def test_admin_reset_password_forces_change(self):
+        uid = self.create()["id"]
+        self.change({"id": uid, **self.db.store["users"][uid]}, "minhaSenha9")
+        profile = self.update(uid, new_password="123456")
+        self.assertTrue(profile["must_change_password"])
+        self.assertEqual(self.auth.accounts[uid]["password"], "123456")
+
+    def test_admin_edit_email_and_cpf(self):
+        uid = self.create()["id"]
+        # E-mail de verdade passa a ser o login da conta; tirando, volta o interno.
+        self.update(uid, email="Pessoa@X.com")
+        self.assertEqual(self.auth.accounts[uid]["email"], "pessoa@x.com")
+        profile = self.update(uid, email="", cpf="111.444.777-35")
+        self.assertEqual(self.auth.accounts[uid]["email"], f"11144477735@{main.CPF_LOGIN_EMAIL_DOMAIN}")
+        self.assertEqual((profile["cpf"], profile["cpf_digits"], profile["email"]), ("111.444.777-35", "11144477735", ""))
+        # Editar sem senha nova nao mexe na troca pendente do primeiro acesso.
+        self.assertTrue(profile["must_change_password"])
+        # CPF de outro cadastro, ou invalido, nao.
+        self.db.store["users"]["outro"] = {"cpf": VALID_CPF}
+        self.assertEqual(self.status_of(self.update, uid, cpf=VALID_CPF)[0], 409)
+        self.assertEqual(self.status_of(self.update, uid, cpf="12345678900")[0], 400)
 
 
 if __name__ == "__main__":

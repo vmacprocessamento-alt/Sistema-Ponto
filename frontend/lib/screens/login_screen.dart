@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/app_permission_service.dart';
+import '../utils/cpf.dart';
 import 'main_screen.dart';
-import 'register_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -13,11 +13,14 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _emailController = TextEditingController();
+  final _loginController = TextEditingController();
   final _passwordController = TextEditingController();
   final _apiService = ApiService();
   bool _isLoading = false;
   bool _obscurePassword = true;
+  // O acesso e pelo CPF. O e-mail fica de reserva: conta antiga sem CPF no
+  // cadastro (ex.: admin) ou backend fora do ar (o login por CPF passa por ele).
+  bool _useEmail = false;
 
   @override
   void initState() {
@@ -25,14 +28,24 @@ class _LoginScreenState extends State<LoginScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       AppPermissionService.requestStartupPermissions();
     });
-    _fillLastEmail();
+    _fillLastLogin();
   }
 
-  // Abre com o ultimo e-mail usado neste aparelho ja preenchido.
-  Future<void> _fillLastEmail() async {
-    final email = await _apiService.getLastLoginEmail();
-    if (!mounted || email == null || _emailController.text.isNotEmpty) return;
-    setState(() => _emailController.text = email);
+  // Abre com o ultimo CPF (ou e-mail) usado neste aparelho ja preenchido.
+  Future<void> _fillLastLogin() async {
+    final last = await _apiService.getLastLogin();
+    if (!mounted || last == null || _loginController.text.isNotEmpty) return;
+    setState(() {
+      _useEmail = last.contains('@');
+      _loginController.text = _useEmail ? last : formatCpf(last);
+    });
+  }
+
+  void _toggleEmail() {
+    setState(() {
+      _useEmail = !_useEmail;
+      _loginController.clear();
+    });
   }
 
   Future<void> _login() async {
@@ -40,17 +53,15 @@ class _LoginScreenState extends State<LoginScreen> {
 
     setState(() => _isLoading = true);
 
-    // Lembra o e-mail ja na tentativa (com ou sem internet), nao so no
-    // login que deu certo.
-    await _apiService.saveLastLoginEmail(_emailController.text);
+    // Lembra o login ja na tentativa (com ou sem internet), nao so no login
+    // que deu certo.
+    await _apiService.saveLastLogin(_loginController.text);
 
     try {
-      debugPrint('Tentando login para: ${_emailController.text}');
-      await _apiService.login(
-        _emailController.text,
+      await _apiService.loginWithCpf(
+        _loginController.text,
         _passwordController.text,
       );
-      debugPrint('Login Auth OK. Redirecionando...');
 
       if (mounted) {
         Navigator.of(context).pushReplacement(
@@ -77,31 +88,43 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   void _showForgotPasswordDialog() {
-    final emailController =
-        TextEditingController(text: _emailController.text.trim());
+    final emailController = TextEditingController(
+        text: _useEmail ? _loginController.text.trim() : '');
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Recuperar Senha'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('Informe seu e-mail para receber o link de redefinição de senha:'),
-            const SizedBox(height: 16),
-            TextField(
-              controller: emailController,
-              decoration: const InputDecoration(
-                labelText: 'E-mail',
-                border: OutlineInputBorder(),
+        title: const Text('Esqueceu a senha?'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Fale com o administrador: ele volta a sua senha para a '
+                'senha padrão e, ao entrar, você cria uma nova.',
               ),
-              keyboardType: TextInputType.emailAddress,
-            ),
-          ],
+              const SizedBox(height: 16),
+              const Text(
+                'Se você tem e-mail no cadastro, também pode receber um link '
+                'para criar a senha:',
+                style: TextStyle(color: Colors.grey, fontSize: 13),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: emailController,
+                decoration: const InputDecoration(
+                  labelText: 'E-mail',
+                  border: OutlineInputBorder(),
+                ),
+                keyboardType: TextInputType.emailAddress,
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: const Text('Cancelar'),
+            child: const Text('Fechar'),
           ),
           ElevatedButton(
             onPressed: () async {
@@ -126,7 +149,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 }
               }
             },
-            child: const Text('Enviar'),
+            child: const Text('Enviar link'),
           ),
         ],
       ),
@@ -160,7 +183,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'Faça login para continuar',
+                    'Entre com seu CPF e senha',
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                           color: Colors.grey[600],
@@ -168,22 +191,34 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                   const SizedBox(height: 48),
                   TextFormField(
-                    controller: _emailController,
-                    keyboardType: TextInputType.emailAddress,
+                    // A chave troca o campo inteiro (teclado e mascara) ao
+                    // alternar entre CPF e e-mail.
+                    key: ValueKey(_useEmail),
+                    controller: _loginController,
+                    keyboardType: _useEmail
+                        ? TextInputType.emailAddress
+                        : TextInputType.number,
+                    inputFormatters: _useEmail ? null : [CpfInputFormatter()],
+                    autocorrect: false,
                     decoration: InputDecoration(
-                      labelText: 'Email',
-                      prefixIcon: const Icon(Icons.email_outlined),
+                      labelText: _useEmail ? 'E-mail' : 'CPF',
+                      hintText: _useEmail ? null : '000.000.000-00',
+                      prefixIcon: Icon(_useEmail
+                          ? Icons.email_outlined
+                          : Icons.badge_outlined),
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(12),
                       ),
                     ),
                     validator: (value) {
-                      if (value == null || value.isEmpty) {
-                        return 'Por favor, insira seu email';
+                      final text = value?.trim() ?? '';
+                      if (_useEmail) {
+                        if (text.isEmpty) return 'Por favor, insira seu e-mail';
+                        if (!text.contains('@')) return 'E-mail inválido';
+                        return null;
                       }
-                      if (!value.contains('@')) {
-                        return 'Email inválido';
-                      }
+                      if (text.isEmpty) return 'Por favor, insira seu CPF';
+                      if (!isValidCpf(text)) return 'CPF inválido';
                       return null;
                     },
                   ),
@@ -214,6 +249,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       }
                       return null;
                     },
+                    onFieldSubmitted: (_) => _isLoading ? null : _login(),
                   ),
                   Align(
                     alignment: Alignment.centerRight,
@@ -242,16 +278,17 @@ class _LoginScreenState extends State<LoginScreen> {
                             style: TextStyle(fontSize: 16),
                           ),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 24),
+                  const Text(
+                    'Primeiro acesso: entre com o seu CPF e a senha que o '
+                    'administrador passou.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey, fontSize: 12),
+                  ),
                   TextButton(
-                    onPressed: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => const RegisterScreen(),
-                        ),
-                      );
-                    },
-                    child: const Text('Não tem conta? Cadastre-se'),
+                    onPressed: _toggleEmail,
+                    child: Text(_useEmail ? 'Entrar com CPF' : 'Entrar com e-mail',
+                        style: const TextStyle(fontSize: 12)),
                   ),
                 ],
               ),
@@ -264,7 +301,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   void dispose() {
-    _emailController.dispose();
+    _loginController.dispose();
     _passwordController.dispose();
     super.dispose();
   }

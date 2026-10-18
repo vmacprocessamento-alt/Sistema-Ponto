@@ -28,11 +28,9 @@ service cloud.firestore {
     match /users/{userId} {
       allow read: if isOwner(userId) || isAdmin();
 
-      // Cadastro: só os campos do formulário (nada de horário especial, modo diária etc. por conta própria).
-      allow create: if isOwner(userId)
-        && request.resource.data.role in ['employee', 'intern']
-        && request.resource.data.keys().hasOnly(['uid', 'email', 'name', 'cpf', 'role', 'job_title',
-                                                 'daily_hours', 'created_at']);
+      // Não há mais cadastro pelo app (18/10/2026): quem cadastra é o admin, pelo backend (POST /admin/users, Admin
+      // SDK, que não passa por estas regras). Conta criada fora do painel não ganha cadastro.
+      allow create: if false;
 
       // Só o admin (gerente não: trocaria o próprio papel para admin). O app já só deixa o admin editar.
       allow update: if isSystemAdmin()

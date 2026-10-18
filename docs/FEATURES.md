@@ -3,8 +3,10 @@
 ## 📱 App Mobile/Web (Flutter)
 
 ### Autenticação
-- [x] Tela de Login
-- [x] Tela de Cadastro
+- [x] Tela de Login (pelo CPF; "Entrar com e-mail" fica de reserva)
+- [x] Cadastro só pelo admin (Gestão → Usuários → Novo usuário), com senha padrão 123456 e mensagem pronta para mandar (copiar ou WhatsApp); não há mais cadastro pelo app
+- [x] Primeiro acesso (ou senha redefinida pelo admin): a pessoa cria a própria senha antes de usar o app
+- [x] Trocar senha pelo Perfil
 - [x] Validação de email
 - [x] Validação de senha
 - [x] Formatação automática de CPF
@@ -23,6 +25,9 @@
 - [ ] Geolocalização (opcional - código pronto)
 - [ ] Foto/biometria (futuro)
 - [x] Modo offline (web/PWA e app; ver OFFLINE.md)
+- [x] Modo diária: o admin liga no cadastro (Funcionário) e a tela de ponto vira o botão "Adicionar diária", uma por dia (sem internet fica no aparelho e vai depois)
+- [x] Modo diária na gestão: tela "Diárias" por pessoa (Usuários ou Registros) para lançar a diária de um dia ou apagar uma, com motivo e auditoria
+- [x] Modo diária na Dash, Meu Mês e Histórico: cada diária aparece com o horário padrão do dia, o mesmo da folha exportada
 
 ### Dashboard
 - [x] Seletor de mês
@@ -62,6 +67,7 @@
 - [x] Totalizadores
 - [x] Informações do funcionário
 - [x] Data de geração
+- [x] Modo diária: Excel com a aba "Diárias" (dias trabalhados e total) e a folha de ponto padrão com um dia de trabalho padrão em cada diária
 - [ ] Envio por email (futuro)
 - [ ] Upload para nuvem (futuro)
 

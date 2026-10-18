@@ -25,6 +25,17 @@ class ExportService {
     };
   }
 
+  /// Campos do modo diaria (os dias com diaria e a carga do dia padrao) para
+  /// o corpo da exportacao; vazio para quem bate ponto.
+  Map<String, dynamic> _dailyModeFields(Map<String, dynamic> data) =>
+      data['daily_mode'] == true
+          ? {
+              'daily_mode': true,
+              'daily_dates': data['daily_dates'] ?? const [],
+              'daily_hours': data['daily_hours'],
+            }
+          : const {};
+
   Future<void> exportToExcel({
     required Map<String, dynamic> data,
     required String month,
@@ -33,6 +44,7 @@ class ExportService {
   }) async {
     try {
       final body = json.encode({
+        ..._dailyModeFields(data),
         'employee_name': data['employee']['name'],
         'employee_role': data['employee']['role'],
         'month': month,
@@ -58,7 +70,9 @@ class ExportService {
 
       if (response.statusCode == 200) {
         final Uint8List bytes = response.bodyBytes;
-        final suffix = _isInternExport(data) ? '_estag' : '';
+        final suffix = _isInternExport(data)
+            ? '_estag'
+            : (data['daily_mode'] == true ? '_diarias' : '');
         final downloadName =
             'Folha_Ponto_${data['employee']['name']}_$month$suffix';
 
@@ -103,6 +117,7 @@ class ExportService {
         final isEstagiario =
             role.contains('estagiario') || role.contains('intern');
         return {
+          ..._dailyModeFields(r),
           'employee_name': r['employee']['name'],
           'employee_role': r['employee']['role'],
           'month': month,
@@ -163,6 +178,7 @@ class ExportService {
         final isEstagiario =
             role.contains('estagiario') || role.contains('intern');
         return {
+          ..._dailyModeFields(r),
           'employee_name': r['employee']['name'],
           'employee_role': r['employee']['role'],
           'month': month,

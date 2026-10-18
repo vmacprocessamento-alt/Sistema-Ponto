@@ -15,6 +15,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'app_config.dart';
 import 'session_service.dart';
 import '../utils/chat_timestamp.dart';
+import '../utils/cpf.dart';
+import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import '../utils/work_schedule_rules.dart';
@@ -47,14 +49,30 @@ class PunchRejectedException implements Exception {
   String toString() => 'Exception: $message';
 }
 
+/// Resposta de erro do backend nas diarias (/daily-entries).
+class _DailyEntryHttpException implements Exception {
+  const _DailyEntryHttpException(this.statusCode, this.message);
+
+  final int statusCode;
+  final String message;
+
+  /// Servidor fora do ar ou sem cota: a mesma diaria passa mais tarde.
+  bool get temporary => statusCode == 429 || statusCode >= 500;
+
+  @override
+  String toString() => 'Exception: $message';
+}
+
 class ApiService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   final FirebaseStorage _storage = FirebaseStorage.instance;
   static const String _offlineRecordsKey = 'offline_time_records';
   static const String _cachedUserKey = 'cached_current_user';
-  // Ultimo e-mail digitado no login. Fica mesmo depois de sair da conta,
-  // para a tela de login ja abrir preenchida (com ou sem internet).
+  // Ultimo CPF (ou e-mail) digitado no login. Fica mesmo depois de sair da
+  // conta, para a tela de login ja abrir preenchida (com ou sem internet).
+  static const String _lastLoginKey = 'last_login_id';
+  // O do login por e-mail, de antes do login por CPF.
   static const String _lastLoginEmailKey = 'last_login_email';
   // Copia local dos pontos do proprio usuario (ultimos dias). No web o cache
   // do Firestore fica desligado (o IndexedDB trava no Safari do iPhone), entao
@@ -152,6 +170,7 @@ class ApiService {
     String? newPassword,
     required bool workScheduleOverrideEnabled,
     Map<String, dynamic>? workScheduleOverride,
+    required bool dailyMode,
   }) async {
     final admin = await getCurrentUser();
     if (admin['role'] != 'admin') {
@@ -191,6 +210,7 @@ class ApiService {
       'work_schedule_override_enabled': workScheduleOverrideEnabled,
       'work_schedule_override':
           workScheduleOverrideEnabled ? workScheduleOverride : null,
+      'daily_mode': dailyMode && role != 'intern' && role != 'estagiario',
       'updated_at': FieldValue.serverTimestamp(),
       'last_admin_update_by_id': admin['id'],
       'last_admin_update_by_name': admin['name'] ?? '',
@@ -214,6 +234,7 @@ class ApiService {
         'cpf',
         'work_schedule_override_enabled',
         'work_schedule_override',
+        'daily_mode',
       ],
       'created_at': FieldValue.serverTimestamp(),
     });
@@ -294,6 +315,11 @@ class ApiService {
         'disabled',
         'work_schedule_override_enabled',
         'work_schedule_override',
+        // Modo diaria: decide a tela de ponto tambem na abertura sem internet.
+        'daily_mode',
+        // Primeiro acesso (ou senha redefinida pelo admin): a tela de criar
+        // senha aparece antes de tudo.
+        'must_change_password',
       ])
         if (user[key] != null) key: user[key],
     };
@@ -550,6 +576,47 @@ class ApiService {
   }
 
   // --- MÉTODOS DE AUTH ---
+
+  /// Senha com que o admin cadastra (e redefine) a conta. No primeiro acesso
+  /// a pessoa cria a propria (must_change_password).
+  static const String defaultUserPassword = '123456';
+
+  /// Login pelo CPF: o backend confere a senha e devolve o e-mail da conta
+  /// no Firebase (o de verdade ou o interno do CPF), e o login segue por ele.
+  /// Com "@" no [loginId], entra direto pelo e-mail: serve de reserva para o
+  /// admin com o backend fora do ar.
+  Future<Map<String, dynamic>> loginWithCpf(
+      String loginId, String password) async {
+    final value = loginId.trim();
+    if (value.contains('@')) return login(value, password);
+
+    final http.Response response;
+    try {
+      response = await http
+          .post(
+            Uri.parse('$backendUrl/auth/cpf-login'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'cpf': cpfDigits(value), 'password': password}),
+          )
+          .timeout(const Duration(seconds: 25));
+    } catch (e) {
+      if (isNetworkFailure(e)) {
+        throw Exception('Sem conexão com o servidor. Confira a internet e '
+            'tente de novo.');
+      }
+      rethrow;
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final email = (jsonDecode(utf8.decode(response.bodyBytes)) as Map)['email']
+        ?.toString();
+    if (email == null || email.isEmpty) {
+      throw Exception('Resposta inválida do servidor.');
+    }
+    return login(email, password);
+  }
+
   Future<Map<String, dynamic>> login(String email, String password) async {
     try {
       // 1. Tentar Login no Firebase Auth
@@ -564,20 +631,14 @@ class ApiService {
       DocumentSnapshot userDoc =
           await _db.collection('users').doc(result.user!.uid).get();
 
-      Map<String, dynamic> userData;
-      if (userDoc.exists) {
-        userData = userDoc.data() as Map<String, dynamic>;
-      } else {
-        // Se não existir no Firestore, cria um documento básico para não quebrar o login
-        userData = {
-          'email': email,
-          'name': email.split('@')[0],
-          'role': 'employee',
-          'daily_hours': 8.0,
-          'created_at': FieldValue.serverTimestamp(),
-        };
-        await _db.collection('users').doc(result.user!.uid).set(userData);
+      // Quem cadastra e o admin: conta sem cadastro (criada fora do painel)
+      // nao entra. Antes o app criava um cadastro basico aqui.
+      if (!userDoc.exists) {
+        await _auth.signOut();
+        throw Exception(
+            'Cadastro não encontrado. Procure o administrador.');
       }
+      final userData = userDoc.data() as Map<String, dynamic>;
 
       final String? token = await result.user!.getIdToken();
 
@@ -615,67 +676,72 @@ class ApiService {
           errorMessage = 'Erro de Autenticação (${e.code}): ${e.message}';
       }
       throw Exception(errorMessage);
+    } on Exception {
+      rethrow;
     } catch (e) {
       // Erro genérico
       throw Exception('Falha ao processar login: $e');
     }
   }
 
-  Future<Map<String, dynamic>> register({
-    required String email,
-    required String name,
-    required String cpf,
-    required String password,
-    String role = 'employee',
-    double dailyHours = 8.0,
-  }) async {
-    try {
-      UserCredential result = await _auth.createUserWithEmailAndPassword(
-          email: email, password: password);
-      Map<String, dynamic> userData = {
-        'uid': result.user!.uid,
-        'email': email,
-        'name': name,
-        'cpf': cpf,
-        'role': role,
-        'job_title': role == 'intern' ? 'Estagiario' : 'Aux. Geral',
-        'daily_hours': dailyHours,
-        'created_at': FieldValue.serverTimestamp(),
-      };
-      await _db.collection('users').doc(result.user!.uid).set(userData);
-      invalidateUsersCache();
-      final user = {'id': result.user!.uid, ...userData};
-      await _cacheCurrentUser(user);
-      await SessionService.saveCredentials(email, password);
-      return user;
-    } on FirebaseAuthException catch (e) {
-      throw Exception('Registro falhou: ${e.message}');
-    }
-  }
-
-  Future<void> saveLastLoginEmail(String email) async {
-    final value = email.trim();
+  Future<void> saveLastLogin(String loginId) async {
+    final value = loginId.trim();
     if (value.isEmpty) return;
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_lastLoginEmailKey, value);
+      await prefs.setString(_lastLoginKey, value);
     } catch (e) {
-      debugPrint('Nao deu para lembrar o e-mail do login: $e');
+      debugPrint('Nao deu para lembrar o login: $e');
     }
   }
 
-  /// Ultimo e-mail usado no login neste aparelho. Para quem entrou antes
-  /// desta funcao existir, usa o e-mail do perfil guardado, se houver.
-  Future<String?> getLastLoginEmail() async {
+  /// Ultimo CPF (ou e-mail) usado no login neste aparelho. Para quem entrou
+  /// antes do login por CPF, o CPF do perfil guardado e, sem ele, o e-mail
+  /// do login antigo.
+  Future<String?> getLastLogin() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final saved = prefs.getString(_lastLoginEmailKey);
+      final saved = prefs.getString(_lastLoginKey);
       if (saved != null && saved.isNotEmpty) return saved;
-      final cachedEmail =
-          (await getCachedCurrentUser())?['email']?.toString().trim();
-      return (cachedEmail == null || cachedEmail.isEmpty) ? null : cachedEmail;
+      final cachedCpf = cpfDigits((await getCachedCurrentUser())?['cpf']);
+      if (cachedCpf.length == 11) return formatCpf(cachedCpf);
+      final legacyEmail = prefs.getString(_lastLoginEmailKey);
+      return (legacyEmail == null || legacyEmail.isEmpty) ? null : legacyEmail;
     } catch (e) {
       return null;
+    }
+  }
+
+  /// Troca a senha da propria conta (no primeiro acesso, obrigatorio), pelo
+  /// backend, e entra de novo com ela: a troca pelo Admin SDK pode derrubar
+  /// a sessao atual na proxima renovacao do token.
+  Future<void> changeOwnPassword(String newPassword) async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/me/password'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'new_password': newPassword}),
+        )
+        .timeout(const Duration(seconds: 25));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final email = _auth.currentUser?.email;
+    if (email != null && email.isNotEmpty) {
+      try {
+        await _auth.signInWithEmailAndPassword(
+            email: email, password: newPassword);
+        await SessionService.saveCredentials(email, newPassword);
+      } catch (e) {
+        debugPrint('Senha trocada; novo login fica para a proxima abertura: $e');
+      }
+    }
+    final cached = await getCachedCurrentUser();
+    if (cached != null) {
+      await _cacheCurrentUser({...cached, 'must_change_password': false});
     }
   }
 
@@ -1636,6 +1702,11 @@ class ApiService {
       user = await getCurrentUser();
     }
 
+    if (user['daily_mode'] == true) {
+      return _timesheetResult(
+          user, await _dailyModeWorkDays(user, startDate, endDate));
+    }
+
     // Busca um dia a mais de cada lado: o turno que comeca no ultimo dia do
     // periodo pode fechar no dia seguinte, e o ponto da madrugada do primeiro
     // dia pode ser de um turno da vespera (que fica no periodo anterior).
@@ -1654,12 +1725,18 @@ class ApiService {
       ..removeWhere((day, _) =>
           day.compareTo(firstDay) < 0 || day.compareTo(lastDay) > 0);
 
-    List<Map<String, dynamic>> dailyRecords = [];
-    double totalN = 0, totalE = 0, total50 = 0, total100 = 0;
-
     final role = user['role']?.toString() ?? 'employee';
-    grouped.forEach((date, dayRecords) {
-      final day = computeWorkDay(date, dayRecords, role);
+    return _timesheetResult(user, [
+      for (final MapEntry(key: date, value: dayRecords) in grouped.entries)
+        computeWorkDay(date, dayRecords, role),
+    ]);
+  }
+
+  /// Resposta de exportTimesheet: os dias (o mais novo primeiro) e os totais.
+  Map<String, dynamic> _timesheetResult(
+      Map<String, dynamic> user, List<Map<String, dynamic>> dailyRecords) {
+    double totalN = 0, totalE = 0, total50 = 0, total100 = 0;
+    for (final day in dailyRecords) {
       final regular = day['regular_hours'] as double;
       final extra50 = day['extra_50'] as double;
       final extra100 = day['extra_100'] as double;
@@ -1669,8 +1746,7 @@ class ApiService {
       totalE += (day['overtime_hours'] as double) - extra50 - extra100;
       total50 += extra50;
       total100 += extra100;
-      dailyRecords.add(day);
-    });
+    }
 
     dailyRecords
         .sort((a, b) => (b['date'] as String).compareTo(a['date'] as String));
@@ -1687,6 +1763,305 @@ class ApiService {
       },
       'daily_records': dailyRecords,
     };
+  }
+
+  // --- MODO DIARIA ---
+  // Quem esta no modo diaria (users.daily_mode) so marca a diaria do dia, pelo
+  // backend: uma por pessoa por dia, no dia do relogio do servidor. Sem
+  // internet (ou com o servidor fora do ar) ela fica guardada no aparelho e
+  // vai depois, valendo o dia do toque.
+
+  static const String _pendingDailyEntriesKey = 'pending_daily_entries';
+  static const String _dailyEntriesCachePrefix = 'cached_daily_entries_';
+  // Dias de diarias que a copia local guarda (o periodo da folha e folga).
+  static const int _dailyEntriesCacheDays = 62;
+  // Envio da fila de diarias em andamento: a volta da internet e o
+  // recarregamento da tela chamam juntos.
+  static Future<List<Map<String, dynamic>>>? _dailySync;
+
+  static bool _isTemporaryDailyFailure(Object error) =>
+      isNetworkFailure(error) ||
+      (error is _DailyEntryHttpException && error.temporary);
+
+  Future<Map<String, dynamic>> _postDailyEntry({DateTime? offlineAt}) async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/daily-entries'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            if (offlineAt != null) 'offline': true,
+            if (offlineAt != null) 'timestamp': offlineAt.toIso8601String(),
+          }),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw _DailyEntryHttpException(response.statusCode, _apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  /// Marca a diaria de hoje. 'status' da resposta: 'created', 'existing' (ja
+  /// havia diaria hoje, de outro toque ou aparelho) ou 'pending' (guardada
+  /// no aparelho; syncPendingDailyEntries envia depois).
+  Future<Map<String, dynamic>> addDailyEntry() async {
+    final tappedAt = DateTime.now();
+    try {
+      final entry = await _postDailyEntry();
+      await _cacheDailyEntries([entry]);
+      return entry;
+    } catch (e) {
+      if (!_isTemporaryDailyFailure(e)) rethrow;
+      debugPrint('Diaria guardada no aparelho para enviar depois: $e');
+      return _queueDailyEntry(tappedAt);
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _readJsonList(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(key);
+    if (raw == null) return [];
+    try {
+      return (jsonDecode(raw) as List)
+          .map((item) => Map<String, dynamic>.from(item as Map))
+          .toList();
+    } catch (e) {
+      debugPrint('Lista local ilegivel ($key): $e');
+      return [];
+    }
+  }
+
+  Future<void> _writeJsonList(
+      String key, List<Map<String, dynamic>> items) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(key, jsonEncode(items));
+  }
+
+  Future<Map<String, dynamic>> _queueDailyEntry(DateTime at) async {
+    final uid = await _localUserId();
+    if (uid == null) {
+      throw Exception(
+          'Faca login com internet uma vez antes de registrar offline.');
+    }
+    final entry = {
+      'user_id': uid,
+      'date': dailyDayKey(at),
+      'registered_at': at.toIso8601String(),
+    };
+    final queued = await _readJsonList(_pendingDailyEntriesKey);
+    // Uma por dia tambem na fila: outro toque sem internet nao vira outra.
+    if (!queued.any((item) =>
+        item['user_id'] == uid && item['date'] == entry['date'])) {
+      await _writeJsonList(_pendingDailyEntriesKey, [...queued, entry]);
+    }
+    return {...entry, 'status': 'pending', 'pending': true};
+  }
+
+  /// Diarias do usuario logado guardadas no aparelho, ainda nao enviadas.
+  Future<List<Map<String, dynamic>>> getPendingDailyEntries() async {
+    final uid = await _localUserId();
+    return (await _readJsonList(_pendingDailyEntriesKey))
+        .where((item) => item['user_id'] == uid)
+        .toList();
+  }
+
+  Future<void> _removePendingDailyEntry(Map<String, dynamic> entry) async {
+    final queued = await _readJsonList(_pendingDailyEntriesKey);
+    await _writeJsonList(
+        _pendingDailyEntriesKey,
+        queued
+            .where((item) =>
+                item['user_id'] != entry['user_id'] ||
+                item['date'] != entry['date'])
+            .toList());
+  }
+
+  /// Envia as diarias guardadas no aparelho. Devolve as que o servidor
+  /// recusou (ex.: mais de 7 dias sem internet), ja fora da fila e com o
+  /// motivo em 'sync_error', para a tela avisar. Sem internet ou com o
+  /// servidor fora do ar, as diarias continuam guardadas.
+  Future<List<Map<String, dynamic>>> syncPendingDailyEntries() =>
+      _dailySync ??= _syncPendingDailyEntries()
+          .whenComplete(() => _dailySync = null);
+
+  Future<List<Map<String, dynamic>>> _syncPendingDailyEntries() async {
+    final rejected = <Map<String, dynamic>>[];
+    for (final pending in await getPendingDailyEntries()) {
+      final at = DateTime.tryParse(pending['registered_at']?.toString() ?? '');
+      try {
+        if (at == null) {
+          throw const _DailyEntryHttpException(400, 'Diária sem horário.');
+        }
+        await _cacheDailyEntries([await _postDailyEntry(offlineAt: at)]);
+      } catch (e) {
+        if (_isTemporaryDailyFailure(e)) break;
+        if (e is! _DailyEntryHttpException) {
+          debugPrint('Diaria guardada nao enviada: $e');
+          break;
+        }
+        rejected.add({...pending, 'sync_error': e.message});
+      }
+      await _removePendingDailyEntry(pending);
+    }
+    return rejected;
+  }
+
+  /// Guarda [entries] (do servidor) na copia local do usuario logado. Com
+  /// [fromDay] e [toDay], a resposta do servidor manda nesse periodo: o que
+  /// a copia tinha nele e nao veio sai.
+  Future<void> _cacheDailyEntries(List<Map<String, dynamic>> entries,
+      {String? fromDay, String? toDay}) async {
+    try {
+      final uid = await _localUserId();
+      if (uid == null) return;
+      bool replaced(String day) =>
+          fromDay != null &&
+          toDay != null &&
+          day.compareTo(fromDay) >= 0 &&
+          day.compareTo(toDay) <= 0;
+      final key = '$_dailyEntriesCachePrefix$uid';
+      final byDay = <String, Map<String, dynamic>>{
+        for (final entry in await _readJsonList(key))
+          if (!replaced(entry['date']?.toString() ?? ''))
+            entry['date'].toString(): entry,
+      };
+      for (final entry in entries) {
+        if (entry['user_id'] != uid || entry['date'] == null) continue;
+        byDay[entry['date'].toString()] = _jsonSafeRecord(entry);
+      }
+      final cutoff = dailyDayKey(DateTime.now()
+          .subtract(const Duration(days: _dailyEntriesCacheDays)));
+      await _writeJsonList(
+          key,
+          byDay.values
+              .where((entry) => entry['date'].toString().compareTo(cutoff) >= 0)
+              .toList());
+    } catch (e) {
+      debugPrint('Nao deu para guardar a copia local das diarias: $e');
+    }
+  }
+
+  /// Diarias do usuario logado de [start] a [end] (dias), com as guardadas
+  /// no aparelho ('pending': true). Sem internet, ou com [localOnly], vem da
+  /// copia local da ultima consulta.
+  Future<List<Map<String, dynamic>>> getMyDailyEntries(
+      {required DateTime start,
+      required DateTime end,
+      bool localOnly = false}) async {
+    final uid = await _localUserId();
+    if (uid == null) return [];
+    List<Map<String, dynamic>>? server;
+    if (!localOnly) {
+      try {
+        server = await getDailyEntries(start: start, end: end);
+        await _cacheDailyEntries(server,
+            fromDay: dailyDayKey(start), toDay: dailyDayKey(end));
+      } catch (e) {
+        if (!_isTemporaryDailyFailure(e)) rethrow;
+        debugPrint('Diarias online indisponiveis, usando a copia local: $e');
+      }
+    }
+    server ??= dailyEntriesBetween(
+        await _readJsonList('$_dailyEntriesCachePrefix$uid'), start, end);
+    return mergeDailyEntries(server,
+        dailyEntriesBetween(await getPendingDailyEntries(), start, end));
+  }
+
+  /// Diarias de [userId] (sem ele, do usuario logado) de [start] a [end],
+  /// direto do servidor. Outra pessoa: so admin ou gestor.
+  Future<List<Map<String, dynamic>>> getDailyEntries(
+      {required DateTime start, required DateTime end, String? userId}) async {
+    final response = await http
+        .get(
+          Uri.parse('$backendUrl/daily-entries').replace(queryParameters: {
+            'start': dailyDayKey(start),
+            'end': dailyDayKey(end),
+            if (userId != null) 'user_id': userId,
+          }),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw _DailyEntryHttpException(response.statusCode, _apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes)) as Map;
+    return [
+      for (final entry in (decoded['entries'] as List? ?? const []))
+        Map<String, dynamic>.from(entry as Map),
+    ];
+  }
+
+  /// Dias da folha de quem esta no modo diaria, para os paineis (Dash, Meu
+  /// Mes): o dia padrao de cada diaria do periodo (dailyStandardWorkDay), o
+  /// mesmo horario da folha exportada. Do proprio usuario entram tambem as
+  /// guardadas no aparelho ('pending').
+  Future<List<Map<String, dynamic>>> _dailyModeWorkDays(
+      Map<String, dynamic> user, String startDate, String endDate) async {
+    final start = DateTime.parse(startDate);
+    final end = DateTime.parse(endDate);
+    final userId = user['id'].toString();
+    final entries = userId == await _localUserId()
+        ? await getMyDailyEntries(start: start, end: end)
+        : await getDailyEntries(start: start, end: end, userId: userId);
+    final name = user['name']?.toString() ?? '';
+    final role = user['role']?.toString() ?? 'employee';
+    return [
+      for (final entry in entries)
+        {
+          ...dailyStandardWorkDay(
+              name, entry['date'].toString(), user['daily_hours'], role),
+          if (entry['pending'] == true) 'pending': true,
+        },
+    ];
+  }
+
+  /// Admin lanca a diaria de [userId] no dia [day] (a pessoa esqueceu de
+  /// marcar). Uma por dia; dia futuro nao.
+  Future<Map<String, dynamic>> adminAddDailyEntry(
+      {required String userId,
+      required DateTime day,
+      required String reason}) async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/admin/daily-entries'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'user_id': userId,
+            'date': dailyDayKey(day),
+            'reason': reason,
+          }),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
+  /// Admin apaga a diaria [entryId]; a copia fica na auditoria.
+  Future<void> adminDeleteDailyEntry(
+      {required String entryId, required String reason}) async {
+    final response = await http
+        .delete(
+          Uri.parse(
+              '$backendUrl/admin/daily-entries/${Uri.encodeComponent(entryId)}'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'reason': reason}),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
   }
 
   // --- MÉTODOS DE ADMIN ---
@@ -1723,6 +2098,44 @@ class ApiService {
     return users;
   }
 
+  /// Admin cadastra uma pessoa: ela entra com o CPF e a senha padrao
+  /// ([defaultUserPassword]) e cria a propria no primeiro acesso. Sem
+  /// [email], a conta usa um e-mail interno tirado do CPF.
+  Future<Map<String, dynamic>> createUserAdmin({
+    required String name,
+    required String cpf,
+    String? email,
+    required String role,
+    required String jobTitle,
+    required double dailyHours,
+    bool dailyMode = false,
+  }) async {
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/admin/users'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'name': name,
+            'cpf': cpfDigits(cpf),
+            'email': (email ?? '').trim(),
+            'role': role,
+            'job_title': jobTitle,
+            'daily_hours': dailyHours,
+            'daily_mode': dailyMode,
+          }),
+        )
+        .timeout(const Duration(seconds: 45));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    invalidateUsersCache();
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
+  }
+
   Future<Map<String, dynamic>> updateUserAdmin(
     dynamic userId, {
     required String name,
@@ -1735,6 +2148,7 @@ class ApiService {
     String? newPassword,
     bool workScheduleOverrideEnabled = false,
     Map<String, dynamic>? workScheduleOverride,
+    bool dailyMode = false,
   }) async {
     final response = await http
         .put(
@@ -1754,6 +2168,7 @@ class ApiService {
             'new_password': newPassword,
             'work_schedule_override_enabled': workScheduleOverrideEnabled,
             'work_schedule_override': workScheduleOverride,
+            'daily_mode': dailyMode,
           }),
         )
         .timeout(const Duration(seconds: 45));
@@ -1771,6 +2186,7 @@ class ApiService {
           newPassword: newPassword,
           workScheduleOverrideEnabled: workScheduleOverrideEnabled,
           workScheduleOverride: workScheduleOverride,
+          dailyMode: dailyMode,
         );
       }
       throw Exception(_apiError(response));

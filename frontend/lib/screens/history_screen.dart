@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
+import '../utils/daily_entries.dart';
 import 'package:intl/intl.dart';
 
 class HistoryScreen extends StatefulWidget {
@@ -13,7 +14,9 @@ class _HistoryScreenState extends State<HistoryScreen> {
   final _apiService = ApiService();
   List<dynamic> _records = [];
   bool _isLoading = true;
-  
+  // Modo diaria: os registros sao o dia padrao de cada diaria.
+  bool _dailyMode = false;
+
   DateTime _startDate = DateTime.now();
   DateTime _endDate = DateTime.now();
   String _filterType = 'diário'; // diário, semanal, mensal
@@ -42,11 +45,30 @@ class _HistoryScreenState extends State<HistoryScreen> {
   Future<void> _fetchRecords() async {
     setState(() => _isLoading = true);
     try {
-      final records = await _apiService.getTimeRecords(
-        startDate: _startDate.toIso8601String(),
-        endDate: _endDate.toIso8601String(),
-      );
-      setState(() => _records = records);
+      final user = await _apiService.getCachedCurrentUser();
+      final dailyMode = user?['daily_mode'] == true;
+      final List<dynamic> records;
+      if (dailyMode) {
+        // Sem batidas: cada diaria aparece com o dia padrao da folha, o mais
+        // novo primeiro, como os pontos.
+        final entries = await _apiService.getMyDailyEntries(
+            start: _startDate, end: _endDate);
+        records = [
+          for (final entry in entries.reversed)
+            ...dailyStandardRecords(user?['name']?.toString() ?? '',
+                    entry['date'].toString(), user?['daily_hours'])
+                .reversed,
+        ];
+      } else {
+        records = await _apiService.getTimeRecords(
+          startDate: _startDate.toIso8601String(),
+          endDate: _endDate.toIso8601String(),
+        );
+      }
+      setState(() {
+        _dailyMode = dailyMode;
+        _records = records;
+      });
     } catch (e) {
       debugPrint('Erro histórico: $e');
     } finally {
@@ -83,6 +105,15 @@ class _HistoryScreenState extends State<HistoryScreen> {
         children: [
           _buildFilterBar(),
           _buildDateHeader(),
+          if (_dailyMode)
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 10, 16, 0),
+              child: Text(
+                'Modo diária: cada diária aparece com o horário padrão do '
+                'dia, o mesmo da folha de ponto.',
+                style: TextStyle(color: Colors.grey, fontSize: 11),
+              ),
+            ),
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator(color: wineColor))

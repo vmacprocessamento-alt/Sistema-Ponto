@@ -4,6 +4,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'dart:async';
 import 'dart:math' as math;
 import '../services/api_service.dart';
+import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import 'monthly_dashboard_screen.dart';
@@ -110,12 +111,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final weekRecords = List<dynamic>.from(weekData['daily_records'] as List);
       final todayKey = DateFormat('yyyy-MM-dd').format(now);
 
-      final rawRecords = await _apiService.getTimeRecords(
-          startDate: day.toIso8601String(),
-          endDate: _endOfDay(day).toIso8601String(),
-          userId: userId);
-      final previousDay = await _loadPreviousDayRecords(
-          userId, day, rawRecords, refreshPreviousDay);
+      final List<dynamic> rawRecords;
+      final List<dynamic> previousDay;
+      if (_isDailyUser) {
+        rawRecords = await _dailyTimelineRecords(day, startWeek, weekRecords);
+        previousDay = const [];
+      } else {
+        rawRecords = await _apiService.getTimeRecords(
+            startDate: day.toIso8601String(),
+            endDate: _endOfDay(day).toIso8601String(),
+            userId: userId);
+        previousDay = await _loadPreviousDayRecords(
+            userId, day, rawRecords, refreshPreviousDay);
+      }
 
       // Troca de funcionario no meio da leitura: descarta o resultado velho.
       if (!mounted || _selectedUser?['id'] != userId) return;
@@ -131,6 +139,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } catch (e) {
       debugPrint('Erro dashboard: $e');
     }
+  }
+
+  /// Modo diaria (users.daily_mode): os dias vem das diarias, cada uma com o
+  /// dia padrao da folha (exportTimesheet ja devolve assim).
+  bool get _isDailyUser => _selectedUser?['daily_mode'] == true;
+
+  /// Linha do tempo do dia [day] no modo diaria: os pontos do dia padrao,
+  /// se houve diaria nele. Dia fora da semana carregada pede as diarias dele.
+  Future<List<dynamic>> _dailyTimelineRecords(
+      DateTime day, DateTime startWeek, List<dynamic> weekRecords) async {
+    final key = DateFormat('yyyy-MM-dd').format(day);
+    bool hasEntry(Iterable<dynamic> days) =>
+        days.any((record) => record is Map && record['date'] == key);
+    var worked = hasEntry(weekRecords);
+    if (!worked && day.isBefore(startWeek)) {
+      final data = await _apiService.exportTimesheet(
+          startDate: day.toIso8601String(),
+          endDate: _endOfDay(day).toIso8601String(),
+          userId: _selectedUser!['id']);
+      worked = hasEntry(data['daily_records'] as List);
+    }
+    if (!worked) return const [];
+    return dailyStandardRecords(_selectedUser?['name']?.toString() ?? '', key,
+        _selectedUser?['daily_hours']);
   }
 
   Future<List<dynamic>> _loadPreviousDayRecords(dynamic userId, DateTime day,
@@ -311,6 +343,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     _buildUserSwitcher(),
                     const SizedBox(height: 24),
                     _buildSummaryCards(),
+                    if (_isDailyUser) ...[
+                      const SizedBox(height: 12),
+                      _buildDailyModeNote(),
+                    ],
                     const SizedBox(height: 24),
                     _buildTimelineChart(),
                     const SizedBox(height: 24),
@@ -497,6 +533,36 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _buildCard('SALDO SEMANA', balanceStr,
             balance >= 0 ? 'acima da meta' : 'abaixo da meta'),
       ],
+    );
+  }
+
+  /// Aviso do modo diaria: quantas diarias na semana e de onde vem o horario.
+  Widget _buildDailyModeNote() {
+    final count = _weeklyRecords.length;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: wineColor.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: wineColor.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.event_available, color: wineColor, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Modo diária: $count diária(s) nesta semana. Cada diária '
+              'aparece com o horário padrão do dia, o mesmo da folha de ponto.',
+              style: TextStyle(
+                  color: Theme.of(context).textTheme.bodyMedium?.color,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
     );
   }
 

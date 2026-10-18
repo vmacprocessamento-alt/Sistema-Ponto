@@ -171,8 +171,10 @@ class _ExportDialogState extends State<ExportDialog> {
           List<Map<String, dynamic>> reports = [];
           for (final rawUser in usersToExport) {
             final user = Map<String, dynamic>.from(rawUser);
-            final data = await _apiService.exportTimesheet(
-                startDate: start, endDate: end, userId: user['id']);
+            final data = _isDailyMode(user)
+                ? await _dailyModeExport(user, start, end)
+                : await _apiService.exportTimesheet(
+                    startDate: start, endDate: end, userId: user['id']);
             reports.add({
               ...data,
               'custom_role': _exportJobTitle(user),
@@ -198,8 +200,10 @@ class _ExportDialogState extends State<ExportDialog> {
               _selectedExportType!.replaceFirst('Individual: ', '');
           final user = Map<String, dynamic>.from(
               _users.firstWhere((u) => u['name'] == userName));
-          final data = await _apiService.exportTimesheet(
-              startDate: start, endDate: end, userId: user['id']);
+          final data = _isDailyMode(user)
+              ? await _dailyModeExport(user, start, end)
+              : await _apiService.exportTimesheet(
+                  startDate: start, endDate: end, userId: user['id']);
 
           await _exportService.exportToExcel(
             data: {
@@ -292,6 +296,27 @@ class _ExportDialogState extends State<ExportDialog> {
   bool _isIntern(Map<String, dynamic> user) {
     final role = (user['role'] ?? '').toString().toLowerCase();
     return role == 'intern' || role.contains('estag');
+  }
+
+  bool _isDailyMode(Map<String, dynamic> user) => user['daily_mode'] == true;
+
+  /// Exportacao de quem esta no modo diaria: no lugar dos pontos, os dias com
+  /// diaria no periodo. O backend monta a aba "Diárias" e a folha de ponto
+  /// padrao, com um dia da carga diaria do cadastro em cada um desses dias.
+  Future<Map<String, dynamic>> _dailyModeExport(
+      Map<String, dynamic> user, String start, String end) async {
+    final entries = await _apiService.getDailyEntries(
+      start: DateTime.parse(start),
+      end: DateTime.parse(end),
+      userId: user['id'].toString(),
+    );
+    return {
+      'employee': user,
+      'daily_records': const [],
+      'daily_mode': true,
+      'daily_dates': [for (final entry in entries) entry['date']],
+      'daily_hours': double.tryParse(user['daily_hours']?.toString() ?? ''),
+    };
   }
 
   String _exportDepartment(Map<String, dynamic> user) {

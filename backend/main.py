@@ -52,6 +52,13 @@ except ImportError:
     messaging = None
     storage = None
 
+try:
+    # Erro do create() do Firestore quando o documento ja existe.
+    from google.api_core.exceptions import AlreadyExists
+except ImportError:
+    class AlreadyExists(Exception):
+        pass
+
 # --- CONFIGURAÇÕES ---
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 if not SECRET_KEY or SECRET_KEY in {
@@ -434,6 +441,61 @@ def generate_scratch_records(year: int, month: int, total_hours: float, days: Op
         ))
     return recs
 
+# Carga do dia padrao da diaria quando o cadastro nao tem uma valida.
+DAILY_MODE_DEFAULT_HOURS = 8.0
+
+def _daily_standard_seed(name: str, day: date) -> int:
+    """Numero que escolhe a entrada e o almoco do dia padrao, tirado do nome
+    e da data. A mesma conta de _standardSeed (frontend/lib/utils/
+    daily_entries.dart): a Dash mostra o horario da folha exportada."""
+    value = 0
+    for byte in f"{name}|{day.isoformat()}".encode("utf-8"):
+        value = (value * 31 + byte) % 1000003
+    return value
+
+def daily_standard_sessions(name: str, day: date, daily_hours: Optional[float]) -> List[tuple]:
+    """Sessoes (entrada, saida) do dia padrao de uma diaria: entrada 08:00 ou
+    08:30, 4h de manha, almoco de 1h ou 1h15 e o resto da carga diaria a
+    tarde (8h sem carga valida no cadastro). Mesma regra de
+    dailyStandardSessions (frontend/lib/utils/daily_entries.dart)."""
+    hours = daily_hours or 0
+    if not 0 < hours <= 16:
+        hours = DAILY_MODE_DEFAULT_HOURS
+    total = int(round(hours * 60))
+    seed = _daily_standard_seed(name, day)
+    start = datetime.combine(day, time(8, 30 if seed % 2 else 0))
+    if total <= 240:
+        return [(start, start + timedelta(minutes=total))]
+    lunch = start + timedelta(minutes=240)
+    back = lunch + timedelta(minutes=75 if (seed // 2) % 2 else 60)
+    return [(start, lunch), (back, back + timedelta(minutes=total - 240))]
+
+def daily_mode_records(data: "ExportData") -> List[ExportRecord]:
+    """Folha de quem esta no modo diaria: o dia padrao (daily_standard_sessions)
+    em cada dia com diaria do periodo, domingo inclusive. Exportar de novo
+    (Excel ou HTML) da os mesmos horarios, e a Dash do app mostra os mesmos."""
+    period = set(export_period_dates(data))
+    days = set()
+    for raw in data.daily_dates or []:
+        try:
+            day = date.fromisoformat(str(raw)[:10])
+        except ValueError:
+            continue
+        if day in period:
+            days.add(day)
+
+    records = []
+    for day in sorted(days):
+        sessions = daily_standard_sessions(data.employee_name, day, data.daily_hours)
+        columns = {}
+        for (start_key, end_key), (start, end) in zip(
+            (("check_in", "check_out"), ("break_start", "break_end")), sessions
+        ):
+            columns[start_key] = start.strftime("%H:%M")
+            columns[end_key] = end.strftime("%H:%M")
+        records.append(ExportRecord(date=day.isoformat(), **columns))
+    return records
+
 # --- MODELS PARA API ---
 
 class ExportData(BaseModel):
@@ -453,6 +515,12 @@ class ExportData(BaseModel):
     period_start: Optional[str] = None
     period_end: Optional[str] = None
     period_label: Optional[str] = None
+    # Modo diaria: os dias (yyyy-mm-dd) com diaria no periodo. A folha leva um
+    # dia padrao de daily_hours em cada um (daily_mode_records) e o arquivo
+    # ganha a aba "Diárias".
+    daily_mode: Optional[bool] = False
+    daily_dates: Optional[List[str]] = None
+    daily_hours: Optional[float] = None
 
 def export_period_dates(data: ExportData) -> List[date]:
     if data.period_start and data.period_end:
@@ -543,6 +611,8 @@ class AdminUserUpdateRequest(BaseModel):
     new_password: Optional[str] = None
     work_schedule_override_enabled: bool = False
     work_schedule_override: Optional[Dict[str, str]] = None
+    # None (app antigo, sem o campo) mantem o modo diaria como esta.
+    daily_mode: Optional[bool] = None
 
 class WorkScheduleConfigRequest(BaseModel):
     shift_start: str = "13:30"
@@ -1800,6 +1870,7 @@ def delete_query_in_batches(db, query, batch_size: int = 300) -> int:
 def delete_user_cascade(db, user_id: str) -> dict:
     collections_by_user_id = [
         "time_records",
+        "daily_entries",
         "adjustment_requests",
         "adjustment_conversations",
     ]
@@ -1859,11 +1930,74 @@ def excel_template_path(is_campo: bool) -> str:
             return candidate
     raise FileNotFoundError(f"Template não encontrado: {file_name}")
 
+DAILY_SHEET_TITLE = "Diárias"
+DAILY_WEEKDAY_NAMES = [
+    "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira",
+    "Sexta-feira", "Sábado", "Domingo",
+]
+DAILY_HEADER_ROW = 7
+
+def add_daily_entries_sheet(wb, timesheet_ws, data: ExportData) -> None:
+    """Aba "Diárias", a primeira do arquivo e a que abre: os dias com diaria
+    do periodo e o total. A folha de ponto padrao fica na aba seguinte, com
+    um dia padrao em cada um desses dias (daily_mode_records)."""
+    ws = wb.create_sheet(DAILY_SHEET_TITLE, 0)
+    days = [date.fromisoformat(record.date) for record in data.daily_records]
+    bold = Font(bold=True)
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+
+    ws["A1"] = "Diárias trabalhadas"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A3"] = f"Colaborador: {data.employee_name}"
+    # A mesma funcao que a folha mostra (C6).
+    ws["A4"] = f"Função: {timesheet_ws.cell(row=6, column=3).value or ''}"
+    ws["A5"] = f"Período: {export_period_label(data)}"
+
+    for col, title in enumerate(("Nº", "Data", "Dia da semana"), start=1):
+        cell = ws.cell(row=DAILY_HEADER_ROW, column=col, value=title)
+        cell.font = bold
+        cell.border = border
+        cell.alignment = center
+    row = DAILY_HEADER_ROW
+    for number, day in enumerate(days, start=1):
+        row = DAILY_HEADER_ROW + number
+        values = (number, day, DAILY_WEEKDAY_NAMES[day.weekday()])
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(row=row, column=col, value=value)
+            cell.border = border
+            cell.alignment = center
+        ws.cell(row=row, column=2).number_format = "DD/MM/YYYY"
+
+    total_row = row + 2
+    ws.cell(row=total_row, column=1, value="Total de diárias").font = bold
+    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=2)
+    total = ws.cell(row=total_row, column=3, value=len(days))
+    total.font = bold
+    total.alignment = center
+    for col in range(1, 4):
+        ws.cell(row=total_row, column=col).border = border
+
+    # A + B + C cabem "Colaborador: <nome completo>" na impressao.
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 26
+    ws.print_area = f"A1:C{total_row}"
+
+    # Abre nesta aba. Com a folha ainda marcada como selecionada, o Excel
+    # abria as duas agrupadas e a edicao de uma mudava a outra.
+    timesheet_ws.sheet_view.tabSelected = False
+    ws.sheet_view.tabSelected = True
+    wb.active = ws
+
 def generate_excel_file(data: ExportData) -> str:
     wb = openpyxl.load_workbook(excel_template_path(data.is_campo))
     ws = wb.active
 
-    if data.generate_from_scratch:
+    if data.daily_mode:
+        data.daily_records = daily_mode_records(data)
+    elif data.generate_from_scratch:
         scratch_days = export_period_dates(data) if (data.period_start and data.period_end) else None
         data.daily_records = generate_scratch_records(int(data.year), int(data.month), data.target_hours or 210.0, days=scratch_days)
 
@@ -1980,6 +2114,9 @@ def generate_excel_file(data: ExportData) -> str:
 
     ws.print_area = EXCEL_PRINT_AREA_INTERN if is_estagiario else EXCEL_PRINT_AREA
 
+    if data.daily_mode:
+        add_daily_entries_sheet(wb, ws, data)
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     wb.save(tmp.name); wb.close()
     return tmp.name
@@ -1992,7 +2129,12 @@ def is_intern_export(data: ExportData) -> bool:
     return "estag" in role or "intern" in role or "estag" in custom_role
 
 def excel_download_filename(data: ExportData) -> str:
-    suffix = "_estag" if is_intern_export(data) else ""
+    if is_intern_export(data):
+        suffix = "_estag"
+    elif data.daily_mode:
+        suffix = "_diarias"
+    else:
+        suffix = ""
     return f"Folha_Ponto_{data.employee_name}_{data.month}{suffix}.xlsx"
 
 MONTH_NAMES = {
@@ -2016,7 +2158,7 @@ header p{font-size:.8rem;opacity:.78;margin-top:.2rem}
 .tab-btn.consolidado{background:#c07010;color:#fff;margin-left:auto}
 .tab-btn.consolidado.active{background:#f0f2f5;color:#c07010}
 .badge{display:inline-block;font-size:.62rem;padding:1px 5px;border-radius:3px;margin-left:3px;vertical-align:middle}
-.badge.estag{background:#3a7bd5;color:#fff}.badge.rev{background:#c05010;color:#fff}.badge.clt{background:#28724f;color:#fff}
+.badge.estag{background:#3a7bd5;color:#fff}.badge.rev{background:#c05010;color:#fff}.badge.clt{background:#28724f;color:#fff}.badge.diaria{background:#7a4fb0;color:#fff}
 .content{padding:1rem}
 .tab-panel{background:#fff;border-radius:6px;padding:1.1rem;box-shadow:0 1px 5px rgba(0,0,0,.1)}
 .emp-header{margin-bottom:.6rem}.emp-info h2{font-size:1.2rem;color:#1a3a5c}
@@ -2149,8 +2291,11 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
     is_estagiario = "estag" in data.employee_role.lower() or "intern" in data.employee_role.lower()
     role = employee_role(data, is_estagiario)
     department = employee_department(data, is_estagiario)
+    is_daily = bool(data.daily_mode)
 
-    if data.generate_from_scratch:
+    if is_daily:
+        data.daily_records = daily_mode_records(data)
+    elif data.generate_from_scratch:
         scratch_days = export_period_dates(data) if (data.period_start and data.period_end) else None
         data.daily_records = generate_scratch_records(year, month, data.target_hours or 210.0, days=scratch_days)
 
@@ -2220,10 +2365,19 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
 </ul></div>"""
     )
 
+    daily_notice = (
+        f"""<div class="payroll-notice ok"><div class="pn-title">Modo diaria - {len(data.daily_records)} diaria(s) no periodo</div></div>"""
+        if is_daily
+        else ""
+    )
+    badge = '<span class="badge estag">Estag.</span>' if is_estagiario else (
+        '<span class="badge diaria">Diária</span>' if is_daily else ''
+    )
+
     panel = f"""
 <div class="tab-panel" id="panel-{panel_id}" style="display:{'block' if visible else 'none'}">
   <div class="emp-header"><div class="emp-info">
-    <h2>{esc(data.employee_name)}{'<span class="badge estag">Estag.</span>' if is_estagiario else ''}</h2>
+    <h2>{esc(data.employee_name)}{badge}</h2>
     <span>Funcao: <strong>{esc(role)}</strong></span>
     <span>Departamento: <strong>{esc(department)}</strong></span>
   </div></div>
@@ -2235,6 +2389,7 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
     <div class="s-card noc"><span>Ad. Not. real</span><strong>{fmt_minutes(totals['noc_real'])}</strong></div>
     <div class="s-card noc2"><span>AN ficto (x8/7)</span><strong>{fmt_minutes(totals['noc_ficto'])}</strong></div>
   </div>
+  {daily_notice}
   {notice}
   <div class="legend">
     <span class="flag fer">FERIADO</span> Feriado trabalhado (+100%) &nbsp;
@@ -2253,7 +2408,7 @@ def build_employee_html(data: ExportData, panel_id: str, visible: bool) -> tuple
   <div class="fonte">Arquivo: {esc(excel_download_filename(data))}</div>
 </div>"""
 
-    summary = {**totals, "name": data.employee_name, "role": role, "department": department, "is_estagiario": is_estagiario}
+    summary = {**totals, "name": data.employee_name, "role": role, "department": department, "is_estagiario": is_estagiario, "is_daily": is_daily}
     return panel, summary
 
 def build_consolidated_html(summaries: List[dict], month_label: str) -> str:
@@ -2263,10 +2418,11 @@ def build_consolidated_html(summaries: List[dict], month_label: str) -> str:
         for key in grand:
             grand[key] += summary[key]
         estag = summary["is_estagiario"]
+        kind = ("estag", "Estag.") if estag else (("diaria", "Diária") if summary.get("is_daily") else ("clt", "CLT"))
         rows.append(f"""
 <tr class="{'estag-row' if estag else ''}">
   <td>{esc(summary['name'])}{'<span class="badge estag">Estag.</span>' if estag else ''}</td>
-  <td class="centro"><span class="badge {'estag' if estag else 'clt'}">{'Estag.' if estag else 'CLT'}</span></td>
+  <td class="centro"><span class="badge {kind[0]}">{kind[1]}</span></td>
   <td>{esc(summary['role'])}</td><td>{esc(summary['department'])}</td>
   <td class="num">{summary['days']}</td>
   <td class="hn">{fmt_minutes(summary['normal'])}</td>
@@ -2308,7 +2464,7 @@ def generate_batch_html_file(data_list: List[ExportData]) -> str:
         is_estagiario = "estag" in data.employee_role.lower() or "intern" in data.employee_role.lower()
         panel_id = tab_id(data.employee_name, idx, data.month, data.year, is_estagiario)
         tabs.append(
-            f"""<button class="tab-btn {'active' if idx == 0 else ''}" onclick="showTab('{panel_id}')" id="btn-{panel_id}">{esc(abbreviated_name(data.employee_name))}{'<span class="badge estag">Estag.</span>' if is_estagiario else ''}</button>"""
+            f"""<button class="tab-btn {'active' if idx == 0 else ''}" onclick="showTab('{panel_id}')" id="btn-{panel_id}">{esc(abbreviated_name(data.employee_name))}{'<span class="badge estag">Estag.</span>' if is_estagiario else ('<span class="badge diaria">Diária</span>' if data.daily_mode else '')}</button>"""
         )
         panel, summary = build_employee_html(data, panel_id, idx == 0)
         panels.append(panel)
@@ -3240,6 +3396,455 @@ async def reject_schedule_request_endpoint(
     })
     return {"status": "rejected"}
 
+# --- MODO DIARIA ---
+# Quem esta no modo diaria (users.daily_mode) nao bate entrada e saida: so
+# marca que trabalhou no dia. Uma diaria por pessoa por dia: o documento de
+# daily_entries tem o id "<uid>_<yyyy-mm-dd>" e e gravado com create(), que
+# falha se ele ja existe. Passa so por aqui (Admin SDK): as regras do
+# Firestore nao abrem a colecao para o app.
+
+class DailyEntryRequest(BaseModel):
+    # Diaria marcada sem internet e enviada depois: vale o dia do aparelho
+    # no momento do toque (timestamp), na mesma janela da batida offline.
+    timestamp: Optional[str] = None
+    offline: bool = False
+
+# Periodo maximo de uma consulta de diarias (um ano e folga).
+_DAILY_ENTRIES_MAX_RANGE = timedelta(days=400)
+
+def _daily_entry_id(user_id: str, day: date) -> str:
+    return f"{user_id}_{day.isoformat()}"
+
+def _daily_entry_moment(payload: DailyEntryRequest, now: datetime) -> datetime:
+    """Hora local da diaria: agora, pelo relogio do servidor; a marcada
+    offline vale a hora do toque, de ate 7 dias atras e nao do futuro."""
+    if not payload.offline:
+        return now
+    attempted = _to_local_naive(payload.timestamp)
+    if attempted is None:
+        raise HTTPException(status_code=400, detail="Informe a hora da diaria offline.")
+    delay = now - attempted
+    if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
+        raise HTTPException(status_code=400, detail="A diaria offline esta fora do periodo aceito.")
+    return attempted
+
+def _daily_entries_between(db, user_id: str, start: date, end: date) -> List[dict]:
+    """Diarias de user_id de start a end (inclusive), em ordem de data. Le
+    pelo id do documento ("<uid>_<data>", que ja ordena por data): so o
+    periodo, sem indice composto para publicar no Firestore."""
+    collection = db.collection("daily_entries")
+    query = collection.where(
+        "__name__", ">=", collection.document(_daily_entry_id(user_id, start))
+    ).where(
+        "__name__", "<=", collection.document(_daily_entry_id(user_id, end))
+    )
+    entries = [serialize_firestore_document(item) for item in query.stream()]
+    entries = [entry for entry in entries if entry.get("user_id") == user_id]
+    entries.sort(key=lambda entry: str(entry.get("date") or ""))
+    return entries
+
+def _parse_day_param(value: str, name: str) -> date:
+    try:
+        return date.fromisoformat((value or "").strip()[:10])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Data invalida em {name}.") from exc
+
+@app.post("/daily-entries")
+async def create_daily_entry_endpoint(
+    payload: DailyEntryRequest,
+    user=Depends(require_authenticated_user),
+):
+    if user.get("daily_mode") is not True:
+        raise HTTPException(status_code=403, detail="Seu cadastro nao esta no modo diaria.")
+    now = _local_now()
+    moment = _daily_entry_moment(payload, now)
+    day = moment.date()
+
+    db = get_firestore_admin()
+    ref = db.collection("daily_entries").document(_daily_entry_id(user["id"], day))
+    entry = {
+        "user_id": user["id"],
+        "user_name": user.get("name", ""),
+        "date": day.isoformat(),
+        "registered_at": moment.isoformat(),
+        "created_by_id": user["id"],
+    }
+    if payload.offline:
+        entry["synced_from_offline"] = True
+    try:
+        ref.create({**entry, "created_at": firestore.SERVER_TIMESTAMP})
+    except AlreadyExists:
+        # Segundo toque no dia, outro aparelho ou reenvio da fila offline:
+        # a diaria do dia ja esta la e vale a primeira.
+        return {"status": "existing", **serialize_firestore_document(ref.get())}
+    return {"status": "created", "id": ref.id, **entry}
+
+@app.get("/daily-entries")
+async def list_daily_entries_endpoint(
+    start: str,
+    end: str,
+    user_id: Optional[str] = None,
+    user=Depends(require_authenticated_user),
+):
+    target_id = (user_id or user["id"]).strip()
+    if target_id != user["id"] and user.get("role") not in ("admin", "manager"):
+        raise HTTPException(status_code=403, detail="Apenas admin ou manager pode ver diarias de outra pessoa.")
+    start_day = _parse_day_param(start, "start")
+    end_day = _parse_day_param(end, "end")
+    if end_day < start_day or end_day - start_day > _DAILY_ENTRIES_MAX_RANGE:
+        raise HTTPException(status_code=400, detail="Periodo de diarias invalido.")
+    db = get_firestore_admin()
+    return {"entries": _daily_entries_between(db, target_id, start_day, end_day)}
+
+class AdminDailyEntryCreateRequest(BaseModel):
+    user_id: str
+    date: str
+    reason: str
+
+class AdminDailyEntryDeleteRequest(BaseModel):
+    reason: str
+
+def _require_reason(value: str) -> str:
+    reason = (value or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Informe o motivo.")
+    return reason[:500]
+
+def _daily_entry_audit(db, action: str, admin: dict, entry: dict, reason: str) -> None:
+    db.collection("system_audits").document().set({
+        "action": action,
+        "target_user_id": entry.get("user_id"),
+        "date": entry.get("date"),
+        "reason": reason,
+        "entry": entry,
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "admin_email": admin.get("email", ""),
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+
+@app.post("/admin/daily-entries")
+async def admin_create_daily_entry_endpoint(
+    payload: AdminDailyEntryCreateRequest,
+    admin=Depends(require_admin_user),
+):
+    """Admin lanca a diaria de um dia (a pessoa esqueceu de marcar). Uma por
+    dia, como a da propria pessoa; dia futuro nao."""
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode lancar diarias.")
+    reason = _require_reason(payload.reason)
+    day = _parse_day_param(payload.date, "date")
+    now = _local_now()
+    if day > now.date():
+        raise HTTPException(status_code=400, detail="Nao da para lancar diaria em dia futuro.")
+
+    db = get_firestore_admin()
+    target = db.collection("users").document(payload.user_id.strip()).get()
+    if not target.exists:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado.")
+    ref = db.collection("daily_entries").document(_daily_entry_id(target.id, day))
+    entry = {
+        "user_id": target.id,
+        "user_name": (target.to_dict() or {}).get("name", ""),
+        "date": day.isoformat(),
+        "registered_at": now.isoformat(),
+        "created_by_id": admin["id"],
+        "created_by_name": admin.get("name", ""),
+        "created_by_admin": True,
+        "admin_reason": reason,
+    }
+    try:
+        ref.create({**entry, "created_at": firestore.SERVER_TIMESTAMP})
+    except AlreadyExists:
+        raise HTTPException(status_code=409, detail="Ja existe diaria nesse dia.")
+    _daily_entry_audit(db, "admin_add_daily_entry", admin, {"id": ref.id, **entry}, reason)
+    return {"status": "created", "id": ref.id, **entry}
+
+@app.delete("/admin/daily-entries/{entry_id}")
+async def admin_delete_daily_entry_endpoint(
+    entry_id: str,
+    payload: AdminDailyEntryDeleteRequest,
+    admin=Depends(require_admin_user),
+):
+    """Admin apaga uma diaria (marcada por engano). A copia fica na
+    auditoria (system_audits)."""
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode apagar diarias.")
+    reason = _require_reason(payload.reason)
+    db = get_firestore_admin()
+    ref = db.collection("daily_entries").document(entry_id)
+    snapshot = ref.get()
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="Diaria nao encontrada.")
+    entry = serialize_firestore_document(snapshot)
+    ref.delete()
+    _daily_entry_audit(db, "admin_delete_daily_entry", admin, entry, reason)
+    return {"status": "deleted", "id": entry_id}
+
+# --- ACESSO POR CPF ---
+# Quem cadastra e o admin (nao ha mais cadastro pelo app): a pessoa entra com
+# o CPF e a senha padrao e, no primeiro acesso, cria a propria senha
+# (users.must_change_password). O Firebase Auth exige e-mail: sem um e-mail
+# de verdade, a conta usa um interno tirado do CPF (cpf_login_email), que
+# nunca recebe mensagem. O login por CPF (/auth/cpf-login) confere a senha e
+# devolve o e-mail da conta; o app entra com ele como antes.
+
+DEFAULT_USER_PASSWORD = "123456"
+CPF_LOGIN_EMAIL_DOMAIN = os.getenv("CPF_LOGIN_EMAIL_DOMAIN", "cpf.ponto.vmacengenharia.com")
+
+def cpf_digits(value) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+def is_valid_cpf(digits: str) -> bool:
+    """CPF de 11 digitos com os dois digitos verificadores certos."""
+    if len(digits) != 11 or not digits.isdigit() or digits == digits[0] * 11:
+        return False
+    for size in (9, 10):
+        total = sum(int(digits[i]) * (size + 1 - i) for i in range(size))
+        if (total * 10) % 11 % 10 != int(digits[size]):
+            return False
+    return True
+
+def format_cpf(digits: str) -> str:
+    return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
+
+def cpf_login_email(digits: str) -> str:
+    return f"{digits}@{CPF_LOGIN_EMAIL_DOMAIN}"
+
+def _login_emails(email: Optional[str], digits: str) -> tuple:
+    """(e-mail do cadastro, e-mail da conta no Firebase Auth). Sem e-mail, o
+    cadastro fica sem ("") e a conta usa o interno do CPF."""
+    email = (email or "").strip().lower()
+    if email:
+        if "@" not in email:
+            raise HTTPException(status_code=400, detail="E-mail invalido.")
+        return email, email
+    if len(digits) != 11:
+        raise HTTPException(status_code=400, detail="Informe o e-mail ou um CPF valido.")
+    return "", cpf_login_email(digits)
+
+def _users_with_cpf(db, digits: str) -> List[Any]:
+    """Cadastros com este CPF, em qualquer formato gravado (123.456.789-00,
+    o 123.456.789.00 do cadastro antigo ou so digitos). Le a colecao toda:
+    sao poucas pessoas, e o cadastro antigo nao tem cpf_digits."""
+    return [
+        doc for doc in db.collection("users").stream()
+        if cpf_digits((doc.to_dict() or {}).get("cpf")) == digits
+    ]
+
+# Tentativas erradas de login por CPF: no maximo 10 em 15 min por aparelho
+# (IP) e por CPF. O /api/ nao passa pela palavra-chave da empresa.
+_LOGIN_FAILURE_WINDOW = timedelta(minutes=15)
+_LOGIN_MAX_FAILURES = 10
+_login_failures: Dict[str, List[datetime]] = {}
+
+def _recent_login_failures(key: str, now: datetime) -> List[datetime]:
+    recent = [at for at in _login_failures.get(key, []) if now - at < _LOGIN_FAILURE_WINDOW]
+    if recent:
+        _login_failures[key] = recent
+    else:
+        _login_failures.pop(key, None)
+    return recent
+
+def _login_blocked(keys: List[str], now: datetime) -> bool:
+    return any(len(_recent_login_failures(key, now)) >= _LOGIN_MAX_FAILURES for key in keys)
+
+def _register_login_failure(keys: List[str], now: datetime) -> None:
+    for key in keys:
+        _login_failures.setdefault(key, []).append(now)
+
+async def _check_firebase_password(email: str, password: str) -> str:
+    """Confere a senha da conta no Firebase Auth: 'ok', 'invalid',
+    'disabled' ou 'throttled'."""
+    if not FIREBASE_WEB_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Login por CPF indisponivel: configure FIREBASE_WEB_API_KEY no backend.",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword",
+                params={"key": FIREBASE_WEB_API_KEY},
+                json={"email": email, "password": password, "returnSecureToken": False},
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="Falha ao validar o acesso. Tente novamente.") from exc
+    if response.is_success:
+        return "ok"
+    try:
+        message = str(response.json().get("error", {}).get("message", ""))
+    except ValueError:
+        message = ""
+    if message.startswith("USER_DISABLED"):
+        return "disabled"
+    if message.startswith("TOO_MANY_ATTEMPTS"):
+        return "throttled"
+    return "invalid"
+
+class CpfLoginRequest(BaseModel):
+    cpf: str
+    password: str
+
+@app.post("/auth/cpf-login")
+async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
+    """Login por CPF: com a senha certa, devolve o e-mail da conta para o app
+    entrar no Firebase. CPF desconhecido e senha errada dao a mesma resposta."""
+    digits = cpf_digits(payload.cpf)
+    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "")
+    keys = [f"ip:{client_ip}", f"cpf:{digits}"]
+    now = _local_now()
+    if _login_blocked(keys, now):
+        raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde 15 minutos e tente de novo.")
+    invalid = HTTPException(status_code=401, detail="CPF ou senha incorretos.")
+    if len(digits) != 11 or not payload.password:
+        _register_login_failure(keys, now)
+        raise invalid
+
+    db = get_firestore_admin()
+    matches = _users_with_cpf(db, digits)
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="Mais de um cadastro com este CPF. Procure o administrador.")
+    if not matches:
+        _register_login_failure(keys, now)
+        raise invalid
+    try:
+        email = firebase_auth.get_user(matches[0].id).email
+    except firebase_auth.UserNotFoundError:
+        email = None
+    if not email:
+        _register_login_failure(keys, now)
+        raise invalid
+
+    result = await _check_firebase_password(email, payload.password)
+    if result == "disabled":
+        raise HTTPException(status_code=403, detail="Esta conta foi desativada.")
+    if result == "throttled":
+        raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde um pouco e tente de novo.")
+    if result != "ok":
+        _register_login_failure(keys, now)
+        raise invalid
+    _login_failures.pop(f"cpf:{digits}", None)
+    return {"email": email}
+
+class AdminUserCreateRequest(BaseModel):
+    name: str
+    cpf: str
+    email: Optional[str] = None
+    role: str = "employee"
+    job_title: Optional[str] = None
+    daily_hours: float = 8.0
+    daily_mode: bool = False
+
+@app.post("/admin/users")
+async def create_user_admin_endpoint(
+    payload: AdminUserCreateRequest,
+    admin=Depends(require_admin_user),
+):
+    """Admin cadastra a pessoa com a senha padrao; no primeiro acesso ela
+    cria a propria (must_change_password)."""
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode cadastrar usuarios.")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Informe o nome.")
+    digits = cpf_digits(payload.cpf)
+    if not is_valid_cpf(digits):
+        raise HTTPException(status_code=400, detail="CPF invalido.")
+    role = payload.role.strip()
+    if role not in {"admin", "manager", "employee", "intern"}:
+        raise HTTPException(status_code=400, detail="Cargo invalido.")
+    email, auth_email = _login_emails(payload.email, digits)
+
+    db = get_firestore_admin()
+    if _users_with_cpf(db, digits):
+        raise HTTPException(status_code=409, detail="Ja existe um cadastro com este CPF.")
+    try:
+        account = firebase_auth.create_user(
+            email=auth_email, password=DEFAULT_USER_PASSWORD, display_name=name,
+        )
+    except firebase_auth.EmailAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail="Este e-mail ja esta em uso.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Falha ao criar a conta: {exc}") from exc
+
+    is_intern = role == "intern"
+    profile = {
+        "uid": account.uid,
+        "email": email,
+        "name": name,
+        "cpf": format_cpf(digits),
+        "cpf_digits": digits,
+        "role": role,
+        "job_title": (payload.job_title or "").strip() or ("Estagiario" if is_intern else "Aux. Geral"),
+        "daily_hours": payload.daily_hours,
+        "daily_mode": payload.daily_mode and role == "employee",
+        "disabled": False,
+        "must_change_password": True,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "created_by_id": admin["id"],
+        "created_by_name": admin.get("name", ""),
+    }
+    try:
+        db.collection("users").document(account.uid).set(profile)
+    except Exception as exc:
+        # Sem o cadastro a conta nao serve: desfaz para o CPF poder ser usado de novo.
+        try:
+            firebase_auth.delete_user(account.uid)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Falha ao gravar o cadastro: {exc}") from exc
+    db.collection("system_audits").document().set({
+        "action": "create_user_admin",
+        "target_user_id": account.uid,
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "admin_email": admin.get("email", ""),
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {
+        "status": "created",
+        "id": account.uid,
+        "cpf": profile["cpf"],
+        "default_password": DEFAULT_USER_PASSWORD,
+    }
+
+class OwnPasswordChangeRequest(BaseModel):
+    new_password: str
+
+@app.post("/me/password")
+async def change_own_password_endpoint(
+    payload: OwnPasswordChangeRequest,
+    user=Depends(require_authenticated_user),
+):
+    """A pessoa troca a propria senha (no primeiro acesso, obrigatorio).
+    Pelo Admin SDK: vale mesmo com a sessao antiga, que o updatePassword do
+    app recusaria ("login recente")."""
+    password = payload.new_password
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="A senha precisa de pelo menos 6 caracteres.")
+    if password == DEFAULT_USER_PASSWORD:
+        raise HTTPException(status_code=400, detail="Escolha uma senha diferente da senha padrao.")
+    cpf = cpf_digits(user.get("cpf"))
+    if cpf and password == cpf:
+        raise HTTPException(status_code=400, detail="Nao use o CPF como senha.")
+
+    db = get_firestore_admin()
+    try:
+        firebase_auth.update_user(user["id"], password=password)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Falha ao trocar a senha: {exc}") from exc
+    db.collection("users").document(user["id"]).update({
+        "must_change_password": False,
+        "password_changed_at": firestore.SERVER_TIMESTAMP,
+    })
+    db.collection("system_audits").document().set({
+        "action": "user_changed_password",
+        "target_user_id": user["id"],
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "success"}
+
 @app.put("/admin/users/{user_id}")
 async def update_user_admin_endpoint(
     user_id: str,
@@ -3270,16 +3875,22 @@ async def update_user_admin_endpoint(
             raise HTTPException(status_code=400, detail="Informe o horario individual completo.")
         override = _validate_work_schedule(payload.work_schedule_override)
 
-    new_email = payload.email.strip().lower()
-    if not new_email or "@" not in new_email:
-        raise HTTPException(status_code=400, detail="E-mail invalido.")
+    new_cpf = cpf_digits(payload.cpf)
+    # CPF antigo fora do padrao continua valendo; o novo precisa ser valido e
+    # unico, porque e o login.
+    if new_cpf and new_cpf != cpf_digits((target_doc.to_dict() or {}).get("cpf")):
+        if not is_valid_cpf(new_cpf):
+            raise HTTPException(status_code=400, detail="CPF invalido.")
+        if any(doc.id != target_id for doc in _users_with_cpf(db, new_cpf)):
+            raise HTTPException(status_code=409, detail="Ja existe outro cadastro com este CPF.")
+    new_email, auth_email = _login_emails(payload.email, new_cpf)
     new_password = (payload.new_password or "").strip()
     if new_password and len(new_password) < 6:
         raise HTTPException(status_code=400, detail="A nova senha deve ter pelo menos 6 caracteres.")
 
     try:
         auth_update = {
-            "email": new_email,
+            "email": auth_email,
             "disabled": payload.disabled,
         }
         if new_password:
@@ -3298,7 +3909,8 @@ async def update_user_admin_endpoint(
         "role": role,
         "job_title": payload.job_title.strip(),
         "daily_hours": payload.daily_hours,
-        "cpf": payload.cpf.strip(),
+        "cpf": format_cpf(new_cpf) if len(new_cpf) == 11 else payload.cpf.strip(),
+        "cpf_digits": new_cpf,
         "disabled": payload.disabled,
         "work_schedule_override_enabled": payload.work_schedule_override_enabled,
         "work_schedule_override": override,
@@ -3307,6 +3919,13 @@ async def update_user_admin_endpoint(
         "last_admin_update_by_name": admin.get("name", ""),
         "last_admin_update_by_email": admin.get("email", ""),
     }
+    if new_password:
+        # Senha definida pelo admin (a padrao ou outra): no proximo acesso a
+        # pessoa cria a propria.
+        update_data["must_change_password"] = True
+    if payload.daily_mode is not None:
+        # Estagiario segue o horario controlado; nao entra no modo diaria.
+        update_data["daily_mode"] = payload.daily_mode and role not in {"intern", "estagiario"}
     user_ref.update(update_data)
     db.collection("system_audits").document().set({
         "action": "update_user_admin",
@@ -3317,6 +3936,7 @@ async def update_user_admin_endpoint(
         "updated_fields": [
             "name", "email", "role", "job_title", "daily_hours", "cpf",
             "disabled", "work_schedule_override_enabled", "work_schedule_override",
+            *( ["daily_mode"] if payload.daily_mode is not None else [] ),
             *( ["password"] if new_password else [] ),
         ],
         "password_was_reset": bool(new_password),

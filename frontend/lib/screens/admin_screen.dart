@@ -1,11 +1,16 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'dart:async';
 import '../services/api_service.dart';
 import '../utils/batch_entry.dart';
+import '../utils/cpf.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
+import 'daily_entries_admin_screen.dart';
 import 'team_records_screen.dart';
 
 class AdminScreen extends StatefulWidget {
@@ -138,50 +143,109 @@ class _UsersListTabState extends State<_UsersListTab> {
     );
   }
 
+  void _openDailyEntries(dynamic user) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DailyEntriesAdminScreen(
+          user: Map<String, dynamic>.from(user as Map),
+          canEdit: _isAdmin,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _createUser() async {
+    final created = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => const UserCreateDialog(),
+    );
+    if (created == null || !mounted) return;
+    await _fetchUsers(forceRefresh: true);
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      builder: (context) => AccessMessageDialog(
+        name: created['name']?.toString() ?? '',
+        cpf: created['cpf']?.toString() ?? '',
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading)
       return const Center(child: CircularProgressIndicator(color: wineColor));
 
-    return RefreshIndicator(
-      // Puxar a lista para baixo e pedido explicito de dado novo: ignora o
-      // cache de 5 min do quadro de pessoal.
-      onRefresh: () => _fetchUsers(forceRefresh: true),
-      color: wineColor,
-      child: ListView.separated(
-        padding: const EdgeInsets.all(16),
-        itemCount: _users.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 12),
-        itemBuilder: (context, index) {
-          final user = _users[index];
-          String role = user['role'] ?? '-';
-          if (role == 'intern') role = 'Estagiário';
-          if (role == 'employee') role = 'Funcionário';
-          final jobTitle = (user['job_title'] ?? role).toString();
+    return Scaffold(
+      floatingActionButton: _isAdmin
+          ? FloatingActionButton.extended(
+              onPressed: _createUser,
+              backgroundColor: wineColor,
+              icon: const Icon(Icons.person_add, color: Colors.white),
+              label: const Text('Novo usuário',
+                  style: TextStyle(color: Colors.white)),
+            )
+          : null,
+      body: RefreshIndicator(
+        // Puxar a lista para baixo e pedido explicito de dado novo: ignora o
+        // cache de 5 min do quadro de pessoal.
+        onRefresh: () => _fetchUsers(forceRefresh: true),
+        color: wineColor,
+        child: ListView.separated(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
+          itemCount: _users.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 12),
+          itemBuilder: (context, index) {
+            final user = _users[index];
+            String role = user['role'] ?? '-';
+            if (role == 'intern') role = 'Estagiário';
+            if (role == 'employee') role = 'Funcionário';
+            final jobTitle = (user['job_title'] ?? role).toString();
+            final dailyTag = user['daily_mode'] == true ? ' • Diária' : '';
+            final cpf = cpfDigits(user['cpf']?.toString());
+            final firstAccess = user['must_change_password'] == true
+                ? ' • Aguardando primeiro acesso'
+                : '';
 
-          return Container(
-            decoration: BoxDecoration(
-              color: Theme.of(context).cardColor,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: ListTile(
-              leading: CircleAvatar(
-                backgroundColor: wineColor,
-                child: Text(user['name'][0].toUpperCase(),
-                    style: const TextStyle(
-                        color: Colors.white, fontWeight: FontWeight.bold)),
+            return Container(
+              decoration: BoxDecoration(
+                color: Theme.of(context).cardColor,
+                borderRadius: BorderRadius.circular(12),
               ),
-              title: Text(user['name'],
-                  style: const TextStyle(fontWeight: FontWeight.bold)),
-              subtitle: Text('$role • $jobTitle • ${user['daily_hours']}h/dia',
-                  style: const TextStyle(color: Colors.grey, fontSize: 12)),
-              trailing: _isAdmin
-                  ? const Icon(Icons.edit, color: wineColor, size: 20)
-                  : null,
-              onTap: _isAdmin ? () => _editUser(user) : null,
-            ),
-          );
-        },
+              child: ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: wineColor,
+                  child: Text(user['name'][0].toUpperCase(),
+                      style: const TextStyle(
+                          color: Colors.white, fontWeight: FontWeight.bold)),
+                ),
+                title: Text(user['name'],
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text(
+                    '$role • $jobTitle • ${user['daily_hours']}h/dia$dailyTag'
+                    '\nCPF: ${cpf.length == 11 ? formatCpf(cpf) : 'não informado'}'
+                    '$firstAccess',
+                    style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (user['daily_mode'] == true)
+                      IconButton(
+                        tooltip: 'Diárias',
+                        icon: const Icon(Icons.event_available,
+                            color: wineColor, size: 22),
+                        onPressed: () => _openDailyEntries(user),
+                      ),
+                    if (_isAdmin)
+                      const Icon(Icons.edit, color: wineColor, size: 20),
+                  ],
+                ),
+                onTap: _isAdmin ? () => _editUser(user) : null,
+              ),
+            );
+          },
+        ),
       ),
     );
   }
@@ -1457,6 +1521,8 @@ class _UserEditDialogState extends State<UserEditDialog> {
   late String _selectedRole;
   bool _disabled = false;
   bool _scheduleOverrideEnabled = false;
+  // Modo diaria: so para Funcionario.
+  bool _dailyMode = false;
   bool _obscurePassword = true;
   final _apiService = ApiService();
   bool _isSaving = false;
@@ -1469,8 +1535,9 @@ class _UserEditDialogState extends State<UserEditDialog> {
         TextEditingController(text: widget.user['name']?.toString() ?? '');
     _emailController =
         TextEditingController(text: widget.user['email']?.toString() ?? '');
-    _cpfController =
-        TextEditingController(text: widget.user['cpf']?.toString() ?? '');
+    final savedCpf = widget.user['cpf']?.toString() ?? '';
+    _cpfController = TextEditingController(
+        text: cpfDigits(savedCpf).length == 11 ? formatCpf(savedCpf) : savedCpf);
     _passwordController = TextEditingController();
     _hoursController =
         TextEditingController(text: widget.user['daily_hours'].toString());
@@ -1480,6 +1547,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
       text: _initialJobTitle(_selectedRole, widget.user['job_title']),
     );
     _disabled = widget.user['disabled'] == true;
+    _dailyMode = widget.user['daily_mode'] == true;
     _scheduleOverrideEnabled =
         widget.user['work_schedule_override_enabled'] == true;
     final rawOverride = widget.user['work_schedule_override'];
@@ -1550,15 +1618,19 @@ class _UserEditDialogState extends State<UserEditDialog> {
             ),
             const SizedBox(height: 16),
             TextFormField(
-              controller: _emailController,
-              decoration: const InputDecoration(labelText: 'E-mail'),
-              keyboardType: TextInputType.emailAddress,
+              controller: _cpfController,
+              decoration: const InputDecoration(
+                  labelText: 'CPF', helperText: 'É o login da pessoa.'),
+              keyboardType: TextInputType.number,
+              inputFormatters: [CpfInputFormatter()],
             ),
             const SizedBox(height: 16),
             TextFormField(
-              controller: _cpfController,
-              decoration: const InputDecoration(labelText: 'CPF'),
-              keyboardType: TextInputType.number,
+              controller: _emailController,
+              decoration: const InputDecoration(
+                  labelText: 'E-mail (opcional)',
+                  helperText: 'Sem e-mail, o acesso é só pelo CPF.'),
+              keyboardType: TextInputType.emailAddress,
             ),
             const SizedBox(height: 16),
             TextFormField(
@@ -1566,7 +1638,9 @@ class _UserEditDialogState extends State<UserEditDialog> {
               obscureText: _obscurePassword,
               decoration: InputDecoration(
                 labelText: 'Nova senha',
-                helperText: 'Deixe vazio para manter a senha atual.',
+                helperText: 'Deixe vazio para manter. Com senha nova, a pessoa '
+                    'cria a própria no próximo acesso.',
+                helperMaxLines: 2,
                 suffixIcon: IconButton(
                   onPressed: () =>
                       setState(() => _obscurePassword = !_obscurePassword),
@@ -1576,7 +1650,18 @@ class _UserEditDialogState extends State<UserEditDialog> {
                 ),
               ),
             ),
-            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => setState(() {
+                  _passwordController.text = ApiService.defaultUserPassword;
+                  _obscurePassword = false;
+                }),
+                icon: const Icon(Icons.lock_reset, size: 18),
+                label: const Text(
+                    'Voltar para a senha padrão (${ApiService.defaultUserPassword})'),
+              ),
+            ),
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
               value: _disabled,
@@ -1636,6 +1721,19 @@ class _UserEditDialogState extends State<UserEditDialog> {
               keyboardType:
                   const TextInputType.numberWithOptions(decimal: true),
             ),
+            if (_selectedRole == 'employee') ...[
+              const Divider(height: 32),
+              SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                value: _dailyMode,
+                onChanged: (value) => setState(() => _dailyMode = value),
+                title: const Text('Modo diária'),
+                subtitle: const Text(
+                    'A tela de ponto vira só o botão "Adicionar diária" (uma '
+                    'por dia). A exportação traz as diárias e uma folha de '
+                    'ponto padrão com a carga diária acima.'),
+              ),
+            ],
             if (_selectedRole == 'intern' || _selectedRole == 'estagiario') ...[
               const Divider(height: 32),
               SwitchListTile.adaptive(
@@ -1690,11 +1788,20 @@ class _UserEditDialogState extends State<UserEditDialog> {
     final name = _nameController.text.trim();
     final email = _emailController.text.trim();
     final password = _passwordController.text.trim();
-    if (name.isEmpty || email.isEmpty || !email.contains('@')) {
+    final cpf = _cpfController.text.trim();
+    // E-mail opcional; sem ele, o CPF e o login e precisa ser valido.
+    final String? problem = name.isEmpty
+        ? 'Informe o nome.'
+        : (email.isNotEmpty && !email.contains('@'))
+            ? 'E-mail inválido.'
+            : (email.isEmpty && cpfDigits(cpf).length != 11)
+                ? 'Sem e-mail, informe um CPF válido: ele é o login.'
+                : null;
+    if (problem != null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('Informe um nome e um e-mail válidos.'),
-            backgroundColor: Color(0xFF8B0000)),
+        SnackBar(
+            content: Text(problem),
+            backgroundColor: const Color(0xFF8B0000)),
       );
       return;
     }
@@ -1729,6 +1836,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
                 'timezone': 'America/Sao_Paulo',
               }
             : null,
+        dailyMode: _selectedRole == 'employee' && _dailyMode,
       );
       widget.onSave();
       if (mounted) Navigator.pop(context);
@@ -1830,6 +1938,300 @@ class _UserEditDialogState extends State<UserEditDialog> {
     } finally {
       if (mounted) setState(() => _isDeleting = false);
     }
+  }
+}
+
+/// Cadastro de uma pessoa pelo admin (nao ha mais cadastro pelo app). Ela
+/// entra com o CPF e a senha padrao e cria a propria no primeiro acesso.
+/// Devolve {'name', 'cpf'} da conta criada, ou null.
+class UserCreateDialog extends StatefulWidget {
+  const UserCreateDialog({super.key});
+
+  @override
+  State<UserCreateDialog> createState() => _UserCreateDialogState();
+}
+
+class _UserCreateDialogState extends State<UserCreateDialog> {
+  static const Color wineColor = Color(0xFF8B0000);
+
+  final _formKey = GlobalKey<FormState>();
+  final _nameController = TextEditingController();
+  final _cpfController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _jobTitleController = TextEditingController(text: 'Aux. Geral');
+  final _hoursController = TextEditingController(text: '8.0');
+  final _apiService = ApiService();
+  String _role = 'employee';
+  bool _dailyMode = false;
+  bool _saving = false;
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _cpfController.dispose();
+    _emailController.dispose();
+    _jobTitleController.dispose();
+    _hoursController.dispose();
+    super.dispose();
+  }
+
+  void _changeRole(String role) {
+    setState(() {
+      _role = role;
+      if (role == 'intern') {
+        _hoursController.text = '6.0';
+        _jobTitleController.text = 'Estagiario';
+      } else if (role == 'employee') {
+        _hoursController.text = '8.0';
+        if (_jobTitleController.text.trim().isEmpty ||
+            _jobTitleController.text.trim() == 'Estagiario') {
+          _jobTitleController.text = 'Aux. Geral';
+        }
+      }
+    });
+  }
+
+  Future<void> _save() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() => _saving = true);
+    try {
+      final name = _nameController.text.trim();
+      final created = await _apiService.createUserAdmin(
+        name: name,
+        cpf: _cpfController.text,
+        email: _emailController.text.trim(),
+        role: _role,
+        jobTitle: _jobTitleController.text.trim().isEmpty
+            ? (_role == 'intern' ? 'Estagiario' : 'Aux. Geral')
+            : _jobTitleController.text.trim(),
+        dailyHours: double.tryParse(
+                _hoursController.text.replaceAll(',', '.')) ??
+            (_role == 'intern' ? 6.0 : 8.0),
+        dailyMode: _role == 'employee' && _dailyMode,
+      );
+      if (!mounted) return;
+      Navigator.pop(context, {
+        'name': name,
+        'cpf': created['cpf']?.toString() ?? formatCpf(_cpfController.text),
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            'Erro ao cadastrar: ${e.toString().replaceAll('Exception:', '').trim()}'),
+        backgroundColor: wineColor,
+      ));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Novo usuário'),
+      content: SingleChildScrollView(
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: wineColor.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Text(
+                  'A pessoa entra com o CPF e a senha padrão '
+                  '${ApiService.defaultUserPassword}. No primeiro acesso, o app '
+                  'pede para ela criar a própria senha.',
+                  style: TextStyle(fontSize: 13),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _nameController,
+                textCapitalization: TextCapitalization.words,
+                decoration: const InputDecoration(labelText: 'Nome completo'),
+                validator: (value) => (value ?? '').trim().isEmpty
+                    ? 'Informe o nome.'
+                    : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _cpfController,
+                keyboardType: TextInputType.number,
+                inputFormatters: [CpfInputFormatter()],
+                decoration: const InputDecoration(
+                    labelText: 'CPF', helperText: 'É o login da pessoa.'),
+                validator: (value) =>
+                    isValidCpf(value) ? null : 'CPF inválido.',
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _emailController,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(
+                    labelText: 'E-mail (opcional)',
+                    helperText: 'Com e-mail, ela também pode recuperar a senha '
+                        'por ele.',
+                    helperMaxLines: 2),
+                validator: (value) {
+                  final text = (value ?? '').trim();
+                  return text.isNotEmpty && !text.contains('@')
+                      ? 'E-mail inválido.'
+                      : null;
+                },
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                initialValue: _role,
+                decoration: const InputDecoration(labelText: 'Cargo/Modelo'),
+                items: const [
+                  DropdownMenuItem(
+                      value: 'employee', child: Text('Funcionário (8h)')),
+                  DropdownMenuItem(
+                      value: 'intern', child: Text('Estagiário (6h)')),
+                  DropdownMenuItem(value: 'manager', child: Text('Gestor')),
+                  DropdownMenuItem(value: 'admin', child: Text('Administrador')),
+                ],
+                onChanged: (value) {
+                  if (value != null) _changeRole(value);
+                },
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _jobTitleController,
+                decoration: const InputDecoration(
+                    labelText: 'Função na folha',
+                    helperText: 'Ex: Aux. Geral, Coordenador de Campo'),
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _hoursController,
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                decoration:
+                    const InputDecoration(labelText: 'Carga Horária Diária'),
+              ),
+              if (_role == 'employee')
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  value: _dailyMode,
+                  onChanged: (value) => setState(() => _dailyMode = value),
+                  title: const Text('Modo diária'),
+                  subtitle: const Text(
+                      'A tela de ponto vira só o botão "Adicionar diária".'),
+                ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _saving ? null : () => Navigator.pop(context),
+          child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+        ),
+        ElevatedButton(
+          onPressed: _saving ? null : _save,
+          style: ElevatedButton.styleFrom(backgroundColor: wineColor),
+          child: _saving
+              ? const SizedBox(
+                  height: 20,
+                  width: 20,
+                  child: CircularProgressIndicator(
+                      color: Colors.white, strokeWidth: 2))
+              : const Text('Cadastrar', style: TextStyle(color: Colors.white)),
+        ),
+      ],
+    );
+  }
+}
+
+/// Depois do cadastro: a mensagem com o acesso para mandar a pessoa
+/// (copiar ou abrir no WhatsApp).
+class AccessMessageDialog extends StatelessWidget {
+  const AccessMessageDialog({super.key, required this.name, required this.cpf});
+
+  final String name;
+  final String cpf;
+
+  static const Color wineColor = Color(0xFF8B0000);
+
+  String get _message {
+    final firstName = name.trim().split(RegExp(r'\s+')).first;
+    return [
+      'Olá, $firstName! Seu acesso ao Ponto VMac:',
+      // No navegador, o endereco que o admin esta usando e o do app.
+      if (kIsWeb) 'Endereço: ${Uri.base.origin}',
+      'Login (CPF): $cpf',
+      'Senha: ${ApiService.defaultUserPassword}',
+      'No primeiro acesso o app pede para você criar uma senha nova.',
+    ].join('\n');
+  }
+
+  Future<void> _copy(BuildContext context) async {
+    await Clipboard.setData(ClipboardData(text: _message));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+      content: Text('Mensagem copiada.'),
+      backgroundColor: Colors.green,
+    ));
+  }
+
+  Future<void> _whatsApp(BuildContext context) async {
+    final uri =
+        Uri.parse('https://wa.me/?text=${Uri.encodeComponent(_message)}');
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication) &&
+        context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Não deu para abrir o WhatsApp. Use "Copiar".'),
+        backgroundColor: wineColor,
+      ));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Usuário cadastrado'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Mande o acesso para a pessoa:'),
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.grey.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: SelectableText(_message,
+                style: const TextStyle(fontSize: 13, height: 1.4)),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton.icon(
+          onPressed: () => _copy(context),
+          icon: const Icon(Icons.copy, size: 18),
+          label: const Text('Copiar'),
+        ),
+        TextButton.icon(
+          onPressed: () => _whatsApp(context),
+          icon: const Icon(Icons.send, size: 18),
+          label: const Text('WhatsApp'),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.pop(context),
+          style: ElevatedButton.styleFrom(backgroundColor: wineColor),
+          child: const Text('OK', style: TextStyle(color: Colors.white)),
+        ),
+      ],
+    );
   }
 }
 

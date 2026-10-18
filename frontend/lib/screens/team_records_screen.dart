@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import 'package:intl/intl.dart';
 import '../widgets/export_dialog.dart';
+import 'daily_entries_admin_screen.dart';
 
 class TeamRecordsScreen extends StatefulWidget {
   final bool canEdit;
@@ -301,6 +302,7 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
           children: [
             _buildFilterBar(),
             _buildPeriodSelector(),
+            if (_selectedDailyUser != null) _buildDailyModeBanner(),
             Expanded(
               child: _isLoading
                   ? const Center(
@@ -405,6 +407,56 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
                 ],
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Funcionario escolhido, se ele esta no modo diaria: o ponto dele sao as
+  /// diarias, que ficam numa tela propria.
+  Map<String, dynamic>? get _selectedDailyUser {
+    if (_selectedUserId == null) return null;
+    for (final user in _users) {
+      if (user is Map &&
+          user['id'] == _selectedUserId &&
+          user['daily_mode'] == true) {
+        return Map<String, dynamic>.from(user);
+      }
+    }
+    return null;
+  }
+
+  Widget _buildDailyModeBanner() {
+    final user = _selectedDailyUser!;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+      padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
+      decoration: BoxDecoration(
+        color: wineColor.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: wineColor.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.event_available, color: wineColor, size: 18),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Text(
+              'Modo diária: o ponto desta pessoa são as diárias.',
+              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => DailyEntriesAdminScreen(
+                    user: user, canEdit: widget.canEdit),
+              ),
+            ),
+            child: const Text('VER DIÁRIAS',
+                style: TextStyle(color: wineColor, fontWeight: FontWeight.bold)),
           ),
         ],
       ),

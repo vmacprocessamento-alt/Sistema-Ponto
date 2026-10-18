@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/api_service.dart';
 import '../services/theme_service.dart';
+import '../utils/cpf.dart';
 import '../widgets/export_dialog.dart';
 import 'admin_chat_list_screen.dart';
+import 'change_password_screen.dart';
 import 'login_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
@@ -151,7 +153,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 child: Column(
                   children: [
                     _buildInfoTile(
-                        Icons.badge, 'CPF', _user?['cpf'] ?? '-', textColor),
+                        Icons.badge,
+                        'CPF (seu login)',
+                        cpfDigits(_user?['cpf']?.toString()).length == 11
+                            ? formatCpf(_user?['cpf']?.toString())
+                            : (_user?['cpf'] ?? '-'),
+                        textColor),
                     const Divider(height: 1),
                     _buildInfoTile(Icons.access_time, 'Carga Horária Diária',
                         '${_user?['daily_hours'] ?? 8} horas', textColor),
@@ -161,6 +168,22 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
               ),
               const SizedBox(height: 16),
+
+              _buildExportCard(
+                icon: Icons.key,
+                title: 'Trocar senha',
+                subtitle: 'Criar uma senha nova para entrar',
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) =>
+                        ChangePasswordScreen(cpf: _user?['cpf']?.toString()),
+                  ),
+                ),
+                textColor: textColor,
+                cardColor: cardColor,
+              ),
+              const SizedBox(height: 12),
 
               // "Meus Documentos" saiu (17/10/2026): a folha de ponto vai para assinar pelo VDRod, com o link do
               // ZapSign no WhatsApp de cada um. A tela (documents_screen.dart) e a API continuam, sem entrada aqui.
