@@ -1812,16 +1812,8 @@ def delete_user_cascade(db, user_id: str) -> dict:
         )
         deleted_counts[collection_name] = count
 
-    audit_cleanup_queries = [
-        ("time_record_audits", "record_user_id"),
-        ("user_audits", "deleted_user_id"),
-    ]
-    for collection_name, field_name in audit_cleanup_queries:
-        count = delete_query_in_batches(
-            db,
-            db.collection(collection_name).where(field_name, "==", user_id),
-        )
-        deleted_counts[collection_name] = count
+    # As auditorias (time_record_audits, user_audits) ficam: sao o registro de quem mexeu em que e as regras do
+    # Firestore as declaram imutaveis. Apagar o usuario nao apaga o rastro (17/10/2026).
 
     user_ref = db.collection("users").document(user_id)
     if user_ref.get().exists:
@@ -2648,13 +2640,16 @@ async def delete_signature_document(
 
 @app.post("/zapsign/webhook")
 async def zapsign_webhook(request: Request):
-    if ZAPSIGN_WEBHOOK_SECRET:
-        supplied_secret = (
-            request.query_params.get("secret")
-            or request.headers.get("X-Webhook-Secret")
-        )
-        if supplied_secret != ZAPSIGN_WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="Webhook nao autorizado.")
+    # Fechado sem segredo configurado (antes ficava aberto): a assinatura da folha passou para o VDRod (17/10/2026).
+    if not ZAPSIGN_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="Webhook desativado.")
+    supplied_secret = (
+        request.headers.get("X-Webhook-Secret")
+        or request.query_params.get("secret")
+        or ""
+    )
+    if not hmac.compare_digest(supplied_secret.encode(), ZAPSIGN_WEBHOOK_SECRET.encode()):
+        raise HTTPException(status_code=401, detail="Webhook nao autorizado.")
 
     payload = await request.json()
     external_id = str(payload.get("external_id") or "")
@@ -2805,7 +2800,10 @@ async def schedule_controlled_punch_endpoint(
     punched_at = attempted
     server_now = datetime.now(ZoneInfo(timezone_name))
     if payload.close_at_scheduled_end:
-        pass  # a hora gravada sera o fim programado, conferido abaixo
+        # A hora gravada sera o fim programado, conferido abaixo. So vale para a SAIDA: numa entrada pulava toda a
+        # conferencia de horario (entrada num mes ja fechado, ou no futuro travando as proximas batidas).
+        if payload.record_type != "check_out":
+            raise HTTPException(status_code=400, detail="Fechar no horario programado vale so para a saida.")
     elif payload.offline:
         # Batida feita sem internet: vale a hora do aparelho no momento da
         # batida, que chega aqui horas ou dias depois. Futuro nao (relogio
@@ -2815,6 +2813,10 @@ async def schedule_controlled_punch_endpoint(
             raise HTTPException(status_code=400, detail="O horario da batida offline esta fora do periodo aceito.")
     elif abs((server_now - attempted).total_seconds()) > 15 * 60:
         raise HTTPException(status_code=400, detail="O horario informado esta muito distante do relogio do servidor.")
+    else:
+        # Online vale a hora do servidor, nao a do aparelho: com o relogio do celular mexido dava ate 15 min a mais
+        # por batida. A do aparelho fica em device_timestamp quando difere (17/10/2026).
+        attempted = server_now
 
     records = _user_records_sorted(db, user["id"])
     if payload.offline:
@@ -2898,6 +2900,8 @@ async def schedule_controlled_punch_endpoint(
         record["offline_delay_minutes"] = max(
             0, int((server_now - punched_at).total_seconds() // 60)
         )
+    elif not payload.close_at_scheduled_end and abs((server_now - punched_at).total_seconds()) >= 60:
+        record["device_timestamp"] = _local_iso(punched_at)
     record_ref.set(record)
     return {"status": "created", "id": record_ref.id, **record}
 
@@ -3379,6 +3383,9 @@ async def delete_user_admin_endpoint(
     user_id: str,
     admin=Depends(require_admin_user),
 ):
+    # require_admin_user aceita gerente; excluir e so do admin, como editar (PUT/PATCH).
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode excluir usuarios.")
     if admin["id"] == user_id:
         raise HTTPException(status_code=400, detail="Voce nao pode excluir a propria conta.")
 

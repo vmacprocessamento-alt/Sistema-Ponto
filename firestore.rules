@@ -28,19 +28,24 @@ service cloud.firestore {
     match /users/{userId} {
       allow read: if isOwner(userId) || isAdmin();
 
+      // Cadastro: só os campos do formulário (nada de horário especial, modo diária etc. por conta própria).
       allow create: if isOwner(userId)
-        && request.resource.data.role in ['employee', 'intern'];
+        && request.resource.data.role in ['employee', 'intern']
+        && request.resource.data.keys().hasOnly(['uid', 'email', 'name', 'cpf', 'role', 'job_title',
+                                                 'daily_hours', 'created_at']);
 
-      allow update: if isAdmin()
+      // Só o admin (gerente não: trocaria o próprio papel para admin). O app já só deixa o admin editar.
+      allow update: if isSystemAdmin()
         || (isOwner(userId)
           && request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['fcm_tokens', 'fcm_token_updated_at']));
 
-      allow delete: if isAdmin();
+      allow delete: if isSystemAdmin();
     }
 
     match /user_audits/{auditId} {
-      allow read, create: if isAdmin();
+      allow read: if isAdmin();
+      allow create: if isSystemAdmin();
       allow update, delete: if false;
     }
 
@@ -48,14 +53,19 @@ service cloud.firestore {
       allow read: if isSignedIn()
         && (resource.data.user_id == request.auth.uid || isAdmin());
 
+      // created_at tem de ser a hora do servidor (o app sempre manda serverTimestamp): é com ela que o RH vê a
+      // batida que chegou muito depois — ou muito antes — do horário marcado no aparelho.
       allow create: if isSignedIn()
-        && (request.resource.data.user_id == request.auth.uid || isAdmin());
+        && (request.resource.data.user_id == request.auth.uid || isAdmin())
+        && request.resource.data.created_at == request.time;
 
-      allow update, delete: if isAdmin();
+      // Editar ou apagar batida: só admin (o app já só deixa o admin; gerente apagaria sem auditoria).
+      allow update, delete: if isSystemAdmin();
     }
 
     match /time_record_audits/{auditId} {
-      allow read, create: if isAdmin();
+      allow read: if isAdmin();
+      allow create: if isSystemAdmin();
       allow update, delete: if false;
     }
 
@@ -155,7 +165,8 @@ service cloud.firestore {
     }
 
     match /system_audits/{auditId} {
-      allow read, create: if isAdmin();
+      allow read: if isAdmin();
+      allow create: if isSystemAdmin();
       allow update, delete: if false;
     }
 
