@@ -179,9 +179,10 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   bool _inPeriod(DateTime d) =>
       !d.isBefore(_periodStart) && !d.isAfter(_periodEnd);
 
-  /// Dia util do estagiario: segunda a sexta, menos feriado nacional.
-  bool _isWorkday(DateTime d) =>
-      d.weekday <= DateTime.friday && !isHoliday(d);
+  /// Dia util do estagiario: segunda a sexta. O feriado CONTA: o
+  /// estagiario nao folga a carga do feriado, ele compensa essas horas nos
+  /// outros dias do periodo (regra da empresa, 27/10/2026).
+  bool _isWorkday(DateTime d) => d.weekday <= DateTime.friday;
 
   double _workedOn(DateTime d) {
     final rec = _recordForDate(d);
@@ -539,7 +540,7 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
           const SizedBox(height: 10),
           Text(
             'Trabalhou ${_hm(counted)} · esperado ${_hm(expected)} '
-            '($countedDays dias úteis × ${_hm(_dailyTarget)})',
+            '($countedDays dias úteis × ${_hm(_dailyTarget)}, feriado incluído)',
             style: TextStyle(fontSize: 12, color: viz.muted),
           ),
           if (!closed && todayWorked > 0) ...[
@@ -582,6 +583,43 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
                 : '$totalDays dias úteis no período',
             style: TextStyle(fontSize: 11, color: viz.muted),
           ),
+          if (!closed && remainingDays > 0) ...[
+            const SizedBox(height: 12),
+            _buildClosingPlan(fullExpected - worked, remainingDays, viz),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Quanto falta para fechar o periodo em dia e quanto da por dia util
+  /// restante (contando hoje, que ainda nao entrou no saldo).
+  Widget _buildClosingPlan(double missing, int remainingDays, _VizPalette viz) {
+    final done = missing <= 5 / 60;
+    final perDay = done ? 0.0 : missing / remainingDays;
+    final color = done ? const Color(0xFF0CA30C) : viz.normal;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Row(
+        children: [
+          Icon(done ? Icons.check_circle : Icons.flag, color: color, size: 22),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              done
+                  ? 'O período já está completo. O que trabalhar a mais vira saldo positivo.'
+                  : 'Para fechar o período em dia: faltam ${_hm(missing)} '
+                      'nos $remainingDays dias úteis restantes '
+                      '(${_hm(perDay)} por dia).',
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+          ),
         ],
       ),
     );
@@ -602,7 +640,8 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
           const SizedBox(height: 4),
           Text(
             _showBalance
-                ? 'Esperado: ${_hm(_dailyTarget)} por dia útil (segunda a sexta, sem feriado).'
+                ? 'Esperado: ${_hm(_dailyTarget)} por dia útil (segunda a sexta). '
+                    'O feriado também conta: as horas dele são compensadas nos outros dias.'
                 : 'Horas trabalhadas em cada semana do período.',
             style: TextStyle(fontSize: 11, color: viz.muted),
           ),
@@ -615,7 +654,7 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
                 _legend(const Color(0xFF0CA30C), 'completo'),
                 _legend(const Color(0xFFE08A00), 'abaixo'),
                 _legend(const Color(0xFFD03B3B), 'falta'),
-                _legend(const Color(0xFF8E6BBF), 'feriado'),
+                _legend(const Color(0xFF8E6BBF), 'feriado (a compensar)'),
               ],
             ),
           ],
