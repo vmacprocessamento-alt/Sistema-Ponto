@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
 import '../services/api_service.dart';
+import '../utils/timesheet.dart' show isHoliday;
 
 /// Paleta de series validada para as superficies do app (card branco no claro,
 /// #1E1E1E no escuro). Os passos do modo escuro sao proprios, nao um inverso
@@ -14,6 +15,7 @@ class _VizPalette {
   Color get extra50 => isDark ? const Color(0xFFD95926) : const Color(0xFFEB6834);
   Color get extra100 =>
       isDark ? const Color(0xFF199E70) : const Color(0xFF1BAF7A);
+  Color get extra => isDark ? const Color(0xFFD9A21B) : const Color(0xFFC98A00);
 
   Color get grid => isDark ? const Color(0xFF2C2C2A) : const Color(0xFFE1E0D9);
   Color get muted => const Color(0xFF898781);
@@ -25,6 +27,12 @@ class MonthlyDashboardScreen extends StatefulWidget {
 
   final Map<String, dynamic> user;
 
+  /// So para pre-visualizacao e teste da tela sem Firebase: substitui a
+  /// busca da folha. No app fica sempre nulo.
+  @visibleForTesting
+  static Future<Map<String, dynamic>> Function(DateTime start, DateTime end)?
+      debugLoader;
+
   @override
   State<MonthlyDashboardScreen> createState() => _MonthlyDashboardScreenState();
 }
@@ -32,7 +40,8 @@ class MonthlyDashboardScreen extends StatefulWidget {
 class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   static const Color wineColor = Color(0xFF8B0000);
 
-  final _apiService = ApiService();
+  // Lazy: so cria (e toca no Firebase) quando a tela busca a folha.
+  late final _apiService = ApiService();
   bool _isLoading = true;
   String? _error;
 
@@ -63,11 +72,14 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
       // na comparacao de texto fica depois de "23:59:59".
       final end = DateTime(_periodEnd.year, _periodEnd.month, _periodEnd.day,
           23, 59, 59, 999, 999);
-      final data = await _apiService.exportTimesheet(
-        startDate: start.toIso8601String(),
-        endDate: end.toIso8601String(),
-        userId: widget.user['id'],
-      );
+      final loader = MonthlyDashboardScreen.debugLoader;
+      final data = loader != null
+          ? await loader(start, end)
+          : await _apiService.exportTimesheet(
+              startDate: start.toIso8601String(),
+              endDate: end.toIso8601String(),
+              userId: widget.user['id'],
+            );
       if (!mounted) return;
       setState(() {
         _days = (data['daily_records'] as List)
@@ -127,6 +139,102 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   double get _e100 => double.tryParse('${_summary['total_100'] ?? 0}') ?? 0;
   double get _extras =>
       (double.tryParse('${_summary['total_extras'] ?? 0}') ?? 0) + _e50 + _e100;
+
+  double get _contractExtras =>
+      double.tryParse('${_summary['total_extras'] ?? 0}') ?? 0;
+
+  // --- SALDO E SEMANAS ---
+  // O estagiario precisa saber se esta devendo hora na semana e no mes. A
+  // meta antiga (carga x dias/semana x 4) nao olhava os dias uteis reais do
+  // periodo nem quantos ja passaram: com o mes em dia a tela dizia "abaixo
+  // da meta".
+
+  bool get _isIntern {
+    final role = '${widget.user['role'] ?? ''}'.toLowerCase();
+    return role.contains('intern') || role.contains('estag');
+  }
+
+  /// Saldo (esperado x trabalhado) so para o estagiario de ponto: a carga
+  /// dele e fixa por dia util. Diaria e demais cargos seguem com o total.
+  bool get _showBalance => _isIntern && widget.user['daily_mode'] != true;
+
+  double get _dailyTarget {
+    final v = double.tryParse('${widget.user['daily_hours'] ?? ''}');
+    if (v != null && v > 0) return v;
+    return _isIntern ? 6.0 : 8.0;
+  }
+
+  DateTime get _today {
+    final n = DateTime.now();
+    return DateTime(n.year, n.month, n.day);
+  }
+
+  /// Ultimo dia que entra no saldo: ontem no periodo em andamento (o dia de
+  /// hoje ainda nao acabou), ou o fim do periodo nos meses fechados.
+  DateTime get _cutoff {
+    final yesterday = DateTime(_today.year, _today.month, _today.day - 1);
+    return yesterday.isBefore(_periodEnd) ? yesterday : _periodEnd;
+  }
+
+  bool _inPeriod(DateTime d) =>
+      !d.isBefore(_periodStart) && !d.isAfter(_periodEnd);
+
+  /// Dia util do estagiario: segunda a sexta, menos feriado nacional.
+  bool _isWorkday(DateTime d) =>
+      d.weekday <= DateTime.friday && !isHoliday(d);
+
+  double _workedOn(DateTime d) {
+    final rec = _recordForDate(d);
+    return rec == null ? 0 : _num(rec['total_hours']);
+  }
+
+  double _expectedOn(DateTime d) =>
+      _isWorkday(d) && !d.isAfter(_cutoff) ? _dailyTarget : 0;
+
+  List<_Week> get _weeks {
+    final weeks = <_Week>[];
+    var monday = DateTime(_periodStart.year, _periodStart.month,
+        _periodStart.day - (_periodStart.weekday - 1));
+    var running = 0.0;
+    while (!monday.isAfter(_periodEnd)) {
+      final days = List.generate(
+          7, (i) => DateTime(monday.year, monday.month, monday.day + i));
+      final inside = days.where(_inPeriod).toList();
+      var worked = 0.0, counted = 0.0, expected = 0.0;
+      for (final d in inside) {
+        final w = _workedOn(d);
+        worked += w;
+        if (!d.isAfter(_cutoff)) counted += w;
+        expected += _expectedOn(d);
+      }
+      final started = !inside.first.isAfter(_cutoff);
+      final balance = counted - expected;
+      if (started) running += balance;
+      weeks.add(_Week(
+        days: days,
+        first: inside.first,
+        last: inside.last,
+        worked: worked,
+        counted: counted,
+        expected: expected,
+        balance: balance,
+        running: running,
+        started: started,
+      ));
+      monday = DateTime(monday.year, monday.month, monday.day + 7);
+    }
+    return weeks;
+  }
+
+  String _signedHm(double hours) {
+    if (hours.abs() < 5 / 60) return 'Em dia';
+    return '${hours > 0 ? '+' : '−'}${_hm(hours.abs())}';
+  }
+
+  Color _balanceColor(double hours) {
+    if (hours.abs() < 5 / 60) return const Color(0xFF898781);
+    return hours > 0 ? const Color(0xFF0CA30C) : const Color(0xFFD03B3B);
+  }
 
   List<Map<String, dynamic>> get _worked =>
       _days.where((d) => _num(d['total_hours']) > 0).toList();
@@ -200,11 +308,21 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
                       children: [
                         _buildMonthSwitcher(),
                         const SizedBox(height: 16),
-                        _buildHero(viz),
-                        const SizedBox(height: 16),
-                        _buildStatGrid(),
-                        const SizedBox(height: 16),
-                        _buildDailyChart(viz),
+                        // Estagiario: saldo e semana a semana. Demais cargos:
+                        // a tela de antes (total, meta e grafico por dia).
+                        if (_showBalance) ...[
+                          _buildBalanceHero(viz),
+                          const SizedBox(height: 16),
+                          _buildWeeks(viz),
+                          const SizedBox(height: 16),
+                          _buildStatGrid(),
+                        ] else ...[
+                          _buildHero(viz),
+                          const SizedBox(height: 16),
+                          _buildStatGrid(),
+                          const SizedBox(height: 16),
+                          _buildDailyChart(viz),
+                        ],
                         const SizedBox(height: 16),
                         _buildComposition(viz),
                         const SizedBox(height: 16),
@@ -364,6 +482,334 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
     );
   }
 
+  /// Topo do estagiario: o saldo ate ontem (ou do periodo fechado) e o
+  /// andamento do periodo inteiro.
+  Widget _buildBalanceHero(_VizPalette viz) {
+    var counted = 0.0, expected = 0.0, worked = 0.0, fullExpected = 0.0;
+    var countedDays = 0, totalDays = 0, remainingDays = 0;
+    for (var i = 0; i < _periodDays; i++) {
+      final d = _dateAt(i);
+      final w = _workedOn(d);
+      worked += w;
+      if (!d.isAfter(_cutoff)) counted += w;
+      final exp = _expectedOn(d);
+      expected += exp;
+      if (exp > 0) countedDays++;
+      if (_isWorkday(d)) {
+        totalDays++;
+        fullExpected += _dailyTarget;
+        if (d.isAfter(_cutoff)) remainingDays++;
+      }
+    }
+    final balance = counted - expected;
+    final closed = !_cutoff.isBefore(_periodEnd);
+    final color = _balanceColor(balance);
+    final todayWorked = _inPeriod(_today) ? _workedOn(_today) : 0.0;
+    final pct =
+        fullExpected <= 0 ? 0.0 : (worked / fullExpected).clamp(0.0, 1.0);
+    final caption = balance.abs() < 5 / 60
+        ? 'Nem sobrando nem faltando hora.'
+        : balance > 0
+            ? 'Você trabalhou a mais do que o esperado.'
+            : 'Faltam essas horas para completar o esperado.';
+
+    return _card(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(closed ? 'SALDO DO PERÍODO' : 'SEU SALDO ATÉ ONTEM',
+              style: TextStyle(
+                  color: viz.muted,
+                  fontSize: 10,
+                  letterSpacing: 1.2,
+                  fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Text(_signedHm(balance),
+              style: TextStyle(
+                  fontSize: 40,
+                  height: 1.1,
+                  fontWeight: FontWeight.bold,
+                  color: color,
+                  fontFeatures: const [FontFeature.tabularFigures()])),
+          const SizedBox(height: 4),
+          Text(caption,
+              style: TextStyle(
+                  fontSize: 14, fontWeight: FontWeight.w600, color: color)),
+          const SizedBox(height: 10),
+          Text(
+            'Trabalhou ${_hm(counted)} · esperado ${_hm(expected)} '
+            '($countedDays dias úteis × ${_hm(_dailyTarget)})',
+            style: TextStyle(fontSize: 12, color: viz.muted),
+          ),
+          if (!closed && todayWorked > 0) ...[
+            const SizedBox(height: 4),
+            Text(
+                'Hoje até agora: ${_hm(todayWorked)} (entra no saldo amanhã)',
+                style: TextStyle(fontSize: 12, color: viz.muted)),
+          ],
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Text('PERÍODO COMPLETO',
+                  style: TextStyle(
+                      color: viz.muted,
+                      fontSize: 10,
+                      letterSpacing: 1.2,
+                      fontWeight: FontWeight.bold)),
+              const Spacer(),
+              Text('${_hm(worked)} de ${_hm(fullExpected)}',
+                  style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      fontFeatures: [FontFeature.tabularFigures()])),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: pct,
+              minHeight: 8,
+              backgroundColor: viz.grid,
+              valueColor: AlwaysStoppedAnimation<Color>(viz.normal),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            remainingDays > 0
+                ? '$totalDays dias úteis no período · faltam $remainingDays'
+                : '$totalDays dias úteis no período',
+            style: TextStyle(fontSize: 11, color: viz.muted),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWeeks(_VizPalette viz) {
+    final weeks = _weeks;
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('SEMANA A SEMANA',
+              style: TextStyle(
+                  color: viz.muted,
+                  fontSize: 10,
+                  letterSpacing: 1.2,
+                  fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          Text(
+            _showBalance
+                ? 'Esperado: ${_hm(_dailyTarget)} por dia útil (segunda a sexta, sem feriado).'
+                : 'Horas trabalhadas em cada semana do período.',
+            style: TextStyle(fontSize: 11, color: viz.muted),
+          ),
+          if (_showBalance) ...[
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 12,
+              runSpacing: 4,
+              children: [
+                _legend(const Color(0xFF0CA30C), 'completo'),
+                _legend(const Color(0xFFE08A00), 'abaixo'),
+                _legend(const Color(0xFFD03B3B), 'falta'),
+                _legend(const Color(0xFF8E6BBF), 'feriado'),
+              ],
+            ),
+          ],
+          const SizedBox(height: 12),
+          for (var i = 0; i < weeks.length; i++) ...[
+            if (i > 0) Divider(height: 24, color: viz.grid),
+            _buildWeek(i + 1, weeks[i], viz),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _legend(Color color, String label) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+              color: color.withOpacity(0.18),
+              border: Border.all(color: color),
+              borderRadius: BorderRadius.circular(3)),
+        ),
+        const SizedBox(width: 4),
+        Text(label, style: const TextStyle(fontSize: 11)),
+      ],
+    );
+  }
+
+  Widget _buildWeek(int number, _Week w, _VizPalette viz) {
+    final range =
+        '${DateFormat('dd/MM').format(w.first)} a ${DateFormat('dd/MM').format(w.last)}';
+    final isCurrent = !_today.isBefore(w.days.first) && !_today.isAfter(w.days.last);
+    final showChip = _showBalance && w.started && w.expected + w.counted > 0;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text('Semana $number',
+                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(isCurrent ? '$range · esta semana' : range,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11, color: viz.muted)),
+            ),
+            if (showChip)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: _balanceColor(w.balance).withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(_signedHm(w.balance),
+                    style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                        color: _balanceColor(w.balance),
+                        fontFeatures: const [FontFeature.tabularFigures()])),
+              )
+            else if (!_showBalance)
+              Text(_hm(w.worked),
+                  style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      fontFeatures: [FontFeature.tabularFigures()])),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            for (final d in w.days)
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 2),
+                  child: _buildDayCell(d, viz),
+                ),
+              ),
+          ],
+        ),
+        if (_showBalance && w.started) ...[
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Trabalhou ${_hm(w.counted)} de ${_hm(w.expected)}',
+                  style: TextStyle(fontSize: 12, color: viz.muted),
+                ),
+              ),
+              Text('No mês: ',
+                  style: TextStyle(fontSize: 12, color: viz.muted)),
+              Text(_signedHm(w.running),
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: _balanceColor(w.running),
+                      fontFeatures: const [FontFeature.tabularFigures()])),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+
+  static const _weekdayLetters = ['S', 'T', 'Q', 'Q', 'S', 'S', 'D'];
+
+  Widget _buildDayCell(DateTime d, _VizPalette viz) {
+    final letter = _weekdayLetters[d.weekday - 1];
+    final inside = _inPeriod(d);
+    final worked = _workedOn(d);
+    final isToday = d == _today;
+    final future = d.isAfter(_today);
+    final holiday = isHoliday(d);
+    final workday = _isWorkday(d);
+
+    // Rotulo e cor do dia.
+    String label;
+    Color? color;
+    if (!inside) {
+      label = '';
+    } else if (worked > 0) {
+      label = _hmShort(worked);
+      if (!_showBalance) {
+        color = viz.normal;
+      } else if (!workday || worked >= _dailyTarget - 5 / 60) {
+        color = const Color(0xFF0CA30C);
+      } else if (isToday) {
+        color = viz.normal;
+      } else {
+        color = const Color(0xFFE08A00);
+      }
+    } else if (holiday) {
+      label = 'fer.';
+      color = const Color(0xFF8E6BBF);
+    } else if (future || isToday || !workday) {
+      label = '–';
+    } else {
+      label = _showBalance ? 'falta' : '0h';
+      color = _showBalance ? const Color(0xFFD03B3B) : null;
+    }
+
+    final muted = viz.muted;
+    return Opacity(
+      opacity: inside ? 1 : 0.35,
+      child: Column(
+        children: [
+          Text(letter,
+              style: TextStyle(
+                  fontSize: 10, color: muted, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 3),
+          Container(
+            height: 44,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: color == null ? Colors.transparent : color.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: isToday
+                    ? const Color(0xFF8B0000)
+                    : (color ?? viz.grid).withOpacity(color == null ? 1 : 0.6),
+                width: isToday ? 2 : 1,
+              ),
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text('${d.day}',
+                    style: TextStyle(fontSize: 10, color: muted)),
+                Text(label,
+                    maxLines: 1,
+                    overflow: TextOverflow.clip,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: color,
+                        fontFeatures: const [FontFeature.tabularFigures()])),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _hmShort(double hours) {
+    final total = (hours * 60).round();
+    return '${total ~/ 60}h${(total % 60).toString().padLeft(2, '0')}';
+  }
+
   Widget _buildStatGrid() {
     final avg = _avgCheckIn;
     final entrada = avg == null
@@ -374,7 +820,8 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
       _StatTile('DIAS TRABALHADOS', '${_worked.length}',
           'de $_periodDays dias'),
       _StatTile('MÉDIA POR DIA', _hm(_avgPerDay), 'nos dias com registro'),
-      _StatTile('HORAS EXTRAS', _hm(_extras), '50% + 100%'),
+      _StatTile('HORAS EXTRAS', _hm(_extras),
+          _showBalance ? 'acima de ${_dailyTarget.toStringAsFixed(0)}h no dia' : '50% + 100%'),
       _StatTile('ENTRADA MÉDIA', entrada, 'horário típico'),
     ];
 
@@ -591,8 +1038,13 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
   /// Legenda + valores. Os numeros diretos sao o "relief" exigido pelo
   /// contraste do verde sobre o card claro — a cor nunca informa sozinha.
   Widget _buildComposition(_VizPalette viz) {
+    // As extras de contrato (acima da carga do dia, ex.: estagiario depois
+    // das 6h) entravam no total e no quadro "Horas extras", mas nao aqui: a
+    // composicao nao fechava com o total do mes.
     final rows = [
       ('Normal', _regular, viz.normal),
+      if (_showBalance && _contractExtras > 0)
+        ('Acima de ${_dailyTarget.toStringAsFixed(0)}h', _contractExtras, viz.extra),
       ('Extra 50%', _e50, viz.extra50),
       ('Extra 100%', _e100, viz.extra100),
     ];
@@ -718,4 +1170,37 @@ class _StatTile {
   final String label;
   final String value;
   final String hint;
+}
+
+/// Uma semana (segunda a domingo) recortada no periodo da folha.
+class _Week {
+  const _Week({
+    required this.days,
+    required this.first,
+    required this.last,
+    required this.worked,
+    required this.counted,
+    required this.expected,
+    required this.balance,
+    required this.running,
+    required this.started,
+  });
+
+  final List<DateTime> days;
+  final DateTime first;
+  final DateTime last;
+
+  /// Tudo o que foi trabalhado na semana, inclusive hoje.
+  final double worked;
+
+  /// Trabalhado ate ontem (o que entra no saldo).
+  final double counted;
+  final double expected;
+  final double balance;
+
+  /// Saldo do mes acumulado ate o fim desta semana.
+  final double running;
+
+  /// A semana ja comecou (tem dia ate ontem).
+  final bool started;
 }
