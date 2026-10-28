@@ -1,0 +1,13 @@
+{
+  "name": "ponto-e2e",
+  "private": true,
+  "description": "Testes de ponta a ponta do app web contra o emulador do Firebase",
+  "scripts": {
+    "batidas": "node batidas.js",
+    "cadastro": "node cadastro_admin.js",
+    "suite": "node web_suite.js"
+  },
+  "dependencies": {
+    "playwright": "1.48.2"
+  }
+}

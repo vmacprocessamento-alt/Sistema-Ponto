@@ -61,3 +61,8 @@ ponto-system/frontend/windows/flutter/ephemeral/
 *.temp
 .DS_Store
 Thumbs.db
+
+# Testes de ponta a ponta
+e2e/node_modules/
+e2e/resultados/
+e2e/app/

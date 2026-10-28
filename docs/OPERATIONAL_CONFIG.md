@@ -31,15 +31,12 @@ The Flutter app reads `API_BASE_URL` through `--dart-define`:
 
 ```bash
 flutter run --dart-define=API_BASE_URL=https://ponto.vmacengenharia.com/api
-flutter build apk --release --dart-define=API_BASE_URL=https://ponto.vmacengenharia.com/api
 flutter build web --release --dart-define=API_BASE_URL=https://ponto.vmacengenharia.com/api
 ```
 
 Without an override:
 
-- Web uses `/api` on the current origin.
-- Android uses the production HTTPS API.
-- Desktop/local uses `http://localhost:8000`.
+- The app (web only) uses `/api` on the current origin.
 
 ## Migration Credentials
 

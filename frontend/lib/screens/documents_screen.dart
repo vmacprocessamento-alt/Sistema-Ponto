@@ -2,9 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:file_saver/file_saver.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
@@ -831,26 +829,10 @@ class _SendDocumentDialogState extends State<_SendDocumentDialog> {
     try {
       final String fileName;
       final Uint8List fileBytes;
-      if (kIsWeb) {
-        final file = await pickPdfFromBrowser();
-        if (file == null) return;
-        fileName = file.name;
-        fileBytes = file.bytes;
-      } else {
-        final result = await FilePicker.platform.pickFiles(
-          type: FileType.custom,
-          allowedExtensions: const ['pdf'],
-          allowMultiple: false,
-          withData: true,
-        );
-        if (result == null) return;
-        final file = result.files.single;
-        if (file.bytes == null) {
-          throw Exception('Nao foi possivel ler o PDF selecionado.');
-        }
-        fileName = file.name;
-        fileBytes = file.bytes!;
-      }
+      final file = await pickPdfFromBrowser();
+      if (file == null) return;
+      fileName = file.name;
+      fileBytes = file.bytes;
 
       if (!fileName.toLowerCase().endsWith('.pdf')) {
         throw Exception('Selecione um arquivo PDF.');
@@ -972,7 +954,7 @@ class _SendDocumentDialogState extends State<_SendDocumentDialog> {
                 ),
               ),
               const SizedBox(height: 16),
-              if (kIsWeb && !_sending)
+              if (!_sending)
                 SizedBox(
                   width: 260,
                   height: 44,

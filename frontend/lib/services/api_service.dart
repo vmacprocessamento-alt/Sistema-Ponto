@@ -5,15 +5,13 @@ import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_config.dart';
-import 'session_service.dart';
 import '../utils/chat_timestamp.dart';
 import '../utils/cpf.dart';
 import '../utils/daily_entries.dart';
@@ -374,9 +372,9 @@ class ApiService {
   // --- MÉTODOS DE AJUSTE (CHAT INTERNO) ---
 
   Future<AdjustmentRequestResult> createAdjustmentRequest(
-      {String? text, String? audioPath, Uint8List? audioBytes}) async {
+      {String? text, Uint8List? audioBytes}) async {
     final user = await getCurrentUser();
-    final hasAudio = audioPath != null || audioBytes != null;
+    final hasAudio = audioBytes != null;
 
     try {
       final docRef = await _db.collection('adjustment_requests').add({
@@ -395,7 +393,6 @@ class ApiService {
       if (hasAudio) {
         unawaited(_uploadAndAttachAdjustmentAudio(
           requestId: docRef.id,
-          audioPath: audioPath,
           audioBytes: audioBytes,
         ));
       }
@@ -410,21 +407,13 @@ class ApiService {
 
   Future<void> _uploadAndAttachAdjustmentAudio({
     required String requestId,
-    String? audioPath,
     Uint8List? audioBytes,
   }) async {
     try {
-      String audioUrl;
-      if (kIsWeb && audioBytes != null) {
-        debugPrint(
-            'ApiService: Iniciando upload áudio Web (${audioBytes.length} bytes)');
-        audioUrl = await uploadAdjustmentAudioWeb(audioBytes);
-      } else if (!kIsWeb && audioPath != null) {
-        debugPrint('ApiService: Iniciando upload áudio Mobile ($audioPath)');
-        audioUrl = await uploadAdjustmentAudioMobile(audioPath);
-      } else {
-        throw Exception('Áudio não encontrado para upload.');
-      }
+      if (audioBytes == null) throw Exception('Áudio não encontrado para upload.');
+      debugPrint(
+          'ApiService: Iniciando upload áudio (${audioBytes.length} bytes)');
+      final audioUrl = await uploadAdjustmentAudioWeb(audioBytes);
 
       await _db.collection('adjustment_requests').doc(requestId).update({
         'audio_url': audioUrl,
@@ -436,17 +425,6 @@ class ApiService {
       if (audioBytes != null &&
           await _embedAudioInRequest(requestId, audioBytes, 'audio/webm')) {
         return;
-      }
-
-      if (audioPath != null && !kIsWeb) {
-        try {
-          final bytes = await File(audioPath).readAsBytes();
-          if (await _embedAudioInRequest(requestId, bytes, 'audio/mp4')) {
-            return;
-          }
-        } catch (fileError) {
-          debugPrint('Erro ao ler áudio local para fallback: $fileError');
-        }
       }
 
       try {
@@ -483,16 +461,6 @@ class ApiService {
       debugPrint('Erro ao embutir áudio no Firestore: $e');
       return false;
     }
-  }
-
-  Future<String> uploadAdjustmentAudioMobile(String filePath) async {
-    final user = _auth.currentUser;
-    if (user == null) throw Exception('Usuário não logado');
-
-    final ref = _storage.ref().child(
-        'adjustments/${user.uid}/${DateTime.now().millisecondsSinceEpoch}.m4a');
-    await ref.putFile(File(filePath)).timeout(const Duration(seconds: 45));
-    return await ref.getDownloadURL();
   }
 
   Future<String> uploadAdjustmentAudioWeb(Uint8List bytes) async {
@@ -671,7 +639,6 @@ class ApiService {
       };
       await _cacheCurrentUser(
           Map<String, dynamic>.from(response['user'] as Map));
-      await SessionService.saveCredentials(email, password);
       return response;
     } on FirebaseAuthException catch (e) {
       // Mapeamento de erros amigáveis para o usuário
@@ -757,7 +724,6 @@ class ApiService {
       try {
         await _auth.signInWithEmailAndPassword(
             email: email, password: newPassword);
-        await SessionService.saveCredentials(email, newPassword);
       } catch (e) {
         debugPrint('Senha trocada; novo login fica para a proxima abertura: $e');
       }
@@ -803,9 +769,6 @@ class ApiService {
   Future<void> clearToken() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_cachedUserKey);
-    // Precisa vir antes do signOut: e o unico ponto que encerra a sessao
-    // permanente, senao o app se relogaria sozinho na proxima abertura.
-    await SessionService.clearCredentials();
     await _auth.signOut();
   }
 

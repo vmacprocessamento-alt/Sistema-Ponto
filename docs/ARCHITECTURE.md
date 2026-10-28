@@ -6,7 +6,7 @@ encaixam, por onde passa cada operação e onde ficam as regras.
 ## Visão geral
 
 ```
- Celular (Android) / navegador (PWA)
+ Navegador (celular ou PC), app web/PWA
             │
             │  Flutter: Firebase Auth + Firestore (leitura) + HTTP (backend)
             ▼
@@ -119,7 +119,8 @@ data/tipo, recargas periódicas só com a tela à vista, backup incremental.
 ## Testes
 - Backend: `cd backend && python -m pytest` (Firestore simulado em memória).
 - App: `cd frontend && flutter test`.
-- Ponta a ponta contra o **emulador do Firebase** (nada toca o Firebase real):
+- Ponta a ponta contra o **emulador do Firebase** (nada toca o Firebase real),
+  app web no Chrome: pasta `e2e/` (ver `e2e/README.md`). Em resumo:
   `firebase emulators:start --only auth,firestore --project demo-ponto` e o
   app compilado com `--dart-define=USE_FIREBASE_EMULATOR=true
   --dart-define=API_BASE_URL=http://127.0.0.1:8000`.
