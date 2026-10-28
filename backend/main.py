@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import secrets
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, time, date
 from calendar import monthrange
 from typing import Optional, List, Dict, Any
@@ -28,9 +29,6 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 
 from work_schedule_rules import (
     DEFAULT_INTERN_WORK_SCHEDULE as RULES_DEFAULT_INTERN_WORK_SCHEDULE,
@@ -138,7 +136,22 @@ SUMMARY_ROW_VALUE = 43
 SUMMARY_ROW_FINAL = 44
 SUMMARY_START_COL = 2
 
+@asynccontextmanager
+async def _lifespan(_app):
+    """Sobe com o servidor: tabela local das assinaturas e os jobs de fundo
+    (fechar pausas vencidas, backup). Desce fechando os clientes HTTP. As
+    funcoes ficam mais abaixo; o nome so e resolvido quando o servidor sobe."""
+    init_signature_documents_table()
+    jobs = [asyncio.create_task(_auto_close_breaks_loop()), asyncio.create_task(_backup_loop())]
+    try:
+        yield
+    finally:
+        for job in jobs:
+            job.cancel()
+        await _close_http_clients()
+
 app = FastAPI(
+    lifespan=_lifespan,
     title="Ponto System API",
     docs_url="/docs" if ENABLE_API_DOCS else None,
     redoc_url="/redoc" if ENABLE_API_DOCS else None,
@@ -666,6 +679,17 @@ def init_firebase_admin():
 
     service_account_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
     service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if not (service_account_path or service_account_json
+            or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("FIRESTORE_EMULATOR_HOST")):
+        # Sem credencial nenhuma o SDK procurava a padrao do Google (servidor de
+        # metadados do Google Cloud) e cada requisicao travava ~30 s, com o
+        # servidor inteiro parado junto. Recusa na hora.
+        raise HTTPException(
+            status_code=503,
+            detail="Credencial do Firebase Admin nao configurada no servidor "
+                   "(FIREBASE_SERVICE_ACCOUNT_PATH ou FIREBASE_SERVICE_ACCOUNT_JSON).",
+        )
     project_id = os.getenv("FIREBASE_PROJECT_ID", "")
     options = {"projectId": project_id} if project_id else None
     if service_account_json:
@@ -1248,8 +1272,8 @@ def _http_client() -> httpx.AsyncClient:
     return client
 
 # Token ja conferido no Google vale por alguns minutos sem nova consulta: o
-# app manda o mesmo token (dura 1h) em todas as chamadas. Conta desativada
-# perde o acesso em ate _TOKEN_CACHE_TTL.
+# app manda o mesmo token (dura 1h) em todas as chamadas. Desativar ou excluir
+# a conta pelo painel tira os tokens dela daqui na hora (_forget_user_tokens).
 _TOKEN_CACHE_TTL = timedelta(minutes=5)
 _TOKEN_CACHE_MAX = 2000
 _verified_tokens: Dict[str, tuple] = {}
@@ -1263,6 +1287,10 @@ def _cached_token_uid(id_token: str) -> Optional[str]:
         return hit[0]
     return None
 
+def _forget_user_tokens(user_uid: str) -> None:
+    for key in [k for k, (uid, _) in _verified_tokens.items() if uid == user_uid]:
+        del _verified_tokens[key]
+
 def _remember_token(id_token: str, user_uid: str) -> None:
     now = datetime.utcnow()
     if len(_verified_tokens) >= _TOKEN_CACHE_MAX:
@@ -1272,7 +1300,6 @@ def _remember_token(id_token: str, user_uid: str) -> None:
             _verified_tokens.clear()
     _verified_tokens[_token_key(id_token)] = (user_uid, now + _TOKEN_CACHE_TTL)
 
-@app.on_event("shutdown")
 async def _close_http_clients() -> None:
     for client in list(_http_clients.values()):
         await client.aclose()
@@ -1410,13 +1437,13 @@ def get_zapsign_headers() -> dict:
 
 async def zapsign_request(method: str, path: str, json_data: Optional[dict] = None) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.request(
-                method,
-                f"{ZAPSIGN_API_BASE_URL}/{path.lstrip('/')}",
-                headers=get_zapsign_headers(),
-                json=json_data,
-            )
+        response = await _http_client().request(
+            method,
+            f"{ZAPSIGN_API_BASE_URL}/{path.lstrip('/')}",
+            headers=get_zapsign_headers(),
+            json=json_data,
+            timeout=60.0,
+        )
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Falha ao conectar com a ZapSign: {exc}")
 
@@ -1885,15 +1912,6 @@ async def _backup_loop() -> None:
         except Exception as exc:
             print(f"[backup] loop: {exc}")
         await asyncio.sleep(_BACKUP_CHECK_INTERVAL_SECONDS)
-
-@app.on_event("startup")
-async def _start_background_jobs() -> None:
-    asyncio.create_task(_auto_close_breaks_loop())
-    asyncio.create_task(_backup_loop())
-
-@app.on_event("startup")
-def initialize_local_tables():
-    init_signature_documents_table()
 
 @app.post("/admin/backup/run")
 async def run_backup_endpoint(admin=Depends(require_admin_user)):
@@ -4085,6 +4103,9 @@ def update_user_admin_endpoint(
         # Estagiario segue o horario controlado; nao entra no modo diaria.
         update_data["daily_mode"] = payload.daily_mode and role not in {"intern", "estagiario"}
     user_ref.update(update_data)
+    if payload.disabled or new_password:
+        # Conta desativada ou senha trocada: o token guardado deixa de valer ja.
+        _forget_user_tokens(target_id)
     db.collection("system_audits").document().set({
         "action": "update_user_admin",
         "target_user_id": target_id,
@@ -4112,6 +4133,12 @@ def update_time_record_admin_endpoint(
         raise HTTPException(status_code=403, detail="Apenas admin pode editar registros de ponto.")
     if not payload.reason.strip():
         raise HTTPException(status_code=400, detail="Informe o motivo da edicao.")
+    # Mesmo formato dos outros pontos (hora local, sem fuso): um texto qualquer
+    # aqui embaralhava a ordem dos pontos e os filtros por periodo, que
+    # comparam o texto.
+    if not (payload.new_timestamp or "").strip():
+        raise HTTPException(status_code=400, detail="Informe o novo horario.")
+    new_timestamp = _local_iso(_parse_schedule_datetime(payload.new_timestamp.strip(), _LOCAL_TZ))
 
     db = get_firestore_admin()
     record_ref = db.collection("time_records").document(record_id)
@@ -4127,7 +4154,7 @@ def update_time_record_admin_endpoint(
 
         old_data = snapshot.to_dict() or {}
         transaction.update(record_ref, {
-            "timestamp": payload.new_timestamp,
+            "timestamp": new_timestamp,
             "notes": payload.notes or "",
             "updated_at": firestore.SERVER_TIMESTAMP,
             "edited_by_admin": True,
@@ -4142,7 +4169,7 @@ def update_time_record_admin_endpoint(
             "record_user_id": old_data.get("user_id"),
             "record_type": old_data.get("record_type"),
             "old_timestamp": old_data.get("timestamp"),
-            "new_timestamp": payload.new_timestamp,
+            "new_timestamp": new_timestamp,
             "old_notes": old_data.get("notes"),
             "new_notes": payload.notes or "",
             "reason": payload.reason,
@@ -4173,6 +4200,7 @@ def delete_user_admin_endpoint(
 
     try:
         firebase_auth.delete_user(user_id)
+        _forget_user_tokens(user_id)
         auth_deleted = True
     except firebase_auth.UserNotFoundError:
         auth_deleted = False
@@ -4202,12 +4230,7 @@ def delete_user_admin_endpoint(
         "deleted_counts": deleted_counts,
     }
 
-# --- DATABASE SETUP ---
-SQLALCHEMY_DATABASE_URL = "sqlite:///./ponto.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    # Mesma porta do Docker e do README.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
