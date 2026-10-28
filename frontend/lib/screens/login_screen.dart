@@ -88,8 +88,8 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   void _showForgotPasswordDialog() {
-    final emailController = TextEditingController(
-        text: _useEmail ? _loginController.text.trim() : '');
+    final emailController =
+        TextEditingController(text: _loginController.text.trim());
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -100,20 +100,20 @@ class _LoginScreenState extends State<LoginScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Fale com o administrador: ele volta a sua senha para a '
-                'senha padrão e, ao entrar, você cria uma nova.',
+                'Fale com o administrador: ele gera uma senha temporária e, '
+                'ao entrar, você cria uma nova.',
               ),
               const SizedBox(height: 16),
               const Text(
                 'Se você tem e-mail no cadastro, também pode receber um link '
-                'para criar a senha:',
+                'para criar a senha. Informe o CPF ou o e-mail:',
                 style: TextStyle(color: Colors.grey, fontSize: 13),
               ),
               const SizedBox(height: 8),
               TextField(
                 controller: emailController,
                 decoration: const InputDecoration(
-                  labelText: 'E-mail',
+                  labelText: 'CPF ou e-mail',
                   border: OutlineInputBorder(),
                 ),
                 keyboardType: TextInputType.emailAddress,
@@ -128,14 +128,15 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
           ElevatedButton(
             onPressed: () async {
-              if (emailController.text.isNotEmpty) {
+              if (emailController.text.trim().isNotEmpty) {
                 try {
-                  await _apiService.resetPassword(emailController.text);
+                  final message =
+                      await _apiService.resetPassword(emailController.text);
                   if (mounted) {
                     Navigator.pop(context);
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('E-mail de recuperação enviado! Verifique sua caixa de entrada.'),
+                      SnackBar(
+                        content: Text(message),
                         backgroundColor: Colors.green,
                       ),
                     );
@@ -143,7 +144,10 @@ class _LoginScreenState extends State<LoginScreen> {
                 } catch (e) {
                   if (mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(e.toString()), backgroundColor: Colors.red),
+                      SnackBar(
+                          content: Text(
+                              e.toString().replaceFirst('Exception: ', '')),
+                          backgroundColor: Colors.red),
                     );
                   }
                 }

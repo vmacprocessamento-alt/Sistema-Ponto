@@ -786,12 +786,35 @@ class ApiService {
     await _auth.signOut();
   }
 
-  Future<void> resetPassword(String email) async {
+  /// Link de nova senha por CPF ou e-mail. Vai pelo backend: o
+  /// sendPasswordResetEmail do Firebase dava "enviado" mesmo sem conta com o
+  /// e-mail (conta por CPF usa e-mail interno) e o remetente caia no spam.
+  /// Devolve a mensagem para mostrar.
+  Future<String> resetPassword(String loginId) async {
+    final value = loginId.trim();
+    final http.Response response;
     try {
-      await _auth.sendPasswordResetEmail(email: email);
-    } on FirebaseAuthException catch (e) {
-      throw Exception('Erro ao enviar e-mail de recuperação: ${e.message}');
+      response = await http
+          .post(
+            Uri.parse('$backendUrl/auth/password-reset'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(
+                {'login': value.contains('@') ? value : cpfDigits(value)}),
+          )
+          .timeout(const Duration(seconds: 25));
+    } catch (e) {
+      if (isNetworkFailure(e)) {
+        throw Exception('Sem conexão com o servidor. Confira a internet e '
+            'tente de novo.');
+      }
+      rethrow;
     }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    return (jsonDecode(utf8.decode(response.bodyBytes)) as Map)['message']
+            ?.toString() ??
+        'Link enviado. Confira sua caixa de entrada e o spam.';
   }
 
   Future<List<Map<String, dynamic>>> getOfflineRecords() async {

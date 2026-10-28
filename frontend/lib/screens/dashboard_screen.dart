@@ -1,13 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
-import 'package:fl_chart/fl_chart.dart';
 import 'dart:async';
-import 'dart:math' as math;
 import '../services/api_service.dart';
 import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
-import 'monthly_dashboard_screen.dart';
+import '../utils/work_schedule_rules.dart' show isInternProfile;
+import 'month_overview.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -24,13 +23,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
   List<dynamic> _dailyRecords = [];
   List<dynamic> _weeklyRecords = [];
   double _weeklyTotalHours = 0;
-  DateTime _timelineDate = DateTime.now();
-  // A linha do tempo acompanha o dia de hoje ate o usuario escolher outra
-  // data. Com o painel aberto na virada do dia, ela ficava presa em ontem.
-  bool _timelineFollowsToday = true;
-  List<int> _hourlyActivity = List.filled(24, 0);
-  // Pontos da vespera do dia da linha do tempo, para o turno que atravessa
-  // a meia-noite. Dia passado quase nao muda e o painel atualiza a cada 30 s:
+  // Trabalhado hoje ate agora, com o turno aberto (a folha so conta o que
+  // ja fechou: com a entrada das 08:00 aberta, "hoje" mostrava 0h 0m).
+  int _todaySeconds = 0;
+  // Recarrega o mes (puxar a tela para baixo).
+  int _monthReload = 0;
+  // Pontos da vespera de hoje, para o turno que atravessa a meia-noite. Dia passado quase nao muda e o painel atualiza a cada 30 s:
   // le uma vez por usuario e dia (puxar a tela para baixo le de novo).
   String? _previousDayKey;
   List<dynamic> _previousDayRecords = const [];
@@ -95,10 +93,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (_selectedUser == null) return;
     try {
       final now = DateTime.now();
-      if (_timelineFollowsToday) _timelineDate = now;
       final userId = _selectedUser!['id'];
-      final day =
-          DateTime(_timelineDate.year, _timelineDate.month, _timelineDate.day);
+      final day = DateTime(now.year, now.month, now.day);
 
       // A semana ja traz o dia de hoje, agrupado como na folha (pelo dia da
       // entrada): uma exportacao so a cada 30 s em vez de duas.
@@ -133,8 +129,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _weeklyRecords = weekRecords;
         _weeklyTotalHours =
             double.tryParse(weekData['summary']['total_hours']) ?? 0.0;
-        _hourlyActivity =
-            _hourlyActivityFor(day, now, previousDay, rawRecords);
+        _todaySeconds = _workedSecondsFor(day, now, previousDay, rawRecords);
       });
     } catch (e) {
       debugPrint('Erro dashboard: $e');
@@ -145,8 +140,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   /// dia padrao da folha (exportTimesheet ja devolve assim).
   bool get _isDailyUser => _selectedUser?['daily_mode'] == true;
 
-  /// Linha do tempo do dia [day] no modo diaria: os pontos do dia padrao,
-  /// se houve diaria nele. Dia fora da semana carregada pede as diarias dele.
+  /// Pontos do dia [day] no modo diaria: os do dia padrao, se houve diaria
+  /// nele. Dia fora da semana carregada pede as diarias dele.
   Future<List<dynamic>> _dailyTimelineRecords(
       DateTime day, DateTime startWeek, List<dynamic> weekRecords) async {
     final key = DateFormat('yyyy-MM-dd').format(day);
@@ -191,30 +186,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return records;
   }
 
-  /// Ocupacao de cada hora do dia [day] na linha do tempo: 0 nada,
-  /// 1 trabalho, 2 pausa, 3 hora atual. Entra o turno que vinha aberto da
-  /// vespera ([previousDay]) e, num dia passado, o que ficou aberto na
-  /// meia-noite (vai ate 24:00). So com os pontos do proprio dia, o turno
-  /// 19:30-07:00 nao aparecia em nenhum dos dois dias. Cada hora fica com o
-  /// que ocupou mais tempo dela.
-  List<int> _hourlyActivityFor(DateTime day, DateTime now,
+  /// Segundos trabalhados no dia [day] ate [now]. Entra o turno que vinha
+  /// aberto da vespera ([previousDay]) e o turno ainda aberto (ate agora).
+  /// So com os pontos do proprio dia, o turno 19:30-07:00 nao aparecia em
+  /// nenhum dos dois dias.
+  int _workedSecondsFor(DateTime day, DateTime now,
       List<dynamic> previousDay, List<dynamic> dayRecords) {
     final dayStart = DateTime(day.year, day.month, day.day);
     final dayEnd = DateTime(day.year, day.month, day.day + 1);
-    final workSeconds = List<int>.filled(24, 0);
-    final pauseSeconds = List<int>.filled(24, 0);
+    var workSeconds = 0;
 
     void paint(DateTime from, DateTime to, bool pause) {
-      var cursor = from.isBefore(dayStart) ? dayStart : from;
+      if (pause) return;
+      final start = from.isBefore(dayStart) ? dayStart : from;
       final end = to.isAfter(dayEnd) ? dayEnd : to;
-      while (cursor.isBefore(end)) {
-        final nextHour =
-            DateTime(cursor.year, cursor.month, cursor.day, cursor.hour + 1);
-        final sliceEnd = nextHour.isBefore(end) ? nextHour : end;
-        (pause ? pauseSeconds : workSeconds)[cursor.hour] +=
-            sliceEnd.difference(cursor).inSeconds;
-        cursor = sliceEnd;
-      }
+      if (end.isAfter(start)) workSeconds += end.difference(start).inSeconds;
     }
 
     DateTime? shiftStart;
@@ -271,17 +257,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
           resumedByAutomaticEnd = false;
       }
     }
-    // Turno ainda aberto: hoje vai ate agora; num dia passado, ate 24:00.
+    // Turno ainda aberto: vai ate agora.
     if (shiftStart != null) closeSegment(now.isBefore(dayEnd) ? now : dayEnd);
 
-    final activity = List<int>.generate(24, (hour) {
-      if (workSeconds[hour] == 0 && pauseSeconds[hour] == 0) return 0;
-      return pauseSeconds[hour] > workSeconds[hour] ? 2 : 1;
-    });
-    if (!now.isBefore(dayStart) && now.isBefore(dayEnd)) {
-      activity[now.hour] = 3;
-    }
-    return activity;
+    return workSeconds;
   }
 
   /// Pontos em ordem, cada um na hora em que de fato aconteceu. O lote
@@ -330,7 +309,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator(color: wineColor))
           : RefreshIndicator(
-              onRefresh: () => _fetchDashboardData(refreshPreviousDay: true),
+              onRefresh: () {
+                setState(() => _monthReload++);
+                return _fetchDashboardData(refreshPreviousDay: true);
+              },
               color: wineColor,
               child: SingleChildScrollView(
                 physics: const AlwaysScrollableScrollPhysics(),
@@ -341,18 +323,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     _buildHeader(),
                     const SizedBox(height: 20),
                     _buildUserSwitcher(),
-                    const SizedBox(height: 24),
+                    const SizedBox(height: 16),
                     _buildSummaryCards(),
                     if (_isDailyUser) ...[
                       const SizedBox(height: 12),
                       _buildDailyModeNote(),
                     ],
-                    const SizedBox(height: 24),
-                    _buildTimelineChart(),
-                    const SizedBox(height: 24),
-                    _buildWeeklyTimelineChart(),
-                    const SizedBox(height: 24),
-                    _buildWeeklyHours(),
+                    const SizedBox(height: 20),
+                    // O mes (antes a tela "Meu Mes"): calendario com as horas
+                    // de cada dia; meta e saldo so para o estagiario.
+                    if (_selectedUser != null)
+                      MonthOverview(
+                        key: ValueKey('${_selectedUser!['id']}|$_monthReload'),
+                        user: Map<String, dynamic>.from(_selectedUser!),
+                        todayRecord: _dailyRecords.isEmpty
+                            ? null
+                            : Map<String, dynamic>.from(
+                                _dailyRecords.first as Map),
+                      ),
                   ],
                 ),
               ),
@@ -400,62 +388,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     color: textColor)),
           ],
         ),
-        const SizedBox(width: 14),
-        _buildMonthlyEntry(),
       ],
-    );
-  }
-
-  /// Acesso a visao mensal: alvo compacto no cabecalho, com anel fino e
-  /// halo tenue em vez de um bloco solido.
-  Widget _buildMonthlyEntry() {
-    if (_selectedUser == null) return const SizedBox.shrink();
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-
-    return Tooltip(
-      message: 'Meu Mês',
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(12),
-          onTap: () => Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => MonthlyDashboardScreen(
-                user: Map<String, dynamic>.from(_selectedUser!),
-              ),
-            ),
-          ),
-          child: Ink(
-            width: 40,
-            height: 40,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: wineColor.withOpacity(0.45)),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  wineColor.withOpacity(isDark ? 0.30 : 0.10),
-                  wineColor.withOpacity(0.02),
-                ],
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: wineColor.withOpacity(isDark ? 0.35 : 0.18),
-                  blurRadius: 10,
-                  spreadRadius: -2,
-                ),
-              ],
-            ),
-            // Variante base do icone: as variantes rounded/sharp nem sempre
-            // tem glifo na MaterialIcons empacotada e saem em branco.
-            child: const Center(
-              child: Icon(Icons.auto_graph, color: wineColor, size: 22),
-            ),
-          ),
-        ),
-      ),
     );
   }
 
@@ -503,35 +436,38 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
+  String _hm(double hours) {
+    final total = (hours * 60).round();
+    return '${total ~/ 60}h ${(total % 60).toString().padLeft(2, '0')}m';
+  }
+
+  /// Hoje e a semana, ate agora. Meta so para o estagiario (carga fixa por
+  /// dia util); os demais fazem o proprio horario e veem so o que fizeram.
   Widget _buildSummaryCards() {
     final record = _dailyRecords.isNotEmpty ? _dailyRecords.first : null;
-    final double hours = record?['total_hours'] ?? 0.0;
-    final int h = hours.toInt();
-    final int m = ((hours - h) * 60).round();
+    final todayHours = _todaySeconds / 3600;
+    // A semana da folha so tem o que ja fechou: troca o hoje dela pelo de
+    // agora.
+    final closedToday = double.tryParse('${record?['total_hours'] ?? 0}') ?? 0;
+    final weekHours = _weeklyTotalHours - closedToday + todayHours;
+    final checkIn = record?['check_in']?.toString();
 
-    bool isEstagiario = (_selectedUser?['role'] ?? '')
-            .toString()
-            .toLowerCase()
-            .contains('estag') ||
-        (_selectedUser?['role'] ?? '')
-            .toString()
-            .toLowerCase()
-            .contains('intern');
-
-    final double weeklyGoal = isEstagiario ? 30.0 : 44.0;
-    final double balance = _weeklyTotalHours - weeklyGoal;
-    final String balanceStr = balance >= 0
-        ? '+${balance.toStringAsFixed(1)}h'
-        : '${balance.toStringAsFixed(1)}h';
+    final bool isEstagiario = isInternProfile(_selectedUser);
+    final dailyTarget =
+        double.tryParse('${_selectedUser?['daily_hours'] ?? ''}') ?? 6.0;
 
     return Row(
       children: [
-        _buildCard('HORAS HOJE', '${h}h ${m}m', 'acumulado', isPrimary: true),
+        _buildCard('HOJE', _hm(todayHours),
+            checkIn == null ? 'sem ponto hoje' : 'entrada $checkIn',
+            isPrimary: true),
         const SizedBox(width: 10),
-        _buildCard('ENTRADA', record?['check_in'] ?? '--:--', 'no prazo'),
-        const SizedBox(width: 10),
-        _buildCard('SALDO SEMANA', balanceStr,
-            balance >= 0 ? 'acima da meta' : 'abaixo da meta'),
+        _buildCard(
+            'SEMANA',
+            _hm(weekHours),
+            isEstagiario && !_isDailyUser
+                ? 'meta ${(dailyTarget * 5).toStringAsFixed(0)}h'
+                : 'trabalhadas'),
       ],
     );
   }
@@ -602,364 +538,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     color: isPrimary ? wineColor : Colors.grey, fontSize: 9)),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildTimelineChart() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('LINHA DO TEMPO — DIA',
-                  style: TextStyle(
-                      color: Colors.grey,
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold)),
-              TextButton.icon(
-                onPressed: () async {
-                  final picked = await showDatePicker(
-                    context: context,
-                    initialDate: _timelineDate,
-                    firstDate: DateTime(2023),
-                    lastDate: DateTime.now(),
-                  );
-                  if (picked != null) {
-                    setState(() {
-                      _timelineDate = picked;
-                      _timelineFollowsToday =
-                          DateUtils.isSameDay(picked, DateTime.now());
-                    });
-                    _fetchDashboardData();
-                  }
-                },
-                icon: const Icon(Icons.calendar_today,
-                    size: 12, color: wineColor),
-                label: Text(
-                  DateFormat('dd/MM/yy').format(_timelineDate),
-                  style: const TextStyle(
-                      color: wineColor,
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold),
-                ),
-                style: TextButton.styleFrom(
-                    padding: EdgeInsets.zero, minimumSize: Size.zero),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          SizedBox(
-            height: 80,
-            child: BarChart(
-              BarChartData(
-                maxY: 10,
-                barGroups: List.generate(24, (i) {
-                  int type = _hourlyActivity[i];
-                  return BarChartGroupData(
-                    x: i,
-                    barRods: [
-                      BarChartRodData(
-                        toY: type > 0 ? 8 : 0,
-                        color: type == 2
-                            ? Colors.orange
-                            : (type == 3
-                                ? Colors.blue
-                                : Colors.blue.withOpacity(0.4)),
-                        width: 6,
-                        borderRadius: BorderRadius.circular(1),
-                      ),
-                    ],
-                  );
-                }),
-                gridData: FlGridData(show: false),
-                titlesData: FlTitlesData(
-                  leftTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                  topTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                  rightTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                  bottomTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      reservedSize: 18,
-                      getTitlesWidget: (val, meta) {
-                        if (val % 2 == 0) {
-                          return Padding(
-                            padding: const EdgeInsets.only(top: 4.0),
-                            child: Text('${val.toInt()}h',
-                                style: const TextStyle(
-                                    color: Colors.grey, fontSize: 8)),
-                          );
-                        }
-                        return const SizedBox.shrink();
-                      },
-                    ),
-                  ),
-                ),
-                borderData: FlBorderData(show: false),
-                barTouchData: BarTouchData(enabled: false),
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              _buildLegend(Colors.blue.withOpacity(0.4), 'Trabalhado'),
-              const SizedBox(width: 12),
-              _buildLegend(Colors.orange, 'Pausa'),
-              const SizedBox(width: 12),
-              _buildLegend(Colors.blue, 'Momento atual'),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildLegend(Color color, String label) {
-    return Row(
-      children: [
-        Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(
-                color: color, borderRadius: BorderRadius.circular(2))),
-        const SizedBox(width: 6),
-        Text(label, style: const TextStyle(color: Colors.grey, fontSize: 9)),
-      ],
-    );
-  }
-
-  /// Horas de cada dia da semana (seg a dom) pelo total do dia, que ja
-  /// desconta as pausas e soma no dia da entrada o turno que passou da
-  /// meia-noite. A conta antiga (hora da saida menos hora da entrada da
-  /// primeira sessao) dava 1h para 19:30-07:00, nada para 22:00-06:00 e so a
-  /// manha num dia com almoco.
-  List<double> _weekdayHours() {
-    final now = DateTime.now();
-    final monday = DateTime(now.year, now.month, now.day - (now.weekday - 1));
-    return List.generate(7, (index) {
-      final key = DateFormat('yyyy-MM-dd')
-          .format(DateTime(monday.year, monday.month, monday.day + index));
-      for (final record in _weeklyRecords) {
-        if (record is Map && record['date'] == key) {
-          final hours = record['total_hours'];
-          return hours is num ? hours.toDouble() : 0.0;
-        }
-      }
-      return 0.0;
-    });
-  }
-
-  String _barLabel(double hours) {
-    final minutes = (hours * 60).round();
-    if (minutes <= 0) return '';
-    final m = minutes % 60;
-    return '${minutes ~/ 60}h${m > 0 ? m.toString().padLeft(2, '0') : ''}';
-  }
-
-  Widget _buildWeeklyTimelineChart() {
-    final weekHours = _weekdayHours();
-    // Turno de 12h ou mais (noite) nao cabia no eixo fixo de 12h.
-    final maxY =
-        math.max(12.0, (weekHours.reduce(math.max) + 1).ceilToDouble());
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('LINHA DO TEMPO — SEMANA',
-              style: TextStyle(
-                  color: Colors.grey,
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold)),
-          const SizedBox(height: 24),
-          SizedBox(
-            height: 100,
-            child: BarChart(
-              BarChartData(
-                maxY: maxY,
-                barGroups: List.generate(7, (index) {
-                  final hours = weekHours[index];
-                  return BarChartGroupData(
-                    x: index,
-                    barRods: [
-                      BarChartRodData(
-                        toY: hours > 0 ? hours : 0.1,
-                        color: wineColor.withOpacity(0.8),
-                        width: 10,
-                        borderRadius: BorderRadius.circular(2),
-                        backDrawRodData: BackgroundBarChartRodData(
-                          show: true,
-                          toY: 10,
-                          color: Theme.of(context).brightness == Brightness.dark
-                              ? Colors.white.withOpacity(0.03)
-                              : Colors.black.withOpacity(0.03),
-                        ),
-                      ),
-                    ],
-                    showingTooltipIndicators: [0],
-                  );
-                }),
-                gridData: FlGridData(show: false),
-                titlesData: FlTitlesData(
-                  leftTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                  topTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                  rightTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                  bottomTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      reservedSize: 18,
-                      getTitlesWidget: (val, meta) {
-                        const days = [
-                          'Seg',
-                          'Ter',
-                          'Qua',
-                          'Qui',
-                          'Sex',
-                          'Sáb',
-                          'Dom'
-                        ];
-                        if (val >= 0 && val < 7) {
-                          return Padding(
-                            padding: const EdgeInsets.only(top: 6.0),
-                            child: Text(days[val.toInt()],
-                                style: const TextStyle(
-                                    color: Colors.grey, fontSize: 8)),
-                          );
-                        }
-                        return const SizedBox.shrink();
-                      },
-                    ),
-                  ),
-                ),
-                borderData: FlBorderData(show: false),
-                barTouchData: BarTouchData(
-                  enabled: false,
-                  touchTooltipData: BarTouchTooltipData(
-                    tooltipBgColor: Colors.transparent,
-                    tooltipPadding: EdgeInsets.zero,
-                    tooltipMargin: 4,
-                    getTooltipItem: (group, groupIndex, rod, rodIndex) {
-                      return BarTooltipItem(
-                        _barLabel(weekHours[group.x]),
-                        TextStyle(
-                            color:
-                                Theme.of(context).textTheme.bodyMedium?.color,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 9),
-                      );
-                    },
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildWeeklyHours() {
-    bool isEstagiario = (_selectedUser?['role'] ?? '')
-            .toString()
-            .toLowerCase()
-            .contains('estag') ||
-        (_selectedUser?['role'] ?? '')
-            .toString()
-            .toLowerCase()
-            .contains('intern');
-
-    final double weeklyGoal = isEstagiario ? 30.0 : 44.0;
-    final double progress = (_weeklyTotalHours / weeklyGoal).clamp(0.0, 1.0);
-    final int h = _weeklyTotalHours.toInt();
-    final int m = ((_weeklyTotalHours - h) * 60).round();
-    final textColor = Theme.of(context).textTheme.bodyLarge?.color;
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('HORAS NA SEMANA (${isEstagiario ? "META 30H" : "META 44H"})',
-              style: const TextStyle(
-                  color: Colors.grey,
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold)),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              SizedBox(
-                width: 44,
-                height: 44,
-                child: CircularProgressIndicator(
-                  value: progress,
-                  strokeWidth: 6,
-                  backgroundColor:
-                      Theme.of(context).brightness == Brightness.dark
-                          ? Colors.white.withOpacity(0.03)
-                          : Colors.black.withOpacity(0.03),
-                  color: wineColor,
-                ),
-              ),
-              const SizedBox(width: 16),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('${h}h ${m}m',
-                      style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                          color: textColor)),
-                  Row(
-                    children: [
-                      Text('meta: ${weeklyGoal.toInt()}h',
-                          style: const TextStyle(
-                              color: Colors.grey, fontSize: 10)),
-                      const SizedBox(width: 8),
-                      if (progress < 0.8)
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                              color: Colors.orange.withOpacity(0.2),
-                              borderRadius: BorderRadius.circular(20)),
-                          child: const Text('ATENÇÃO',
-                              style: TextStyle(
-                                  color: Colors.orange,
-                                  fontSize: 8,
-                                  fontWeight: FontWeight.bold)),
-                        ),
-                    ],
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ],
       ),
     );
   }
