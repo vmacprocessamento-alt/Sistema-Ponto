@@ -19,7 +19,6 @@ import '../utils/cpf.dart';
 import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
-import '../utils/work_schedule_rules.dart';
 
 class AdjustmentRequestResult {
   final String id;
@@ -914,27 +913,6 @@ class ApiService {
   Future<void> clearOfflineRecords() async {
     await _replaceOfflineRecords([]);
   }
-
-  /// Ponto [recordId] lido direto do servidor, ou null (nao existe, e de
-  /// outro usuario ou nao deu para ler).
-  Future<Map<String, dynamic>?> _serverTimeRecord(String recordId) async {
-    try {
-      final snapshot = await _db
-          .collection('time_records')
-          .doc(recordId)
-          .get(const GetOptions(source: Source.server))
-          .timeout(const Duration(seconds: 15));
-      final data = snapshot.data();
-      if (!snapshot.exists || data == null) return null;
-      return {'id': snapshot.id, ...data};
-    } catch (e) {
-      debugPrint('Nao deu para conferir o ponto $recordId no servidor: $e');
-      return null;
-    }
-  }
-
-  Future<bool> _recordExistsOnServer(String recordId) async =>
-      await _serverTimeRecord(recordId) != null;
 
   /// Id novo de documento de time_records, gerado no aparelho (sem rede).
   String newTimeRecordId() => _db.collection('time_records').doc().id;
@@ -2587,17 +2565,6 @@ class ApiService {
     'timezone': 'America/Sao_Paulo',
   };
 
-  DateTime _scheduleTime(DateTime day, dynamic value) {
-    final parts = value.toString().split(':');
-    return DateTime(
-      day.year,
-      day.month,
-      day.day,
-      int.tryParse(parts.first) ?? 0,
-      parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0,
-    );
-  }
-
   DateTime _firestoreCreatedAt(Map<String, dynamic> item) {
     final value = item['created_at'];
     if (value is Timestamp) return value.toDate();
@@ -2678,18 +2645,6 @@ class ApiService {
       'start_request': startRequest,
       'compatibility_mode': true,
     };
-  }
-
-  /// Um registro ja gravado corresponde a esta mesma tentativa de batida?
-  /// Usado so no fallback pos-falha do backend, para diferenciar "o ponto ja
-  /// entrou" (mesmo minuto) de um conflito real de turno.
-  static const Duration _sameAttemptWindow = Duration(minutes: 5);
-
-  bool _matchesAttempt(Map<String, dynamic>? record, DateTime attempted) {
-    if (record == null) return false;
-    final moment = DateTime.tryParse(record['timestamp']?.toString() ?? '');
-    if (moment == null) return false;
-    return moment.difference(attempted).abs() <= _sameAttemptWindow;
   }
 
   /// Turno aberto do usuario pelo que esta no servidor (14 dias, como o
