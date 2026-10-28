@@ -1407,6 +1407,58 @@ class TemporaryPasswordTest(unittest.TestCase):
 
 
 @needs_main
+class PasswordChangeGateTest(unittest.TestCase):
+    """Com a troca de senha do primeiro acesso pendente, a API fecha para tudo
+    menos a propria troca. Antes so a tela do app forcava a troca: com o CPF
+    de um colega e a senha padrao dava para usar a API inteira."""
+
+    def gate(self, dependency, profile):
+        async def verify(token):
+            return "u1"
+
+        async def read_profile(collection, document_id, token):
+            return dict(profile)
+
+        with mock.patch.object(main, "verify_firebase_user_token", verify), \
+                mock.patch.object(main, "get_firestore_document_with_user_token", read_profile):
+            return asyncio.run(dependency(types.SimpleNamespace(credentials="t")))
+
+    def test_pending_change_blocks_everything_but_the_change_itself(self):
+        pending = {"role": "employee", "must_change_password": True}
+        with self.assertRaises(main.HTTPException) as ctx:
+            self.gate(main.require_authenticated_user, pending)
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.detail, main.PASSWORD_CHANGE_REQUIRED_DETAIL)
+        self.assertEqual(ctx.exception.headers, {"X-Password-Change-Required": "1"})
+        # Admin com troca pendente tambem fica de fora: require_admin_user
+        # depende de require_authenticated_user, que e quem barra.
+        with self.assertRaises(main.HTTPException):
+            self.gate(main.require_authenticated_user, {**pending, "role": "admin"})
+        # /me/password continua aberto para quem precisa criar a senha.
+        user = self.gate(main.require_user_pending_password_change, pending)
+        self.assertEqual((user["id"], user["must_change_password"]), ("u1", True))
+
+    def test_without_pending_change_passes(self):
+        for profile in ({"role": "employee"}, {"role": "employee", "must_change_password": False}):
+            user = self.gate(main.require_authenticated_user, profile)
+            self.assertEqual(user["id"], "u1")
+            self.assertEqual(user["_id_token"], "t")
+
+    def test_missing_profile_is_403(self):
+        async def verify(token):
+            return "u1"
+
+        async def no_profile(collection, document_id, token):
+            return None
+
+        with mock.patch.object(main, "verify_firebase_user_token", verify), \
+                mock.patch.object(main, "get_firestore_document_with_user_token", no_profile), \
+                self.assertRaises(main.HTTPException) as ctx:
+            asyncio.run(main.require_authenticated_user(types.SimpleNamespace(credentials="t")))
+        self.assertEqual(ctx.exception.status_code, 403)
+
+
+@needs_main
 class CpfAccessTest(unittest.TestCase):
     """Login por CPF, cadastro pelo admin e troca de senha no primeiro acesso."""
 
@@ -1509,8 +1561,8 @@ class CpfAccessTest(unittest.TestCase):
         # Bloqueado mesmo com a senha certa, e de outro aparelho (por CPF).
         self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD, ip="9.9.9.9")[0], 429)
 
-    def change(self, user, password):
-        payload = main.OwnPasswordChangeRequest(new_password=password)
+    def change(self, user, password, current=None):
+        payload = main.OwnPasswordChangeRequest(new_password=password, current_password=current)
         return _call(main.change_own_password_endpoint(payload, user))
 
     def test_first_access_password_change(self):
@@ -1518,10 +1570,28 @@ class CpfAccessTest(unittest.TestCase):
         user = {"id": uid, **self.db.store["users"][uid]}
         for bad in ("123456", "12345", VALID_CPF):
             self.assertEqual(self.status_of(self.change, user, bad)[0], 400)
+        # Primeiro acesso: a pessoa acabou de entrar com a padrao, nao a repete.
         self.assertEqual(self.change(user, "minhaSenha9")["status"], "success")
         self.assertEqual(self.auth.accounts[uid]["password"], "minhaSenha9")
         self.assertFalse(self.db.store["users"][uid]["must_change_password"])
         self.assertEqual(self.login(VALID_CPF, "minhaSenha9"), {"email": f"{VALID_CPF}@{main.CPF_LOGIN_EMAIL_DOMAIN}"})
+
+    def test_later_change_requires_current_password(self):
+        uid = self.create()["id"]
+        self.change({"id": uid, **self.db.store["users"][uid]}, "minhaSenha9")
+        user = {"id": uid, **self.db.store["users"][uid]}
+        self.assertFalse(user["must_change_password"])
+        # Sem a atual, ou com a atual errada, nada muda.
+        self.assertEqual(self.status_of(self.change, user, "outraSenha9"), (400, "Informe a senha atual."))
+        self.assertEqual(self.status_of(self.change, user, "outraSenha9", "errada"), (400, "Senha atual incorreta."))
+        self.assertEqual(self.status_of(self.change, user, "minhaSenha9", "minhaSenha9")[0], 400)
+        self.assertEqual(self.auth.accounts[uid]["password"], "minhaSenha9")
+        # Com a atual certa, troca.
+        self.assertEqual(self.change(user, "outraSenha9", "minhaSenha9")["status"], "success")
+        self.assertEqual(self.auth.accounts[uid]["password"], "outraSenha9")
+        # Conta desativada nem com a senha certa.
+        self.auth.accounts[uid]["disabled"] = True
+        self.assertEqual(self.status_of(self.change, user, "maisUma9", "outraSenha9")[0], 403)
 
     def update(self, uid, **fields):
         values = {

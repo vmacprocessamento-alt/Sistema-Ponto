@@ -705,7 +705,11 @@ class ApiService {
   /// Troca a senha da propria conta (no primeiro acesso, obrigatorio), pelo
   /// backend, e entra de novo com ela: a troca pelo Admin SDK pode derrubar
   /// a sessao atual na proxima renovacao do token.
-  Future<void> changeOwnPassword(String newPassword) async {
+  ///
+  /// Fora do primeiro acesso o backend exige [currentPassword]; sem ela
+  /// responde 400 "Informe a senha atual".
+  Future<void> changeOwnPassword(String newPassword,
+      {String? currentPassword}) async {
     final response = await http
         .post(
           Uri.parse('$backendUrl/me/password'),
@@ -713,7 +717,11 @@ class ApiService {
             ...await _authorizedHeaders(),
             'Content-Type': 'application/json',
           },
-          body: jsonEncode({'new_password': newPassword}),
+          body: jsonEncode({
+            'new_password': newPassword,
+            if (currentPassword != null && currentPassword.isNotEmpty)
+              'current_password': currentPassword,
+          }),
         )
         .timeout(const Duration(seconds: 25));
     if (response.statusCode < 200 || response.statusCode >= 300) {

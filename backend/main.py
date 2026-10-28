@@ -1394,22 +1394,53 @@ async def verify_firebase_user_token(id_token: str) -> str:
     _remember_token(id_token, user_uid)
     return user_uid
 
-async def require_authenticated_user(token: HTTPAuthorizationCredentials = Depends(security)):
-    user_uid = await verify_firebase_user_token(token.credentials)
+async def _load_authenticated_user(id_token: str) -> dict:
+    user_uid = await verify_firebase_user_token(id_token)
 
     user_data = await get_firestore_document_with_user_token(
         "users",
         user_uid,
-        token.credentials,
+        id_token,
     )
     if user_data is None:
         raise HTTPException(status_code=403, detail="Perfil do usuario nao encontrado.")
 
     return {
         "id": user_uid,
-        "_id_token": token.credentials,
+        "_id_token": id_token,
         **user_data,
     }
+
+PASSWORD_CHANGE_REQUIRED_DETAIL = "Crie sua senha para continuar (primeiro acesso)."
+
+def password_change_pending(user: dict) -> bool:
+    return bool(user.get("must_change_password"))
+
+async def require_authenticated_user(token: HTTPAuthorizationCredentials = Depends(security)):
+    """Sessao valida E senha propria ja criada.
+
+    A senha do primeiro acesso e a padrao da empresa, conhecida por todos, e o
+    CPF e um dado semipublico: quem souber o CPF de um colega recem-cadastrado
+    (ou com a senha redefinida pelo admin) entra com a senha padrao. Antes, so
+    a tela do app forcava a troca; chamando a API direto dava para bater ponto,
+    registrar diaria e exportar sem nunca criar a senha. Agora, com a troca
+    pendente (users.must_change_password), toda a API responde 403, exceto a
+    propria troca (/me/password, que usa require_user_pending_password_change).
+    """
+    user = await _load_authenticated_user(token.credentials)
+    if password_change_pending(user):
+        raise HTTPException(
+            status_code=403,
+            detail=PASSWORD_CHANGE_REQUIRED_DETAIL,
+            headers={"X-Password-Change-Required": "1"},
+        )
+    return user
+
+async def require_user_pending_password_change(
+    token: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Sessao valida, com ou sem a troca de senha pendente. So para /me/password."""
+    return await _load_authenticated_user(token.credentials)
 
 async def require_admin_user(user=Depends(require_authenticated_user)):
     if user.get("role") not in ["admin", "manager"]:
@@ -4332,15 +4363,21 @@ def create_user_admin_endpoint(
 
 class OwnPasswordChangeRequest(BaseModel):
     new_password: str
+    # Obrigatoria fora do primeiro acesso (ver change_own_password_endpoint).
+    current_password: Optional[str] = None
 
 @app.post("/me/password")
-def change_own_password_endpoint(
+async def change_own_password_endpoint(
     payload: OwnPasswordChangeRequest,
-    user=Depends(require_authenticated_user),
+    user=Depends(require_user_pending_password_change),
 ):
-    """A pessoa troca a propria senha (no primeiro acesso, obrigatorio).
-    Pelo Admin SDK: vale mesmo com a sessao antiga, que o updatePassword do
-    app recusaria ("login recente")."""
+    """A pessoa troca a propria senha. Pelo Admin SDK: vale mesmo com a sessao
+    antiga, que o updatePassword do app recusaria ("login recente").
+
+    No primeiro acesso (must_change_password) basta a senha nova: a pessoa
+    acabou de entrar com a padrao. Depois disso a senha atual e obrigatoria:
+    sem ela, qualquer sessao esquecida aberta num celular emprestado bastava
+    para tomar a conta de vez, trocando a senha sem conhecer a antiga."""
     password = payload.new_password
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="A senha precisa de pelo menos 6 caracteres.")
@@ -4350,16 +4387,34 @@ def change_own_password_endpoint(
     if cpf and password == cpf:
         raise HTTPException(status_code=400, detail="Nao use o CPF como senha.")
 
+    if not password_change_pending(user):
+        current_password = payload.current_password or ""
+        if not current_password:
+            raise HTTPException(status_code=400, detail="Informe a senha atual.")
+        if current_password == password:
+            raise HTTPException(status_code=400, detail="A senha nova precisa ser diferente da atual.")
+        try:
+            account = await asyncio.to_thread(firebase_auth.get_user, user["id"])
+        except firebase_auth.UserNotFoundError as exc:
+            raise HTTPException(status_code=403, detail="Conta nao encontrada.") from exc
+        result = await _check_firebase_password(account.email or "", current_password)
+        if result == "throttled":
+            raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde um pouco e tente de novo.")
+        if result == "disabled":
+            raise HTTPException(status_code=403, detail="Esta conta foi desativada.")
+        if result != "ok":
+            raise HTTPException(status_code=400, detail="Senha atual incorreta.")
+
     db = get_firestore_admin()
     try:
-        firebase_auth.update_user(user["id"], password=password)
+        await asyncio.to_thread(firebase_auth.update_user, user["id"], password=password)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Falha ao trocar a senha: {exc}") from exc
-    db.collection("users").document(user["id"]).update({
+    await asyncio.to_thread(db.collection("users").document(user["id"]).update, {
         "must_change_password": False,
         "password_changed_at": firestore.SERVER_TIMESTAMP,
     })
-    db.collection("system_audits").document().set({
+    await asyncio.to_thread(db.collection("system_audits").document().set, {
         "action": "user_changed_password",
         "target_user_id": user["id"],
         "created_at": firestore.SERVER_TIMESTAMP,

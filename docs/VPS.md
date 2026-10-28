@@ -23,7 +23,9 @@ bash /opt/ponto/deploy/atualizar.sh
 ```
 
 Puxa a `main`, gera o build do Flutter num container (`ghcr.io/cirruslabs/flutter`),
-recria backend e frontend. Se o build falhar, volta o build anterior.
+recria backend e frontend. O build sai em `frontend/build/web-new`, com o site
+atual no ar o tempo todo; so no fim a pasta e trocada (a anterior fica em
+`frontend/build/web-old`). Se o build ou o backend falhar, nada e trocado.
 
 ## Migração (feita uma vez, a partir do PC antigo)
 

@@ -91,7 +91,11 @@ r, _ = timed("POST", "/auth/cpf-login", json={"cpf": "00000000191", "password": 
 check("CPF inexistente -> 401 (mesma resposta)", r.status_code == 401)
 emp = sign_in(emp_email, emp_pw)
 r, _ = timed("GET", "/notifications", headers=bearer(emp))
-check("token do funcionario aceito pelo backend", r.status_code == 200)
+check("com a senha padrao, a API recusa ate criar a senha (403)", r.status_code == 403,
+      f"-> {r.status_code} {r.headers.get('x-password-change-required')}")
+check("   ...com o cabecalho X-Password-Change-Required", r.headers.get("x-password-change-required") == "1")
+r, _ = timed("POST", "/time-records/punch", headers=bearer(emp), json={"record_type": "check_in"})
+check("nem bate ponto com a senha padrao (403)", r.status_code == 403)
 r, _ = timed("POST", "/admin/users", headers=bearer(emp), json={"name": "Hack", "cpf": "39053344705"})
 check("funcionario NAO cadastra usuario (403)", r.status_code == 403)
 
@@ -100,10 +104,24 @@ r, _ = timed("POST", "/me/password", headers=bearer(emp), json={"new_password": 
 check("recusa a senha padrao", r.status_code == 400)
 r, _ = timed("POST", "/me/password", headers=bearer(emp), json={"new_password": "52998224725"})
 check("recusa o CPF como senha", r.status_code == 400)
-r, _ = timed("POST", "/me/password", headers=bearer(emp), json={"new_password": "nova-senha-9"})
-check("troca a senha", r.status_code == 200)
-check("senha nova entra", sign_in(emp_email, "nova-senha-9") is not None)
+r, _ = timed("POST", "/me/password", headers=bearer(emp), json={"new_password": "senha-inicial-9"})
+check("troca a senha (primeiro acesso, sem pedir a atual)", r.status_code == 200)
+check("senha nova entra", sign_in(emp_email, "senha-inicial-9") is not None)
 check("senha antiga nao entra mais", sign_in(emp_email, emp_pw) is None)
+emp = sign_in(emp_email, "senha-inicial-9")
+r, _ = timed("GET", "/notifications", headers=bearer(emp))
+check("depois de criar a senha, o token do funcionario e aceito", r.status_code == 200)
+
+print("\n== TROCA DE SENHA (depois do primeiro acesso) ==")
+r, _ = timed("POST", "/me/password", headers=bearer(emp), json={"new_password": "nova-senha-9"})
+check("sem a senha atual -> 400", r.status_code == 400, r.text[:80])
+r, _ = timed("POST", "/me/password", headers=bearer(emp),
+             json={"new_password": "nova-senha-9", "current_password": "errada"})
+check("senha atual errada -> 400", r.status_code == 400, r.text[:80])
+r, _ = timed("POST", "/me/password", headers=bearer(emp),
+             json={"new_password": "nova-senha-9", "current_password": "senha-inicial-9"})
+check("com a senha atual certa, troca", r.status_code == 200, r.text[:80])
+check("senha nova entra", sign_in(emp_email, "nova-senha-9") is not None)
 emp = sign_in(emp_email, "nova-senha-9")
 
 print("\n== CONTA DESATIVADA ==")
@@ -118,6 +136,10 @@ r, _ = timed("PUT", f"/admin/users/{intern_uid}", headers=bearer(admin), json={
     "cpf": "111.444.777-35", "disabled": False})
 intern_email = timed("POST", "/auth/cpf-login", json={"cpf": "11144477735", "password": intern_pw})[0].json()["email"]
 intern = sign_in(intern_email, intern_pw)
+# Estagiario tambem precisa criar a senha antes de usar a API.
+r, _ = timed("POST", "/me/password", headers=bearer(intern), json={"new_password": "senha-est-9"})
+check("estagiario cria a senha do primeiro acesso", r.status_code == 200, r.text[:80])
+intern = sign_in(intern_email, "senha-est-9")
 
 print("\n== PONTO DO ESTAGIARIO (backend) ==")
 now = datetime.now().isoformat()

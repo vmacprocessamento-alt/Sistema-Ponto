@@ -27,6 +27,9 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   static const Color wineColor = Color(0xFF8B0000);
 
   final _formKey = GlobalKey<FormState>();
+  // Senha atual: so fora do primeiro acesso. No primeiro acesso a pessoa
+  // acabou de entrar com a senha padrao, e o backend nao a exige.
+  final _currentController = TextEditingController();
   final _passwordController = TextEditingController();
   final _confirmController = TextEditingController();
   final _apiService = ApiService();
@@ -35,6 +38,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
 
   @override
   void dispose() {
+    _currentController.dispose();
     _passwordController.dispose();
     _confirmController.dispose();
     super.dispose();
@@ -48,6 +52,9 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
     }
     final cpf = cpfDigits(widget.cpf);
     if (cpf.isNotEmpty && password == cpf) return 'Não use o CPF como senha.';
+    if (!widget.forced && password == _currentController.text) {
+      return 'A senha nova precisa ser diferente da atual.';
+    }
     return null;
   }
 
@@ -55,7 +62,10 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _saving = true);
     try {
-      await _apiService.changeOwnPassword(_passwordController.text);
+      await _apiService.changeOwnPassword(
+        _passwordController.text,
+        currentPassword: widget.forced ? null : _currentController.text,
+      );
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         content: Text('Senha salva!'),
@@ -132,15 +142,27 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                                 'passou. Para continuar, '
                                 'crie uma senha só sua: é com ela e o seu CPF '
                                 'que você vai entrar daqui para frente.'
-                            : 'Digite a nova senha duas vezes.',
+                            : 'Digite a senha atual e, depois, a nova senha duas vezes.',
                         textAlign: TextAlign.center,
                         style: const TextStyle(fontSize: 15, height: 1.4),
                       ),
                       const SizedBox(height: 24),
+                      if (!widget.forced) ...[
+                        TextFormField(
+                          controller: _currentController,
+                          obscureText: _obscure,
+                          autofocus: true,
+                          decoration: _decoration('Senha atual'),
+                          validator: (value) => (value ?? '').isEmpty
+                              ? 'Informe a senha atual.'
+                              : null,
+                        ),
+                        const SizedBox(height: 16),
+                      ],
                       TextFormField(
                         controller: _passwordController,
                         obscureText: _obscure,
-                        autofocus: true,
+                        autofocus: widget.forced,
                         decoration: _decoration('Nova senha'),
                         validator: _validatePassword,
                       ),

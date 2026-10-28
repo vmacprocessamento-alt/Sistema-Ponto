@@ -56,7 +56,11 @@ de `firestore.rules`.
 3. O app entra no Firebase Auth com esse e-mail. Limite de tentativas: 10 por
    CPF e 30 por IP (o IP real vem do `CF-Connecting-IP`) a cada 15 min.
 4. Primeiro acesso (`must_change_password`): o app pede a senha nova
-   (`POST /api/me/password`).
+   (`POST /api/me/password`). Enquanto a troca estiver pendente, o backend
+   responde 403 em todos os outros endpoints (cabeçalho
+   `X-Password-Change-Required: 1`); a senha padrão não dá acesso à API.
+   Fora do primeiro acesso, trocar a senha exige a senha atual
+   (`current_password`).
 
 ### Bater ponto
 1. Toque no botão: o GPS começa na hora, junto com a conferência dos pontos.
