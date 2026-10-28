@@ -1319,6 +1319,17 @@ async def require_admin_user(user=Depends(require_authenticated_user)):
         raise HTTPException(status_code=403, detail="Apenas admin ou manager pode executar esta acao.")
     return user
 
+def _response_safe(data: dict) -> dict:
+    """Copia de `data` para devolver na resposta: o SERVER_TIMESTAMP do
+    Firestore e um marcador que so o banco preenche e nao vira JSON. Com ele
+    na resposta o endpoint gravava o documento e devolvia 500, e o app caia no
+    plano B pelo Firestore (o dobro do tempo em toda batida do estagiario)."""
+    server_now = datetime.utcnow().isoformat() + "Z"
+    return {
+        key: server_now if value is firestore.SERVER_TIMESTAMP else value
+        for key, value in data.items()
+    }
+
 def serialize_firestore_document(document) -> dict:
     data = document.to_dict() or {}
     for key, value in list(data.items()):
@@ -3059,7 +3070,7 @@ async def schedule_controlled_punch_endpoint(
     elif not payload.close_at_scheduled_end and abs((server_now - punched_at).total_seconds()) >= 60:
         record["device_timestamp"] = _local_iso(punched_at)
     record_ref.set(record)
-    return {"status": "created", "id": record_ref.id, **record}
+    return {"status": "created", "id": record_ref.id, **_response_safe(record)}
 
 @app.post("/work-schedule/approval-requests")
 async def create_schedule_approval_request_endpoint(
@@ -3211,7 +3222,7 @@ async def create_schedule_approval_request_endpoint(
             "type": "schedule_approval",
             "request_id": request_ref.id,
         })
-    return {"status": "created", "request": {"id": request_ref.id, **request_data}}
+    return {"status": "created", "request": {"id": request_ref.id, **_response_safe(request_data)}}
 
 @app.get("/admin/work-schedule/approval-requests")
 async def list_schedule_approval_requests_endpoint(
