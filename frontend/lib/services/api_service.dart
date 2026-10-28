@@ -13,6 +13,10 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_config.dart';
+// Import proprio para isInternProfile: o import inteiro abaixo sai quando
+// as outras funcoes dele deixam de ser usadas aqui.
+// ignore: unnecessary_import
+import '../utils/work_schedule_rules.dart' show isInternProfile;
 import 'session_service.dart';
 import '../utils/chat_timestamp.dart';
 import '../utils/cpf.dart';
@@ -1112,8 +1116,8 @@ class ApiService {
     final profile = cachedUser?['id']?.toString() == userId
         ? cachedUser!
         : await getCurrentUser();
-    final role = (profile['role'] ?? '').toString().toLowerCase();
-    final isIntern = role.contains('intern') || role.contains('estag');
+    // Mesma regra do backend: papel ou cargo "Estagiario".
+    final isIntern = isInternProfile(profile);
 
     int syncedCount = 0;
     final syncedKeys = <String>{};
