@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from test_work_schedule import _FakeDb, _FakeDocument, main, needs_main
+from test_work_schedule import _FakeDb, _FakeDocument, _FakeQuery, main, needs_main
 
 FUSO = ZoneInfo("America/Sao_Paulo")
 
@@ -46,6 +46,64 @@ class HoraDaBatidaTest(unittest.TestCase):
             _rodar(main.schedule_controlled_punch_endpoint(payload, self.user))
         self.assertEqual(erro.exception.status_code, 400)
         self.assertEqual(self.db.store.get("time_records", {}), {})
+
+
+class _ContaLeituras:
+    """Conta documentos lidos do Firestore simulado (o que entra na cota do plano gratuito)."""
+
+    def __init__(self, test):
+        self.lidos = 0
+        original = _FakeQuery.stream
+
+        def stream(consulta):
+            for snap in original(consulta):
+                self.lidos += 1
+                yield snap
+
+        patcher = mock.patch.object(_FakeQuery, "stream", stream)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+
+@needs_main
+class MenosLeiturasTest(unittest.TestCase):
+    def setUp(self):
+        self.db = _FakeDb()
+        self.db.store["users"] = {f"u{i}": {"cpf": f"{i:011d}", "cpf_digits": f"{i:011d}"} for i in range(200)}
+        main._backfill_cpf_digits(self.db)  # feito uma vez quando o servidor sobe
+        self.addCleanup(main._cpf_digits_backfilled.clear)
+        self.leituras = _ContaLeituras(self)
+
+    def test_login_le_um_cadastro_nao_todos(self):
+        achados = main._users_with_cpf(self.db, "00000000007", thorough=False)
+        self.assertEqual([d.id for d in achados], ["u7"])
+        self.assertEqual(self.leituras.lidos, 1)
+
+    def test_cadastro_antigo_sem_cpf_digits_e_achado_e_corrigido(self):
+        self.db.store["users"]["velho"] = {"cpf": "529.982.247-25"}
+        self.assertEqual([d.id for d in main._users_with_cpf(self.db, "52998224725", thorough=False)], ["velho"])
+        self.assertEqual(self.db.store["users"]["velho"]["cpf_digits"], "52998224725")
+        self.leituras.lidos = 0
+        main._users_with_cpf(self.db, "52998224725", thorough=False)
+        self.assertEqual(self.leituras.lidos, 1)
+
+    def test_cpf_digits_velho_nao_engana(self):
+        # CPF trocado pelo plano B do app: "cpf" novo, cpf_digits ainda o antigo.
+        self.db.store["users"]["u7"]["cpf"] = "529.982.247-25"
+        self.assertEqual(main._users_with_cpf(self.db, "00000000007", thorough=False), [])
+        self.assertEqual([d.id for d in main._users_with_cpf(self.db, "52998224725", thorough=False)], ["u7"])
+
+    def test_admin_ainda_ve_cpf_repetido_em_cadastro_antigo(self):
+        self.db.store["users"]["velho"] = {"cpf": "000.000.000-07"}
+        self.assertEqual(sorted(d.id for d in main._users_with_cpf(self.db, "00000000007")), ["u7", "velho"])
+
+    def test_horario_efetivo_le_so_os_pedidos_do_dia(self):
+        self.db.store["work_schedule_approval_requests"] = {
+            f"a{i}": {"user_id": "e1", "request_type": "overtime", "day_key": f"2026-09-{i % 28 + 1:02d}",
+                      "status": "approved"} for i in range(80)}
+        with mock.patch.object(main, "get_firestore_admin", return_value=self.db):
+            _rodar(main.get_effective_work_schedule_endpoint(None, {"id": "e1", "role": "intern"}))
+        self.assertLessEqual(self.leituras.lidos, 2)
 
 
 @needs_main

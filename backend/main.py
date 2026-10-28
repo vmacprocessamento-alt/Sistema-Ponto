@@ -1062,10 +1062,20 @@ def _find_schedule_requests(
     day_key: str,
     statuses: Optional[set] = None,
 ) -> List[Any]:
-    """Pedidos do usuario para o tipo/dia, do mais novo para o mais antigo."""
-    candidates = db.collection("work_schedule_approval_requests").where(
-        "user_id", "==", user_id
-    ).stream()
+    """Pedidos do usuario para o tipo/dia, do mais novo para o mais antigo.
+
+    Filtra tipo e dia no Firestore: so pelo usuario, lia todos os pedidos que
+    ele ja fez, duas vezes a cada 90 s com a tela do estagiario aberta, e a
+    conta so crescia. So igualdades: o Firestore resolve com os indices de
+    campo unico, sem indice composto.
+    """
+    candidates = (
+        db.collection("work_schedule_approval_requests")
+        .where("user_id", "==", user_id)
+        .where("request_type", "==", request_type)
+        .where("day_key", "==", day_key)
+        .stream()
+    )
     matches = []
     for item in candidates:
         data = item.to_dict() or {}
@@ -3683,14 +3693,58 @@ def _login_emails(email: Optional[str], digits: str) -> tuple:
         raise HTTPException(status_code=400, detail="Informe o e-mail ou um CPF valido.")
     return "", cpf_login_email(digits)
 
-def _users_with_cpf(db, digits: str) -> List[Any]:
+# Bancos (um so em producao) em que todo cadastro ja tem cpf_digits.
+_cpf_digits_backfilled: set = set()
+
+def _backfill_cpf_digits(db) -> None:
+    """Uma vez por processo: grava cpf_digits em quem nao tem ou tem velho.
+    Sem isso, um CPF repetido num cadastro antigo nao apareceria na busca
+    pelo campo e o login nao recusaria o CPF duplicado."""
+    for doc in db.collection("users").stream():
+        data = doc.to_dict() or {}
+        digits = cpf_digits(data.get("cpf"))
+        if digits and data.get("cpf_digits") != digits:
+            try:
+                doc.reference.update({"cpf_digits": digits})
+            except Exception as exc:
+                logger.warning("Nao deu para gravar cpf_digits de %s: %s", doc.id, exc)
+                return  # tenta de novo no proximo login
+    _cpf_digits_backfilled.add(id(db))
+
+def _users_with_cpf(db, digits: str, thorough: bool = True) -> List[Any]:
     """Cadastros com este CPF, em qualquer formato gravado (123.456.789-00,
-    o 123.456.789.00 do cadastro antigo ou so digitos). Le a colecao toda:
-    sao poucas pessoas, e o cadastro antigo nao tem cpf_digits."""
-    return [
-        doc for doc in db.collection("users").stream()
-        if cpf_digits((doc.to_dict() or {}).get("cpf")) == digits
-    ]
+    o 123.456.789.00 do cadastro antigo ou so digitos).
+
+    thorough=False (login): procura pelo campo cpf_digits, uma leitura so.
+    Ler a colecao toda a cada login custava uma leitura por pessoa
+    cadastrada. O cadastro antigo nao tem o campo: na primeira vez, todos
+    ganham (_backfill_cpf_digits). Vale o "cpf" de cada achado (o campo pode
+    estar velho) e, sem achado, le a colecao toda como antes.
+    thorough=True (cadastro/edicao pelo admin): sempre a colecao toda, para
+    nao deixar passar CPF repetido num cadastro sem cpf_digits.
+    """
+    if not thorough:
+        if id(db) not in _cpf_digits_backfilled:
+            _backfill_cpf_digits(db)
+        indexed = [
+            doc for doc in db.collection("users").where("cpf_digits", "==", digits).stream()
+            if cpf_digits((doc.to_dict() or {}).get("cpf")) == digits
+        ]
+        if indexed:
+            return indexed
+    matches = []
+    for doc in db.collection("users").stream():
+        data = doc.to_dict() or {}
+        if cpf_digits(data.get("cpf")) != digits:
+            continue
+        matches.append(doc)
+        if data.get("cpf_digits") != digits:
+            # Acerta o campo para o proximo login achar numa leitura so.
+            try:
+                doc.reference.update({"cpf_digits": digits})
+            except Exception as exc:
+                logger.warning("Nao deu para gravar cpf_digits de %s: %s", doc.id, exc)
+    return matches
 
 # Tentativas erradas de login por CPF: no maximo 10 em 15 min por CPF e 30
 # por IP. O /api/ nao passa pela palavra-chave da empresa. O limite do IP e
@@ -3780,7 +3834,7 @@ async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
         raise invalid
 
     db = get_firestore_admin()
-    matches = await asyncio.to_thread(_users_with_cpf, db, digits)
+    matches = await asyncio.to_thread(_users_with_cpf, db, digits, False)
     if len(matches) > 1:
         raise HTTPException(status_code=409, detail="Mais de um cadastro com este CPF. Procure o administrador.")
     if not matches:

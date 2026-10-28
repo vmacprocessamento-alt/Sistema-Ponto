@@ -1400,6 +1400,7 @@ class CpfAccessTest(unittest.TestCase):
         self.auth = _FakeAuth()
         self.passwords_ok = {}
         main._login_failures.clear()
+        main._cpf_digits_backfilled.clear()
 
         async def check_password(email, password):
             account = next(a for a in self.auth.accounts.values() if a["email"] == email)
@@ -1469,7 +1470,15 @@ class CpfAccessTest(unittest.TestCase):
         uid = self.create()["id"]
         self.auth.accounts[uid]["disabled"] = True
         self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 403)
-        self.db.store["users"]["outro"] = {"cpf": VALID_CPF}
+        # Todo caminho grava cpf_digits (backend e o plano B do app).
+        self.db.store["users"]["outro"] = {"cpf": VALID_CPF, "cpf_digits": main.cpf_digits(VALID_CPF)}
+        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 409)
+
+    def test_duplicate_in_old_record_without_cpf_digits(self):
+        # Cadastro antigo, de antes do cpf_digits, ja no banco quando o servidor sobe.
+        self.create()
+        self.db.store["users"]["antigo"] = {"cpf": VALID_CPF}
+        main._cpf_digits_backfilled.clear()
         self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 409)
 
     def test_too_many_failures_block_for_a_while(self):
