@@ -315,6 +315,94 @@ class ArquivoExportadoApagadoTest(unittest.TestCase):
 
 
 @needs_main
+class BatidaPeloBackendTest(unittest.TestCase):
+    """Quem nao e estagiario batia direto no Firestore com a hora do celular, e as regras aceitavam qualquer
+    horario (ponto retroativo). Agora a batida passa por /time-records/punch (28/10/2026)."""
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.user = {"id": "u1", "role": "employee", "name": "Fulano"}
+        for patcher in (mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+                        mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts"))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ids = iter(f"rec{i:05d}abc" for i in range(1000))
+
+    def _agora(self, **delta):
+        return datetime.now(FUSO) + timedelta(**delta)
+
+    def _ponto(self, tipo, quando, doc_id=None):
+        self.db.store.setdefault("time_records", {})[doc_id or next(self.ids)] = {
+            "user_id": "u1", "record_type": tipo, "timestamp": main._local_iso(quando)}
+
+    def _bater(self, tipo, quando=None, user=None, **extra):
+        payload = main.TimeRecordPunchRequest(record_type=tipo, client_record_id=extra.pop("cid", next(self.ids)),
+                                              timestamp=(quando or self._agora()).isoformat(), **extra)
+        return _rodar(main.time_record_punch_endpoint(payload, user or self.user))
+
+    def _status(self, *args, **kwargs):
+        with self.assertRaises(main.HTTPException) as erro:
+            self._bater(*args, **kwargs)
+        return erro.exception.status_code
+
+    def test_online_vale_a_hora_do_servidor(self):
+        r = self._bater("check_in", self._agora(minutes=-10))
+        gravada = datetime.fromisoformat(r["timestamp"]).replace(tzinfo=FUSO)
+        self.assertLess(abs((gravada - self._agora()).total_seconds()), 60)
+        self.assertIn("device_timestamp", r)
+
+    def test_ponto_retroativo_online_recusado(self):
+        self.assertEqual(self._status("check_in", self._agora(days=-5)), 400)
+        self.assertEqual(self.db.store.get("time_records", {}), {})
+
+    def test_offline_aceita_ate_7_dias(self):
+        r = self._bater("check_in", self._agora(days=-5), offline=True)
+        self.assertTrue(r["synced_from_offline"])
+        self.assertEqual(self._status("check_in", self._agora(days=-8), offline=True), 400)
+        self.assertEqual(self._status("check_out", self._agora(hours=2), offline=True), 400)  # futuro
+
+    def test_regras_de_turno(self):
+        self.assertEqual(self._status("check_out"), 409)
+        self._bater("check_in")
+        self.assertEqual(self._status("check_in"), 409)
+        self.assertEqual(self._bater("break_start")["record_type"], "break_start")
+        self.assertEqual(self._bater("check_out")["status"], "created")
+
+    def test_entrada_offline_fecha_turno_velho_esquecido(self):
+        self._ponto("check_in", self._agora(days=-3), "velha")
+        self._bater("check_in", self._agora(hours=-1), offline=True)
+        saida = self.db.store["time_records"]["forgot_velha"]
+        self.assertEqual(saida["record_type"], "check_out")
+
+    def test_saida_esquecida_calculada_no_servidor(self):
+        inicio = self._agora(days=-1)
+        self._ponto("check_in", inicio, "entradaX1")
+        r = self._bater("check_out", self._agora(), kind="forgotten_exit", ref_record_id="entradaX1")
+        self.assertEqual(r["id"], "forgot_entradaX1")
+        self.assertEqual(r["timestamp"], main._local_iso(inicio + timedelta(seconds=1)))
+        self.assertEqual(self._bater("check_out", kind="forgotten_exit", cid="outroid123", ref_record_id="entradaX1")["id"], "forgot_entradaX1")
+
+    def test_fechamento_automatico_da_pausa(self):
+        self._ponto("check_in", self._agora(hours=-6))
+        self._ponto("break_start", self._agora(hours=-1), "pausaRecente")
+        self.assertEqual(self._status("break_end", kind="auto_break_close", ref_record_id="pausaRecente"), 409)
+        inicio = self._agora(hours=-4)
+        self.db.store["time_records"]["pausaRecente"]["timestamp"] = main._local_iso(inicio)
+        r = self._bater("break_end", kind="auto_break_close", ref_record_id="pausaRecente")
+        self.assertEqual(r["id"], "autoclose_pausaRecente")
+        self.assertEqual(r["timestamp"], main._local_iso(inicio + timedelta(hours=1)))
+        self.assertTrue(r["auto_closed"])
+
+    def test_reenvio_devolve_o_mesmo_ponto(self):
+        primeiro = self._bater("check_in", cid="mesmoid123")
+        self.assertEqual(self._bater("check_in", cid="mesmoid123")["id"], primeiro["id"])
+        self.assertEqual(len(self.db.store["time_records"]), 1)
+
+    def test_estagiario_entra_pelo_horario_controlado(self):
+        self.assertEqual(self._status("check_in", user={"id": "e1", "role": "intern"}), 400)
+
+
+@needs_main
 class ExcluirUsuarioTest(unittest.TestCase):
     def setUp(self):
         self.db = _FakeDb()

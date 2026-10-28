@@ -236,10 +236,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         timestamp: closedAt.toIso8601String(),
         notes: "Retorno automatico (pausa excedeu 3h; ajustado para 1h)",
         location: "Sistema (Auto)",
-        // Mesmo id do job do backend que fecha pausas esquecidas: o job, este
-        // aparelho e qualquer outro gravam o MESMO retorno, nunca dois.
-        recordId: breakStartId.isEmpty ? null : 'autoclose_$breakStartId',
-        extraFields: const {'auto_closed': true},
+        // O backend confere a pausa e grava com o mesmo id do job que fecha
+        // pausas esquecidas: o job, este aparelho e qualquer outro gravam o
+        // MESMO retorno, nunca dois.
+        punchKind: breakStartId.isEmpty ? null : 'auto_break_close',
+        refRecordId: breakStartId.isEmpty ? null : breakStartId,
       );
       _autoClosedBreakKey = _breakKey(breakStart);
       // Recarrega logo depois de gravar: enquanto a lista mostrar a pausa
@@ -821,7 +822,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     if (!mounted) return;
 
-    String? recordId;
+    // "Esqueci de bater a saida": o backend fecha o turno sem horas.
+    var forgottenExit = false;
+    String? forgottenShiftId;
     if (type == 'check_out' && _carriedOpenShiftStart != null) {
       final shiftStart = _carriedOpenShiftStart!;
       final checkInId = _carriedOpenShiftId ?? '';
@@ -838,9 +841,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         timestamp = shiftStart.add(const Duration(seconds: 1));
         notes = 'Saida esquecida: o gestor precisa lancar o horario real';
         location = 'App (saida esquecida)';
-        // Id fixo pela entrada: "Esqueci" em dois aparelhos, ou a fila
-        // offline fechando o mesmo turno, gravam a mesma saida, nao duas.
-        if (checkInId.isNotEmpty) recordId = 'forgot_$checkInId';
+        // O backend calcula a hora (1s depois da entrada) e grava com id fixo
+        // pela entrada: "Esqueci" em dois aparelhos, ou a fila offline
+        // fechando o mesmo turno, gravam a mesma saida, nao duas. Vale tambem
+        // para o estagiario: pelo horario controlado, a saida de um turno de
+        // ontem seria recusada como "muito distante do relogio".
+        forgottenExit = true;
+        if (checkInId.isNotEmpty) forgottenShiftId = checkInId;
       }
     }
 
@@ -881,7 +888,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // 2. Estagiarios usam validacao autoritativa do backend na entrada/saida.
       final attemptedAt = timestamp ?? tappedAt;
       Map<String, dynamic> result;
-      if (_isInternUser && (type == 'check_in' || type == 'check_out')) {
+      if (_isInternUser &&
+          !forgottenExit &&
+          (type == 'check_in' || type == 'check_out')) {
         // Id gerado ANTES do envio: se a rede cair depois de o backend gravar
         // (resposta perdida), a fila reenvia com o mesmo id e o backend
         // devolve o ponto que ja existe em vez de duplicar ou recusar.
@@ -959,7 +968,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           location: location,
           latitude: position?.latitude,
           longitude: position?.longitude,
-          recordId: recordId,
+          punchKind: forgottenExit ? 'forgotten_exit' : null,
+          refRecordId: forgottenShiftId,
         );
       }
 

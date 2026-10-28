@@ -7,6 +7,8 @@ import 'package:intl/intl.dart';
 import 'package:timezone/data/latest_all.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
 
+import '../firebase_options.dart';
+
 class NotificationService {
   NotificationService._();
 
@@ -167,7 +169,12 @@ class NotificationService {
     }
   }
 
-  static Future<void> registerCurrentDevice() => _configurePushNotifications();
+  static Future<void> registerCurrentDevice() async {
+    // Build de teste no emulador: o FCM nao tem emulador e o pedido de token
+    // iria ao Google com a configuracao falsa do projeto demo.
+    if (DefaultFirebaseOptions.useEmulator) return;
+    await _configurePushNotifications();
+  }
 
   static Future<void> showBreakAutoClosed({
     required DateTime closedAt,
