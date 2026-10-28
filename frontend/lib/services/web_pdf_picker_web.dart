@@ -1,9 +1,10 @@
 import 'dart:async';
-import 'dart:html' as html;
+import 'dart:js_interop';
 import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/widgets.dart';
+import 'package:web/web.dart' as web;
 
 class SelectedPdfFile {
   const SelectedPdfFile({required this.name, required this.bytes});
@@ -12,40 +13,33 @@ class SelectedPdfFile {
   final Uint8List bytes;
 }
 
+web.HTMLInputElement _pdfInput() => web.HTMLInputElement()
+  ..type = 'file'
+  ..accept = '.pdf,application/pdf'
+  ..multiple = false;
+
+Future<SelectedPdfFile> _read(web.File file) async {
+  final buffer = await file.arrayBuffer().toDart;
+  return SelectedPdfFile(name: file.name, bytes: buffer.toDart.asUint8List());
+}
+
 Future<SelectedPdfFile?> pickPdfFromBrowser() {
-  final input = html.FileUploadInputElement()
-    ..accept = '.pdf,application/pdf'
-    ..multiple = false
-    ..style.display = 'none';
-  html.document.body?.append(input);
+  final input = _pdfInput()..style.display = 'none';
+  web.document.body?.append(input);
 
   final completer = Completer<SelectedPdfFile?>();
-  input.onChange.first.then((_) {
-    final file = input.files?.isNotEmpty == true ? input.files!.first : null;
+  input.onChange.first.then((_) async {
+    final file = input.files?.item(0);
+    input.remove();
     if (file == null) {
-      input.remove();
       completer.complete(null);
       return;
     }
-
-    final reader = html.FileReader();
-    reader.onError.first.then((_) {
-      input.remove();
+    try {
+      completer.complete(await _read(file));
+    } catch (_) {
       completer.completeError(StateError('Nao foi possivel ler o PDF.'));
-    });
-    reader.onLoadEnd.first.then((_) {
-      input.remove();
-      final result = reader.result;
-      if (result is ByteBuffer) {
-        completer.complete(SelectedPdfFile(
-          name: file.name,
-          bytes: Uint8List.view(result),
-        ));
-      } else {
-        completer.completeError(StateError('Nao foi possivel ler o PDF.'));
-      }
-    });
-    reader.readAsArrayBuffer(file);
+    }
   });
 
   input.click();
@@ -70,50 +64,25 @@ class _WebPdfInputState extends State<WebPdfInput> {
     super.initState();
     _viewType = 'ponto-pdf-input-${identityHashCode(this)}';
     ui_web.platformViewRegistry.registerViewFactory(_viewType, (_) {
-      final input = html.FileUploadInputElement()
-        ..accept = '.pdf,application/pdf'
-        ..multiple = false
-        ..style.width = '100%'
-        ..style.height = '42px'
-        ..style.padding = '8px 12px'
-        ..style.boxSizing = 'border-box'
-        ..style.border = '1px solid #a80000'
-        ..style.borderRadius = '22px'
-        ..style.color = '#a80000'
-        ..style.backgroundColor = 'transparent';
+      final input = _pdfInput();
+      input.style
+        ..width = '100%'
+        ..height = '42px'
+        ..padding = '8px 12px'
+        ..boxSizing = 'border-box'
+        ..border = '1px solid #a80000'
+        ..borderRadius = '22px'
+        ..color = '#a80000'
+        ..backgroundColor = 'transparent';
 
-      input.onChange.listen((_) {
-        final file = input.files?.isNotEmpty == true ? input.files!.first : null;
+      input.onChange.listen((_) async {
+        final file = input.files?.item(0);
         if (file == null) return;
-
-        final reader = html.FileReader();
-        reader.onError.first.then((_) {
+        try {
+          widget.onSelected(await _read(file));
+        } catch (_) {
           widget.onError(StateError('Nao foi possivel ler o PDF.'));
-        });
-        reader.onLoadEnd.first.then((_) {
-          final result = reader.result;
-          Uint8List? bytes;
-          if (result is ByteBuffer) {
-            bytes = Uint8List.view(result);
-          } else if (result is Uint8List) {
-            bytes = result;
-          } else if (result is ByteData) {
-            bytes = Uint8List.view(result.buffer, result.offsetInBytes,
-                result.lengthInBytes);
-          } else if (result is List<int>) {
-            bytes = Uint8List.fromList(result);
-          }
-
-          if (bytes != null) {
-            widget.onSelected(SelectedPdfFile(
-              name: file.name,
-              bytes: bytes,
-            ));
-          } else {
-            widget.onError(StateError('Nao foi possivel ler o PDF.'));
-          }
-        });
-        reader.readAsArrayBuffer(file);
+        }
       });
       return input;
     });

@@ -103,6 +103,13 @@ class ApiService {
     return {'Authorization': 'Bearer $token'};
   }
 
+  /// O backend falhou (404/5xx) e a operacao segue pelo plano B direto no
+  /// Firestore. Fica registrado: foi um plano B silencioso que escondeu por
+  /// meses o erro 500 em toda batida de estagiario.
+  void _logPlanB(http.Response response) => debugPrint(
+      'Plano B pelo Firestore: ${response.request?.method} '
+      '${response.request?.url.path} respondeu ${response.statusCode}');
+
   String _apiError(http.Response response) {
     try {
       final decoded = jsonDecode(utf8.decode(response.bodyBytes));
@@ -2159,6 +2166,7 @@ class ApiService {
         .timeout(const Duration(seconds: 45));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _updateUserAdminInFirestore(
           userId.toString(),
           name: name,
@@ -2192,6 +2200,7 @@ class ApiService {
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         final user = _auth.currentUser;
         if (user == null) return [];
         // So as nao lidas: e o unico que o sininho exibe, e a colecao so cresce.
@@ -2224,6 +2233,7 @@ class ApiService {
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         final user = _auth.currentUser;
         if (user == null) return;
         // Le so o que precisa mudar, em vez da caixa inteira do usuario.
@@ -2373,6 +2383,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         // A tela guarda na fila (isNetworkFailure) e a sincronizacao reenvia
         // pelo backend, com as regras de horario.
         throw ServerUnavailableException(_apiError(response));
@@ -2450,6 +2461,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _createScheduleApprovalRequestInFirestore(
           requestType: requestType,
           attemptedAt: attemptedAt,
@@ -2475,6 +2487,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _getScheduleApprovalRequestsFromFirestore(status: status);
       }
       throw Exception(_apiError(response));
@@ -2504,6 +2517,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         await _decideScheduleApprovalInFirestore(
           requestId,
           approve: approve,
@@ -2524,6 +2538,7 @@ class ApiService {
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _getGlobalWorkScheduleFromFirestore();
       }
       throw Exception(_apiError(response));
@@ -2546,6 +2561,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         await _db
             .collection('work_schedule_settings')
             .doc('intern_default')
