@@ -9,6 +9,7 @@ import '../utils/daily_entries.dart';
 import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
 import 'user_chat_list_screen.dart';
+import '../widgets/content_width.dart';
 
 /// Tela de ponto de quem esta no modo diaria (users.daily_mode): no lugar de
 /// entrada, pausas e saida, um botao que marca a diaria do dia (uma por dia)
@@ -246,7 +247,7 @@ class _DailyModeScreenState extends State<DailyModeScreen>
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(
-                  builder: (context) => const UserChatListScreen()),
+                  builder: (context) => const ContentWidth(child: UserChatListScreen())),
             ),
           ),
           const SizedBox(width: 8),

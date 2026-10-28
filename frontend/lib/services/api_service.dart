@@ -12,6 +12,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_config.dart';
+import '../utils/work_schedule_rules.dart' show isInternProfile;
 import '../utils/chat_timestamp.dart';
 import '../utils/cpf.dart';
 import '../utils/daily_entries.dart';
@@ -771,12 +772,35 @@ class ApiService {
     await _auth.signOut();
   }
 
-  Future<void> resetPassword(String email) async {
+  /// Link de nova senha por CPF ou e-mail. Vai pelo backend: o
+  /// sendPasswordResetEmail do Firebase dava "enviado" mesmo sem conta com o
+  /// e-mail (conta por CPF usa e-mail interno) e o remetente caia no spam.
+  /// Devolve a mensagem para mostrar.
+  Future<String> resetPassword(String loginId) async {
+    final value = loginId.trim();
+    final http.Response response;
     try {
-      await _auth.sendPasswordResetEmail(email: email);
-    } on FirebaseAuthException catch (e) {
-      throw Exception('Erro ao enviar e-mail de recuperação: ${e.message}');
+      response = await http
+          .post(
+            Uri.parse('$backendUrl/auth/password-reset'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(
+                {'login': value.contains('@') ? value : cpfDigits(value)}),
+          )
+          .timeout(const Duration(seconds: 25));
+    } catch (e) {
+      if (isNetworkFailure(e)) {
+        throw Exception('Sem conexão com o servidor. Confira a internet e '
+            'tente de novo.');
+      }
+      rethrow;
     }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    return (jsonDecode(utf8.decode(response.bodyBytes)) as Map)['message']
+            ?.toString() ??
+        'Link enviado. Confira sua caixa de entrada e o spam.';
   }
 
   Future<List<Map<String, dynamic>>> getOfflineRecords() async {
@@ -1033,8 +1057,8 @@ class ApiService {
     final profile = cachedUser?['id']?.toString() == userId
         ? cachedUser!
         : await getCurrentUser();
-    final role = (profile['role'] ?? '').toString().toLowerCase();
-    final isIntern = role.contains('intern') || role.contains('estag');
+    // Mesma regra do backend: papel ou cargo "Estagiario".
+    final isIntern = isInternProfile(profile);
 
     int syncedCount = 0;
     final syncedKeys = <String>{};
@@ -1676,7 +1700,11 @@ class ApiService {
       ..removeWhere((day, _) =>
           day.compareTo(firstDay) < 0 || day.compareTo(lastDay) > 0);
 
-    final role = user['role']?.toString() ?? 'employee';
+    // Folha do estagiario pela mesma regra do backend (papel ou cargo):
+    // so ele tem as horas fora da janela 13:30-19:30 como extras.
+    final role = isInternProfile(user)
+        ? 'intern'
+        : user['role']?.toString() ?? 'employee';
     return _timesheetResult(user, [
       for (final MapEntry(key: date, value: dayRecords) in grouped.entries)
         computeWorkDay(date, dayRecords, role),
@@ -1958,7 +1986,11 @@ class ApiService {
         ? await getMyDailyEntries(start: start, end: end)
         : await getDailyEntries(start: start, end: end, userId: userId);
     final name = user['name']?.toString() ?? '';
-    final role = user['role']?.toString() ?? 'employee';
+    // Folha do estagiario pela mesma regra do backend (papel ou cargo):
+    // so ele tem as horas fora da janela 13:30-19:30 como extras.
+    final role = isInternProfile(user)
+        ? 'intern'
+        : user['role']?.toString() ?? 'employee';
     return [
       for (final entry in entries)
         {

@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 
 import '../utils/chat_timestamp.dart';
 import 'admin_chat_detail_screen.dart';
+import '../widgets/content_width.dart';
 
 class AdminUserConversationsScreen extends StatefulWidget {
   final String userId;
@@ -313,13 +314,13 @@ class _AdminUserConversationsScreenState
                         await Navigator.push(
                           context,
                           MaterialPageRoute(
-                            builder: (_) => AdminChatDetailScreen(
+                            builder: (_) => ContentWidth(child: AdminChatDetailScreen(
                               conversationId: conversation['conversation_id'],
                               userId: widget.userId,
                               userName: widget.userName,
                               requests: List<Map<String, dynamic>>.from(
                                   conversation['requests']),
-                            ),
+                            )),
                           ),
                         );
                         _reload();

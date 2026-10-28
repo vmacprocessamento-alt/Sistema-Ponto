@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../screens/chat_screen.dart';
 import '../services/api_service.dart';
+import 'content_width.dart';
 import '../utils/screen_watch.dart';
 
 class UserNotificationBell extends StatefulWidget {
@@ -131,11 +132,11 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
                       if (!mounted || !context.mounted) return;
                       Navigator.pop(context);
                       Navigator.of(this.context).push(MaterialPageRoute(
-                        builder: (_) => ChatScreen(
+                        builder: (_) => ContentWidth(child: ChatScreen(
                           conversationId:
                               message['conversation_id']?.toString() ?? '',
                           title: 'Ajuste de ponto',
-                        ),
+                        )),
                       ));
                     },
                   )),

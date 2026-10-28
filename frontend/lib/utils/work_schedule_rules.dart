@@ -9,6 +9,17 @@ DateTime scheduleTime(DateTime day, dynamic value) {
   );
 }
 
+/// Estagiario pelo cadastro: papel intern/estag ou cargo com "estag". Mesma
+/// regra do backend (_is_intern_profile) e do firestore.rules (isIntern):
+/// se o app discordar, a batida vai pelo caminho errado e as regras recusam.
+bool isInternProfile(Map<String, dynamic>? user) {
+  final role = '${user?['role'] ?? ''}'.toLowerCase();
+  final jobTitle = '${user?['job_title'] ?? ''}'.toLowerCase();
+  return role.contains('intern') ||
+      role.contains('estag') ||
+      jobTitle.contains('estag');
+}
+
 bool isInternWorkday(DateTime attempted) {
   return attempted.weekday >= DateTime.monday &&
       attempted.weekday <= DateTime.friday;

@@ -4157,6 +4157,94 @@ async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
     _login_failures.pop(f"cpf:{digits}", None)
     return {"email": email}
 
+class PasswordResetRequest(BaseModel):
+    login: str
+
+# Mesma resposta com ou sem cadastro, para nao revelar quem tem conta.
+_PASSWORD_RESET_REPLY = {
+    "status": "ok",
+    "message": "Se houver um e-mail no seu cadastro, o link foi enviado para ele. "
+               "Confira tambem a caixa de spam.",
+}
+
+def _password_reset_target(login: str):
+    """(conta no Firebase Auth, e-mail que recebe o link, nome) ou None.
+    O destino e o e-mail real do cadastro: conta sem e-mail usa o interno do
+    CPF, que ninguem recebe."""
+    db = get_firestore_admin()
+    account = None
+    if "@" in login:
+        try:
+            account = firebase_auth.get_user_by_email(login)
+        except firebase_auth.UserNotFoundError:
+            matches = list(db.collection("users").where("email", "==", login).limit(2).stream())
+            if len(matches) == 1:
+                account = firebase_auth.get_user(matches[0].id)
+    else:
+        matches = _users_with_cpf(db, cpf_digits(login))
+        if len(matches) == 1:
+            try:
+                account = firebase_auth.get_user(matches[0].id)
+            except firebase_auth.UserNotFoundError:
+                account = None
+    if account is None or account.disabled or not account.email:
+        return None
+    profile = db.collection("users").document(account.uid).get().to_dict() or {}
+    destination = (profile.get("email") or "").strip().lower()
+    if not destination and not account.email.endswith("@" + CPF_LOGIN_EMAIL_DOMAIN):
+        destination = account.email.lower()
+    if not destination:
+        return None
+    return account, destination, profile.get("name") or account.display_name or ""
+
+@app.post("/auth/password-reset")
+async def password_reset_endpoint(payload: PasswordResetRequest):
+    """Link para criar nova senha, por CPF ou e-mail. O sendPasswordResetEmail
+    do app falhava calado: conta sem e-mail usa o interno do CPF (ninguem
+    recebe) e o remetente noreply@firebaseapp.com cai no spam. Aqui o link sai
+    do Admin SDK e vai pelo Gmail do RH para o e-mail real do cadastro."""
+    login = (payload.login or "").strip().lower()
+    # So pelo login: o IP atras do tunel nao separa as pessoas (ver #3).
+    keys = [f"reset:{login}"]
+    now = _local_now()
+    if _login_blocked(keys, now):
+        raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde 15 minutos e tente de novo.")
+    _register_login_failure(keys, now)
+    if not MAIL_PASSWORD or MAIL_PASSWORD == "mude-me":
+        raise HTTPException(status_code=503, detail="Envio de e-mail nao configurado. Fale com o administrador.")
+    if not login:
+        return _PASSWORD_RESET_REPLY
+
+    # Firestore e Auth do Admin SDK sao bloqueantes: fora do event loop.
+    target = await asyncio.to_thread(_password_reset_target, login)
+    if target is None:
+        return _PASSWORD_RESET_REPLY
+    account, destination, name = target
+
+    try:
+        link = await asyncio.to_thread(firebase_auth.generate_password_reset_link, account.email)
+        await FastMail(conf).send_message(MessageSchema(
+            subject="Ponto VMac - criar nova senha",
+            recipients=[destination],
+            body=(
+                f"<p>Ola {html.escape(name)},</p>"
+                "<p>Recebemos um pedido para criar uma nova senha no Ponto VMac.</p>"
+                f'<p><a href="{html.escape(link)}">Clique aqui para criar a nova senha</a></p>'
+                "<p>Se nao foi voce, ignore este e-mail: a sua senha continua a mesma.</p>"
+            ),
+            subtype=MessageType.html,
+        ))
+    except Exception as exc:
+        print(f"[password-reset] falha ao enviar para {account.uid}: {exc}")
+        raise HTTPException(status_code=502, detail="Nao foi possivel enviar o e-mail agora. Tente mais tarde.") from exc
+
+    await asyncio.to_thread(lambda: get_firestore_admin().collection("system_audits").document().set({
+        "action": "password_reset_email",
+        "target_user_id": account.uid,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }))
+    return _PASSWORD_RESET_REPLY
+
 class AdminUserCreateRequest(BaseModel):
     name: str
     cpf: str
