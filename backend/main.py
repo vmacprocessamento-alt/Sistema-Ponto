@@ -3643,10 +3643,13 @@ def _users_with_cpf(db, digits: str) -> List[Any]:
         if cpf_digits((doc.to_dict() or {}).get("cpf")) == digits
     ]
 
-# Tentativas erradas de login por CPF: no maximo 10 em 15 min por aparelho
-# (IP) e por CPF. O /api/ nao passa pela palavra-chave da empresa.
+# Tentativas erradas de login por CPF: no maximo 10 em 15 min por CPF e 30
+# por IP. O /api/ nao passa pela palavra-chave da empresa. O limite do IP e
+# maior porque o Wi-Fi do escritorio sai por um IP so: com 10, um colega
+# errando a senha travava o login da equipe toda.
 _LOGIN_FAILURE_WINDOW = timedelta(minutes=15)
 _LOGIN_MAX_FAILURES = 10
+_LOGIN_MAX_FAILURES_PER_IP = 30
 _login_failures: Dict[str, List[datetime]] = {}
 
 def _recent_login_failures(key: str, now: datetime) -> List[datetime]:
@@ -3658,7 +3661,23 @@ def _recent_login_failures(key: str, now: datetime) -> List[datetime]:
     return recent
 
 def _login_blocked(keys: List[str], now: datetime) -> bool:
-    return any(len(_recent_login_failures(key, now)) >= _LOGIN_MAX_FAILURES for key in keys)
+    return any(
+        len(_recent_login_failures(key, now))
+        >= (_LOGIN_MAX_FAILURES_PER_IP if key.startswith("ip:") else _LOGIN_MAX_FAILURES)
+        for key in keys
+    )
+
+def _client_ip(request: Request) -> str:
+    """IP de quem fez o pedido. Atras do tunel da Cloudflare o nginx so ve o
+    cloudflared (127.0.0.1/gateway do Docker): o X-Real-IP era o mesmo para
+    todo mundo e 10 senhas erradas de uma pessoa travavam o login de todos.
+    O CF-Connecting-IP e o IP real; o backend so escuta no 127.0.0.1 do VPS,
+    entao o cabecalho chega da Cloudflare, nao do aparelho."""
+    return (
+        request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-real-ip")
+        or (request.client.host if request.client else "")
+    )
 
 def _register_login_failure(keys: List[str], now: datetime) -> None:
     for key in keys:
@@ -3702,7 +3721,7 @@ async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
     """Login por CPF: com a senha certa, devolve o e-mail da conta para o app
     entrar no Firebase. CPF desconhecido e senha errada dao a mesma resposta."""
     digits = cpf_digits(payload.cpf)
-    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "")
+    client_ip = _client_ip(request)
     keys = [f"ip:{client_ip}", f"cpf:{digits}"]
     now = _local_now()
     if _login_blocked(keys, now):

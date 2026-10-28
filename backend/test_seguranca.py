@@ -83,6 +83,53 @@ class RespostaViraJsonTest(unittest.TestCase):
 
 
 @needs_main
+class BloqueioDeLoginTest(unittest.TestCase):
+    """Atras do tunel da Cloudflare todo pedido chega com o mesmo X-Real-IP: a senha errada de uma pessoa nao
+    pode travar o login das outras (28/10/2026)."""
+    TUNEL = "172.18.0.1"
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.db.store["users"] = {"ana": {"cpf": "529.982.247-25"}, "bruno": {"cpf": "111.444.777-35"}}
+        auth = types.SimpleNamespace(get_user=lambda uid: types.SimpleNamespace(email=f"{uid}@x"),
+                                     UserNotFoundError=type("NF", (Exception,), {}))
+
+        async def senha(email, password):
+            return "ok" if password == "certa" else "invalid"
+
+        main._login_failures.clear()
+        for patcher in (mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+                        mock.patch.object(main, "firebase_auth", auth),
+                        mock.patch.object(main, "_check_firebase_password", senha)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(main._login_failures.clear)
+
+    def _login(self, cpf, senha, ip_real):
+        pedido = types.SimpleNamespace(headers={"x-real-ip": self.TUNEL, "cf-connecting-ip": ip_real}, client=None)
+        return _rodar(main.cpf_login_endpoint(main.CpfLoginRequest(cpf=cpf, password=senha), pedido))
+
+    def _errar(self, vezes, ip_real):
+        for _ in range(vezes):
+            with self.assertRaises(main.HTTPException):
+                self._login("52998224725", "errada", ip_real)
+
+    def test_senha_errada_de_uma_pessoa_nao_trava_outra_em_outro_aparelho(self):
+        self._errar(10, "200.1.1.1")
+        self.assertEqual(self._login("11144477735", "certa", "200.2.2.2"), {"email": "bruno@x"})
+
+    def test_mesmo_wifi_do_escritorio(self):
+        self._errar(10, "200.1.1.1")
+        self.assertEqual(self._login("11144477735", "certa", "200.1.1.1"), {"email": "bruno@x"})
+
+    def test_cpf_continua_travando_apos_10_erros(self):
+        self._errar(10, "200.1.1.1")
+        with self.assertRaises(main.HTTPException) as erro:
+            self._login("52998224725", "certa", "200.9.9.9")
+        self.assertEqual(erro.exception.status_code, 429)
+
+
+@needs_main
 class ExcluirUsuarioTest(unittest.TestCase):
     def setUp(self):
         self.db = _FakeDb()
