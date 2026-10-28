@@ -9,6 +9,7 @@ import 'profile_screen.dart';
 import '../services/api_service.dart';
 import '../services/app_permission_service.dart';
 import '../services/notification_service.dart';
+import '../widgets/content_width.dart';
 import '../widgets/startup_loading.dart';
 
 class MainScreen extends StatefulWidget {
@@ -83,6 +84,27 @@ class _MainScreenState extends State<MainScreen> {
         const ProfileScreen(),
       ];
 
+  /// Abas do menu: as mesmas no celular (barra de baixo) e no computador
+  /// (menu na lateral).
+  List<(IconData, String)> get _tabs => [
+    (Icons.timer, 'Ponto'),
+    (Icons.dashboard, 'Dash'),
+    (Icons.history, 'Histórico'),
+    if (_isAdmin) (Icons.admin_panel_settings, 'Gestão'),
+    (Icons.person, 'Perfil'),
+  ];
+
+  /// Troca de aba pelo menu de baixo (celular) ou da lateral (computador).
+  void _selectTab(int index) => setState(() => _selectedIndex = index);
+
+  /// A partir desta largura (tablet deitado, computador) o menu vai para a
+  /// lateral e a tela ganha espaco na vertical.
+  static const double _sideMenuFrom = 900;
+
+  /// Mantem as abas abertas (e o que ja carregaram) quando a janela passa
+  /// de um layout para o outro.
+  final _tabsKey = GlobalKey();
+
   @override
   Widget build(BuildContext context) {
     if (!_profileReady) {
@@ -98,31 +120,76 @@ class _MainScreenState extends State<MainScreen> {
         }),
       );
     }
-    return Scaffold(
-      body: IndexedStack(
-        index: _selectedIndex,
-        children: _screens,
-      ),
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _selectedIndex,
-        onTap: (index) => setState(() => _selectedIndex = index),
-        type: BottomNavigationBarType.fixed,
-        selectedItemColor: Theme.of(context).primaryColor,
-        unselectedItemColor: Colors.grey,
-        items: [
-          const BottomNavigationBarItem(
-              icon: Icon(Icons.timer), label: 'Ponto'),
-          const BottomNavigationBarItem(
-              icon: Icon(Icons.dashboard), label: 'Dash'),
-          const BottomNavigationBarItem(
-              icon: Icon(Icons.history), label: 'Histórico'),
-          if (_isAdmin)
-            const BottomNavigationBarItem(
-                icon: Icon(Icons.admin_panel_settings), label: 'Gestão'),
-          const BottomNavigationBarItem(
-              icon: Icon(Icons.person), label: 'Perfil'),
-        ],
-      ),
+    final body = KeyedSubtree(
+      key: _tabsKey,
+      child: IndexedStack(index: _selectedIndex, children: [
+        // No computador cada aba fica numa coluna no centro; a Gestao, com
+        // listas e tabelas, mais larga.
+        for (final (i, screen) in _screens.indexed)
+          ContentWidth(
+            maxWidth: _isAdmin && i == 3 ? ContentWidth.wide : ContentWidth.narrow,
+            child: screen,
+          ),
+      ]),
+    );
+    final primary = Theme.of(context).primaryColor;
+
+    return LayoutBuilder(
+      builder: (context, box) {
+        if (box.maxWidth >= _sideMenuFrom) {
+          return Scaffold(
+            body: Row(
+              children: [
+                SafeArea(
+                  right: false,
+                  child: NavigationRail(
+                    selectedIndex: _selectedIndex,
+                    onDestinationSelected: _selectTab,
+                    extended: box.maxWidth >= 1200,
+                    labelType: box.maxWidth >= 1200
+                        ? NavigationRailLabelType.none
+                        : NavigationRailLabelType.all,
+                    selectedIconTheme: IconThemeData(color: primary),
+                    selectedLabelTextStyle: TextStyle(
+                      color: primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                    unselectedIconTheme: const IconThemeData(
+                      color: Colors.grey,
+                    ),
+                    unselectedLabelTextStyle: const TextStyle(
+                      color: Colors.grey,
+                    ),
+                    destinations: [
+                      for (final (icon, label) in _tabs)
+                        NavigationRailDestination(
+                          icon: Icon(icon),
+                          label: Text(label),
+                        ),
+                    ],
+                  ),
+                ),
+                const VerticalDivider(width: 1, thickness: 1),
+                Expanded(child: body),
+              ],
+            ),
+          );
+        }
+        return Scaffold(
+          body: body,
+          bottomNavigationBar: BottomNavigationBar(
+            currentIndex: _selectedIndex,
+            onTap: _selectTab,
+            type: BottomNavigationBarType.fixed,
+            selectedItemColor: primary,
+            unselectedItemColor: Colors.grey,
+            items: [
+              for (final (icon, label) in _tabs)
+                BottomNavigationBarItem(icon: Icon(icon), label: label),
+            ],
+          ),
+        );
+      },
     );
   }
 }

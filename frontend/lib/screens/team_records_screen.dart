@@ -3,6 +3,7 @@ import '../services/api_service.dart';
 import 'package:intl/intl.dart';
 import '../widgets/export_dialog.dart';
 import 'daily_entries_admin_screen.dart';
+import '../widgets/content_width.dart';
 
 class TeamRecordsScreen extends StatefulWidget {
   final bool canEdit;
@@ -451,8 +452,8 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
             onPressed: () => Navigator.push(
               context,
               MaterialPageRoute(
-                builder: (_) => DailyEntriesAdminScreen(
-                    user: user, canEdit: widget.canEdit),
+                builder: (_) => ContentWidth(maxWidth: ContentWidth.wide, child: DailyEntriesAdminScreen(
+                    user: user, canEdit: widget.canEdit)),
               ),
             ),
             child: const Text('VER DIÁRIAS',

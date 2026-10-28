@@ -7,6 +7,7 @@ import '../widgets/export_dialog.dart';
 import 'admin_chat_list_screen.dart';
 import 'change_password_screen.dart';
 import 'login_screen.dart';
+import '../widgets/content_width.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -232,7 +233,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         onTap: () => Navigator.push(
                             context,
                             MaterialPageRoute(
-                                builder: (_) => const AdminChatListScreen())),
+                                builder: (_) => const ContentWidth(child: AdminChatListScreen()))),
                         textColor: textColor,
                         cardColor: cardColor,
                         iconColor: unreadCount > 0 ? Colors.orange : wineColor,

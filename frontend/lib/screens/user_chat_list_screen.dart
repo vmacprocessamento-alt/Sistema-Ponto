@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 
 import '../utils/chat_timestamp.dart';
 import 'chat_screen.dart';
+import '../widgets/content_width.dart';
 
 class UserChatListScreen extends StatefulWidget {
   const UserChatListScreen({super.key});
@@ -30,7 +31,7 @@ class _UserChatListScreenState extends State<UserChatListScreen> {
       context,
       MaterialPageRoute(
         builder: (_) =>
-            ChatScreen(conversationId: docRef.id, title: 'Nova conversa'),
+            ContentWidth(child: ChatScreen(conversationId: docRef.id, title: 'Nova conversa')),
       ),
     );
   }
@@ -317,9 +318,9 @@ class _UserChatListScreenState extends State<UserChatListScreen> {
                                 Navigator.push(
                                   context,
                                   MaterialPageRoute(
-                                    builder: (_) => ChatScreen(
+                                    builder: (_) => ContentWidth(child: ChatScreen(
                                         conversationId: conv['id'],
-                                        title: title),
+                                        title: title)),
                                   ),
                                 );
                               },

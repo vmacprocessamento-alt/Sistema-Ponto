@@ -12,6 +12,7 @@ import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import 'daily_entries_admin_screen.dart';
 import 'team_records_screen.dart';
+import '../widgets/content_width.dart';
 
 class AdminScreen extends StatefulWidget {
   const AdminScreen({super.key});
@@ -147,10 +148,10 @@ class _UsersListTabState extends State<_UsersListTab> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => DailyEntriesAdminScreen(
+        builder: (_) => ContentWidth(maxWidth: ContentWidth.wide, child: DailyEntriesAdminScreen(
           user: Map<String, dynamic>.from(user as Map),
           canEdit: _isAdmin,
-        ),
+        )),
       ),
     );
   }

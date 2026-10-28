@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 
 import '../services/api_service.dart';
 import 'admin_user_conversations_screen.dart';
+import '../widgets/content_width.dart';
 
 class AdminChatListScreen extends StatefulWidget {
   const AdminChatListScreen({super.key});
@@ -209,12 +210,12 @@ class _AdminChatListScreenState extends State<AdminChatListScreen> {
                 await Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (_) => AdminUserConversationsScreen(
+                    builder: (_) => ContentWidth(child: AdminUserConversationsScreen(
                       userId: user['user_id'],
                       userName: userName,
                       requests:
                           List<Map<String, dynamic>>.from(user['requests']),
-                    ),
+                    )),
                   ),
                 );
                 _loadUsers();
