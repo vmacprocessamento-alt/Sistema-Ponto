@@ -96,8 +96,8 @@ class _LoginScreenState extends State<LoginScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Fale com o administrador: ele gera uma senha temporária e, '
-                'ao entrar, você cria uma nova.',
+                'Fale com o administrador: ele volta a sua senha para a senha '
+                'padrão e, ao entrar, você cria uma nova.',
               ),
               const SizedBox(height: 16),
               const Text(
