@@ -1,4 +1,4 @@
-// Admin cadastra uma pessoa pelo app web real e recebe a senha temporaria.
+// Admin cadastra uma pessoa pelo app web real e recebe a senha do primeiro acesso (123456, norma da empresa).
 const { chromium } = require('playwright');
 const path = require('path');
 
@@ -55,15 +55,14 @@ async function j(method, url, body, headers = {}) {
   await page.getByRole('button', { name: 'Copiar' }).click({ timeout: 30000 });
   await page.waitForTimeout(500);
   const message = await page.evaluate(() => navigator.clipboard.readText());
-  const password = message.match(/Senha temporária: (\d{8})/)[1];
+  const password = message.match(/Senha do primeiro acesso: (\d+)/)[1];
   await page.screenshot({ path: path.join(SHOTS, 'admin-02-senha.png') });
-  check('admin cadastra e ve a senha temporaria na mensagem', /^\d{8}$/.test(password), `(${password})`);
-  check('a senha nao e a 123456', password !== '123456');
+  check('admin cadastra e a mensagem traz a senha do primeiro acesso', password === '123456', `(${password})`);
 
   const ok = await j('POST', `${API}/auth/cpf-login`, { cpf: '11144477735', password }, { 'X-Real-IP': '10.9.9.9' });
-  check('a pessoa entra com a senha temporaria', ok.status === 200, `HTTP ${ok.status}`);
-  const old = await j('POST', `${API}/auth/cpf-login`, { cpf: '11144477735', password: '123456' }, { 'X-Real-IP': '10.9.9.8' });
-  check('a 123456 nao entra', old.status === 401, `HTTP ${old.status}`);
+  check('a pessoa entra com a 123456 no primeiro acesso', ok.status === 200, `HTTP ${ok.status}`);
+  const wrong = await j('POST', `${API}/auth/cpf-login`, { cpf: '11144477735', password: '654321' }, { 'X-Real-IP': '10.9.9.8' });
+  check('senha errada nao entra', wrong.status === 401, `HTTP ${wrong.status}`);
 
   await browser.close();
   console.log(`\nRESULTADO: ${results.filter(Boolean).length}/${results.length}`);

@@ -1400,14 +1400,10 @@ class CpfRulesTest(unittest.TestCase):
 
 @needs_main
 class TemporaryPasswordTest(unittest.TestCase):
-    """Senha do primeiro acesso: aleatoria, 8 digitos, nunca a 123456 de antes."""
+    """Norma da empresa: a senha do primeiro acesso e a 123456."""
 
-    def test_random_digits(self):
-        senhas = [main._temporary_password() for _ in range(200)]
-        self.assertTrue(all(len(p) == 8 and p.isdigit() for p in senhas))
-        self.assertNotIn(main.LEGACY_DEFAULT_PASSWORD, senhas)
-        self.assertGreater(len(set(senhas)), 195)
-        self.assertTrue(all(len(set(p)) > 2 for p in senhas))
+    def test_senha_padrao(self):
+        self.assertEqual(main._temporary_password(), "123456")
 
 
 @needs_main
@@ -1545,8 +1541,10 @@ class CpfAccessTest(unittest.TestCase):
         self.assertEqual(response["temporary_password"], TEMP_PASSWORD)
         self.assertTrue(self.db.store["users"][uid]["must_change_password"])
         self.assertEqual(self.auth.accounts[uid]["password"], TEMP_PASSWORD)
-        # A senha padrao antiga nao volta nem digitada pelo admin.
-        self.assertEqual(self.status_of(self.update, uid, new_password="123456")[0], 400)
+        # O admin tambem pode digitar a padrao: volta a valer a troca no proximo acesso.
+        self.update(uid, new_password="123456")
+        self.assertEqual(self.auth.accounts[uid]["password"], "123456")
+        self.assertTrue(self.db.store["users"][uid]["must_change_password"])
 
     def test_admin_edit_email_and_cpf(self):
         uid = self.create()["id"]

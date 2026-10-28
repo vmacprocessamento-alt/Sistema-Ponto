@@ -3949,19 +3949,15 @@ def admin_delete_daily_entry_endpoint(
 # nunca recebe mensagem. O login por CPF (/auth/cpf-login) confere a senha e
 # devolve o e-mail da conta; o app entra com ele como antes.
 
-# Senha com que as contas eram criadas ate 28/10/2026. Quem sabia o CPF da
-# pessoa entrava como ela ate o primeiro acesso. Nao vale mais como senha nova.
-LEGACY_DEFAULT_PASSWORD = "123456"
+# Norma da empresa (28/10/2026): toda conta nova, e toda senha redefinida
+# pelo admin, entra com 123456; no primeiro acesso a pessoa cria a propria
+# (must_change_password), que nao pode ser a 123456.
+DEFAULT_USER_PASSWORD = "123456"
+LEGACY_DEFAULT_PASSWORD = DEFAULT_USER_PASSWORD
 
 def _temporary_password() -> str:
-    """Senha do primeiro acesso: 8 digitos aleatorios, mostrados uma vez ao
-    admin para entregar a pessoa, que troca no primeiro acesso
-    (must_change_password). Digitos porque e digitada no celular; o limite de
-    tentativas por CPF segura a adivinhacao."""
-    while True:
-        password = f"{secrets.randbelow(10 ** 8):08d}"
-        if len(set(password)) > 2:  # nada de 00000000, 11112111...
-            return password
+    """Senha do primeiro acesso: a padrao da empresa."""
+    return DEFAULT_USER_PASSWORD
 CPF_LOGIN_EMAIL_DOMAIN = os.getenv("CPF_LOGIN_EMAIL_DOMAIN", "cpf.ponto.vmacengenharia.com")
 
 def cpf_digits(value) -> str:
@@ -4324,10 +4320,8 @@ def update_user_admin_endpoint(
     new_password = (payload.new_password or "").strip()
     temporary_password = None
     if payload.reset_password:
-        # "Gerar senha temporaria" no painel: a pessoa troca no proximo acesso.
+        # "Voltar para a senha padrao" no painel: a pessoa troca no proximo acesso.
         new_password = temporary_password = _temporary_password()
-    if new_password == LEGACY_DEFAULT_PASSWORD:
-        raise HTTPException(status_code=400, detail="Use \"Gerar senha temporaria\" em vez da senha padrao antiga.")
     if new_password and len(new_password) < 6:
         raise HTTPException(status_code=400, detail="A nova senha deve ter pelo menos 6 caracteres.")
 

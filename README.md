@@ -6,8 +6,8 @@ backend FastAPI. Não há mais app Android (APK).
 
 ## 📋 Funcionalidades
 
-- **Acesso:** login por CPF e senha; o admin cadastra a pessoa e o sistema gera
-  uma senha temporária, trocada no primeiro acesso. Palavra-chave da empresa
+- **Acesso:** login por CPF e senha; o admin cadastra a pessoa com a senha
+  padrão 123456, trocada no primeiro acesso. Palavra-chave da empresa
   no site.
 - **Ponto:** entrada, até duas pausas e saída, com localização. Online vale a
   hora do servidor; sem internet a batida fica no aparelho e é enviada quando
