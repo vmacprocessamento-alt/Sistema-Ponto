@@ -17,6 +17,7 @@ void main() {
         'check_out': saida,
         'total_hours': horas,
         'overtime_hours': extras,
+        'extra_50': extras,
       };
 
   final dias = [
@@ -121,5 +122,26 @@ void main() {
     // Hoje (selecionado ao abrir): turno aberto desde as 08:00.
     expect(temTexto('Trabalhou: 08:00 – agora'), isTrue);
     expect(temTexto('24h 00m'), isTrue); // 22h do mes + 2h de hoje
+  });
+
+  testWidgets('operador ve a composicao sem "fora do horario"',
+      (tester) async {
+    await abrir(tester, {'id': 'u1', 'role': 'employee', 'job_title': 'Operador'});
+
+    expect(temTexto('COMPOSIÇÃO DAS HORAS'), isTrue);
+    expect(temTexto('Toda hora trabalhada conta'), isTrue);
+    expect(temTexto('Extra 50%'), isTrue);
+    expect(temTexto('Fora do horário'), isFalse);
+    expect(temTexto('DIAS TRABALHADOS'), isTrue);
+    expect(temTexto('DESTAQUES'), isTrue);
+    expect(temTexto('13/10 · 11h 30m'), isTrue); // dia mais longo
+  });
+
+  testWidgets('estagiario ve as horas fora do horario na composicao',
+      (tester) async {
+    await abrir(tester, {'id': 'u2', 'role': 'intern', 'daily_hours': 6});
+
+    expect(temTexto('Fora do horário'), isTrue);
+    expect(temTexto('só com liberação do gestor'), isTrue);
   });
 }

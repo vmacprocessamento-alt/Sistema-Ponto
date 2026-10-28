@@ -259,6 +259,56 @@ class _MonthOverviewState extends State<MonthOverview> {
     return hours > 0 ? _green : _red;
   }
 
+  // --- COMPOSICAO DAS HORAS ---
+  // Pelos dias (o de hoje ja vem atualizado pela Dash), para fechar com o
+  // total do mes. A regra e a da folha (classifyWorkMinutes):
+  //   - domingo, feriado e 22h-5h: extra 100%
+  //   - sabado: extra 50%
+  //   - dia util: normal. Estagiario: normal so das 13:30 as 19:30; o resto
+  //     e "fora do horario".
+
+  double _regularOn(Map<String, dynamic> rec) {
+    if (rec['regular_hours'] != null) return _num(rec['regular_hours']);
+    return _num(rec['total_hours']) - _num(rec['overtime_hours']);
+  }
+
+  ({double regular, double outside, double e50, double e100}) get _composition {
+    var regular = 0.0, outside = 0.0, e50 = 0.0, e100 = 0.0;
+    for (var i = 0; i < _periodDays; i++) {
+      final rec = _recordForDate(_dateAt(i));
+      if (rec == null) continue;
+      final a = _num(rec['extra_50']);
+      final b = _num(rec['extra_100']);
+      regular += _regularOn(rec);
+      e50 += a;
+      e100 += b;
+      outside += (_num(rec['overtime_hours']) - a - b).clamp(0, 24);
+    }
+    return (regular: regular, outside: outside, e50: e50, e100: e100);
+  }
+
+  /// Dias com horas no periodo, do mais antigo ao mais novo.
+  List<(DateTime, double)> get _workedList => [
+        for (var i = 0; i < _periodDays; i++)
+          if (_workedOn(_dateAt(i)) > 0) (_dateAt(i), _workedOn(_dateAt(i))),
+      ];
+
+  /// Media do horario de entrada, em minutos desde a meia-noite.
+  int? get _avgCheckIn {
+    final mins = <int>[];
+    for (var i = 0; i < _periodDays; i++) {
+      final raw = _recordForDate(_dateAt(i))?['check_in'];
+      if (raw is! String || !raw.contains(':')) continue;
+      final parts = raw.split(':');
+      final h = int.tryParse(parts[0]);
+      final m = int.tryParse(parts[1]);
+      if (h == null || m == null) continue;
+      mins.add(h * 60 + m);
+    }
+    if (mins.isEmpty) return null;
+    return (mins.reduce((a, b) => a + b) / mins.length).round();
+  }
+
   // --- UI ---
 
   @override
@@ -278,7 +328,13 @@ class _MonthOverviewState extends State<MonthOverview> {
         else ...[
           if (_showBalance) _buildBalanceHero() else _buildTotalHero(),
           const SizedBox(height: 16),
+          _buildStatTiles(),
+          const SizedBox(height: 16),
+          _buildComposition(),
+          const SizedBox(height: 16),
           _buildCalendar(),
+          const SizedBox(height: 16),
+          _buildHighlights(),
         ],
       ],
     );
@@ -412,6 +468,216 @@ class _MonthOverviewState extends State<MonthOverview> {
               ],
             ),
           ],
+        ],
+      ),
+    );
+  }
+
+  /// Quatro numeros do mes: dias, media, extras e entrada media.
+  Widget _buildStatTiles() {
+    final c = _composition;
+    final extras = c.outside + c.e50 + c.e100;
+    final worked = _workedList;
+    final avg = worked.isEmpty ? 0.0 : _total / worked.length;
+    final entry = _avgCheckIn;
+    final tiles = [
+      ('DIAS TRABALHADOS', '${worked.length}', 'de $_periodDays dias'),
+      ('MÉDIA POR DIA', _hm(avg), 'nos dias com registro'),
+      ('HORAS EXTRAS', _hm(extras),
+          _isIntern ? 'fora do horário, 50% e 100%' : '50% + 100%'),
+      (
+        'ENTRADA MÉDIA',
+        entry == null
+            ? '--:--'
+            : '${(entry ~/ 60).toString().padLeft(2, '0')}:'
+                '${(entry % 60).toString().padLeft(2, '0')}',
+        'horário típico'
+      ),
+    ];
+    return LayoutBuilder(builder: (context, box) {
+      final twoCols = box.maxWidth < 560;
+      final w = twoCols ? (box.maxWidth - 12) / 2 : (box.maxWidth - 36) / 4;
+      return Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          for (final (label, value, hint) in tiles)
+            SizedBox(
+              width: w,
+              child: _card(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            color: _muted,
+                            fontSize: 9,
+                            letterSpacing: 1,
+                            fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    Text(value,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            fontFeatures: [FontFeature.tabularFigures()])),
+                    const SizedBox(height: 2),
+                    Text(hint,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: _muted, fontSize: 10)),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      );
+    });
+  }
+
+  /// Quanto do mes foi hora normal e quanto foi extra, e por que. Para quem
+  /// faz o proprio horario toda hora conta: a extra e so o adicional da
+  /// folha (sabado, domingo, feriado, madrugada), nao uma hora proibida.
+  Widget _buildComposition() {
+    final c = _composition;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final rows = [
+      (
+        'Normal',
+        _isIntern ? 'dia útil, 13:30 às 19:30' : 'dia útil, 5h às 22h',
+        c.regular,
+        dark ? const Color(0xFF3987E5) : const Color(0xFF2A78D6),
+      ),
+      if (_isIntern)
+        (
+          'Fora do horário',
+          'dia útil, fora das 13:30 às 19:30',
+          c.outside,
+          dark ? const Color(0xFFD9A21B) : const Color(0xFFC98A00),
+        ),
+      (
+        'Extra 50%',
+        'sábado',
+        c.e50,
+        dark ? const Color(0xFFD95926) : const Color(0xFFEB6834),
+      ),
+      (
+        'Extra 100%',
+        'domingo, feriado e 22h às 5h',
+        c.e100,
+        dark ? const Color(0xFF199E70) : const Color(0xFF1BAF7A),
+      ),
+    ];
+    final sum = rows.fold<double>(0, (p, r) => p + r.$3);
+    final track = dark ? const Color(0xFF2C2C2A) : const Color(0xFFE1E0D9);
+
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _label('COMPOSIÇÃO DAS HORAS'),
+          const SizedBox(height: 4),
+          Text(
+              _isIntern
+                  ? 'Seu horário é das 13:30 às 19:30. Fora dele, só com liberação do gestor.'
+                  : 'Toda hora trabalhada conta. Sábado, domingo, feriado e madrugada têm adicional.',
+              style: const TextStyle(fontSize: 12, color: _muted)),
+          const SizedBox(height: 14),
+          for (final (name, why, hours, color) in rows)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Row(
+                children: [
+                  Container(
+                    width: 10,
+                    height: 10,
+                    decoration: BoxDecoration(
+                        color: color, borderRadius: BorderRadius.circular(2)),
+                  ),
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 132,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(name,
+                            style: const TextStyle(
+                                fontSize: 12, fontWeight: FontWeight.w600)),
+                        Text(why,
+                            maxLines: 2,
+                            style:
+                                const TextStyle(fontSize: 10, color: _muted)),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(3),
+                      child: LinearProgressIndicator(
+                        value: sum <= 0 ? 0 : hours / sum,
+                        minHeight: 6,
+                        backgroundColor: track,
+                        valueColor: AlwaysStoppedAnimation<Color>(color),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 64,
+                    child: Text(_hm(hours),
+                        textAlign: TextAlign.right,
+                        style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            fontFeatures: [FontFeature.tabularFigures()])),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// O dia mais longo, quantos dias tiveram registro e o ritmo medio.
+  Widget _buildHighlights() {
+    final worked = _workedList;
+    final avg = worked.isEmpty ? 0.0 : _total / worked.length;
+    final best = worked.isEmpty
+        ? null
+        : worked.reduce((a, b) => a.$2 >= b.$2 ? a : b);
+
+    Widget line(IconData icon, String label, String value) => Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Row(
+            children: [
+              Icon(icon, size: 18, color: wineColor),
+              const SizedBox(width: 12),
+              Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
+              Text(value,
+                  style: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.bold)),
+            ],
+          ),
+        );
+
+    return _card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _label('DESTAQUES'),
+          const SizedBox(height: 14),
+          if (best != null)
+            line(Icons.local_fire_department, 'Dia mais longo',
+                '${DateFormat('dd/MM').format(best.$1)} · ${_hm(best.$2)}'),
+          line(Icons.event_available, 'Dias com registro',
+              '${worked.length} de $_periodDays'),
+          line(Icons.speed, 'Ritmo médio', '${_hm(avg)} por dia trabalhado'),
         ],
       ),
     );
