@@ -265,8 +265,13 @@ async function scenario(name, fn) {
     await button(page, /ADICIONAR DIÁRIA|Registrar a diária/).waitFor({ timeout: 30000 });
     await page.screenshot({ path: path.join(SHOTS, '6-diaria.png') });
     await button(page, /ADICIONAR DIÁRIA|Registrar a diária/).click();
+    // Confirmacao "Registrar a diaria de hoje?": espera o dialogo aparecer.
     const confirmar = page.getByRole('button', { name: /^Registrar$/ });
-    if (await confirmar.count()) await confirmar.first().click();
+    if (await confirmar.first().waitFor({ timeout: 8000 }).then(() => true, () => false)) {
+      await confirmar.first().click();
+    }
+    await page.waitForTimeout(1500);
+    await page.screenshot({ path: path.join(SHOTS, '6-diaria-depois.png') });
     let diaria = false;
     for (let i = 0; i < 30 && !diaria; i++) {
       await page.waitForTimeout(500);

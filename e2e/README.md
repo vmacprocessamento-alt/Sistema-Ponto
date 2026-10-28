@@ -7,9 +7,9 @@ o Google (os scripts desviam o Auth do Google para o emulador).
 ## O que cobrem
 | Script | Cenários |
 |---|---|
-| `api_e2e.py` | API e regras do Firestore: cadastro, login por CPF, senha temporária, troca no primeiro acesso, conta desativada, estagiário, batidas, ponto retroativo bloqueado, limite de tentativas, tempos de resposta |
+| `api_e2e.py` | API e regras do Firestore: cadastro, login por CPF, senha padrão 123456, troca no primeiro acesso, conta desativada, estagiário, batidas, ponto retroativo bloqueado, limite de tentativas, tempos de resposta |
 | `batidas.js` | Funcionário no navegador: login, troca de senha, entrada/pausa/retorno, **servidor fora do ar** → fila → envio sozinho, abas |
-| `cadastro_admin.js` | Admin cadastra pela tela e recebe a senha temporária; ela entra, a 123456 não |
+| `cadastro_admin.js` | Admin cadastra pela tela; a mensagem traz a senha do primeiro acesso (123456) e a pessoa entra com ela |
 | `web_suite.js` | Celular pequeno e computador, sessão ao recarregar, sair e entrar, exportar Excel, estagiário fora do horário → **gestor libera pela tela**, modo diária, **offline** (abre sem internet, bate e sincroniza), lançamento em lote |
 
 ## Como rodar

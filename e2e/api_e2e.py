@@ -82,7 +82,7 @@ intern_uid = r.json().get("id"); intern_pw = r.json().get("temporary_password") 
 
 print("\n== LOGIN ==")
 r, ms = timed("POST", "/auth/cpf-login", json={"cpf": "529.982.247-25", "password": emp_pw})
-check("senha inicial e temporaria aleatoria, nao a 123456", emp_pw and emp_pw != "123456", f"({emp_pw})")
+check("senha do primeiro acesso e a padrao 123456", emp_pw == "123456", f"({emp_pw})")
 check("login CPF com senha padrao", r.status_code == 200, f"({ms:.0f} ms)")
 emp_email = r.json().get("email")
 r, _ = timed("POST", "/auth/cpf-login", json={"cpf": "52998224725", "password": "errada"})

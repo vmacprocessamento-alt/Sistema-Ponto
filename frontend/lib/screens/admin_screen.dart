@@ -1527,7 +1527,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
   // Modo diaria: so para Funcionario.
   bool _dailyMode = false;
   bool _obscurePassword = true;
-  // "Gerar senha temporaria": o backend gera ao salvar e a tela mostra uma vez.
+  // "Voltar para a senha padrao": ao salvar, a conta volta para a 123456.
   bool _resetPassword = false;
   final _apiService = ApiService();
   bool _isSaving = false;
@@ -1666,8 +1666,8 @@ class _UserEditDialogState extends State<UserEditDialog> {
                 icon: Icon(_resetPassword ? Icons.check_box : Icons.lock_reset,
                     size: 18),
                 label: Text(_resetPassword
-                    ? 'Senha temporária será gerada ao salvar'
-                    : 'Gerar senha temporária'),
+                    ? 'Volta para a senha padrão (123456) ao salvar'
+                    : 'Voltar para a senha padrão (123456)'),
               ),
             ),
             SwitchListTile.adaptive(
@@ -1856,7 +1856,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
             name: name,
             cpf: _cpfController.text.trim(),
             password: temporary,
-            title: 'Senha temporária gerada',
+            title: 'Senha padrão definida',
           ),
         );
       }
@@ -1963,7 +1963,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
 }
 
 /// Cadastro de uma pessoa pelo admin (nao ha mais cadastro pelo app). Ela
-/// entra com o CPF e a senha temporaria gerada pelo backend e cria a propria
+/// entra com o CPF e a senha padrao (123456) e cria a propria
 /// no primeiro acesso.
 /// Devolve {'name', 'cpf'} da conta criada, ou null.
 class UserCreateDialog extends StatefulWidget {
@@ -2069,9 +2069,8 @@ class _UserCreateDialogState extends State<UserCreateDialog> {
                   borderRadius: BorderRadius.circular(10),
                 ),
                 child: const Text(
-                  'O sistema gera uma senha temporária para o primeiro '
-                  'acesso, mostrada uma vez depois de salvar. No primeiro '
-                  'acesso, o app pede para a pessoa criar a própria senha.',
+                  'A pessoa entra com o CPF e a senha padrão 123456. No '
+                  'primeiro acesso, o app pede para ela criar a própria senha.',
                   style: TextStyle(fontSize: 13),
                 ),
               ),
@@ -2189,7 +2188,7 @@ class AccessMessageDialog extends StatelessWidget {
   final String name;
   final String cpf;
 
-  /// Senha temporaria gerada pelo backend: so aparece aqui, uma vez.
+  /// Senha do primeiro acesso (a padrao, 123456).
   final String password;
   final String title;
 
@@ -2202,7 +2201,7 @@ class AccessMessageDialog extends StatelessWidget {
       // O endereco que o admin esta usando e o do app.
       'Endereço: ${Uri.base.origin}',
       'Login (CPF): $cpf',
-      'Senha temporária: $password',
+      'Senha do primeiro acesso: $password',
       'No primeiro acesso o app pede para você criar uma senha nova.',
     ].join('\n');
   }
@@ -2236,8 +2235,7 @@ class AccessMessageDialog extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Mande o acesso para a pessoa. A senha temporária '
-              'aparece só agora: copie ou envie antes de fechar.'),
+          const Text('Mande o acesso para a pessoa:'),
           const SizedBox(height: 12),
           Container(
             width: double.infinity,
