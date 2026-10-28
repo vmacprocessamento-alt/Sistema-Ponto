@@ -15,8 +15,9 @@ from test_work_schedule import _FakeDb, _FakeDocument, main, needs_main
 FUSO = ZoneInfo("America/Sao_Paulo")
 
 
-def _rodar(coro):
-    return asyncio.run(coro)
+def _rodar(resultado):
+    # Endpoint `def` ja devolve o resultado; `async def` devolve a corrotina.
+    return asyncio.run(resultado) if asyncio.iscoroutine(resultado) else resultado
 
 
 @needs_main
@@ -127,6 +128,77 @@ class BloqueioDeLoginTest(unittest.TestCase):
         with self.assertRaises(main.HTTPException) as erro:
             self._login("52998224725", "certa", "200.9.9.9")
         self.assertEqual(erro.exception.status_code, 429)
+
+
+@needs_main
+class DesempenhoTest(unittest.TestCase):
+    """O Firestore do Admin SDK e bloqueante: nos endpoints `async def` uma batida travava o servidor inteiro e
+    as do pico entravam em fila (30 juntas: a ultima esperava ~10 s). E o token era conferido no Google em toda
+    requisicao, com cliente HTTP novo (28/10/2026)."""
+
+    def test_batidas_simultaneas_nao_esperam_umas_pelas_outras(self):
+        import time
+        import httpx
+
+        lento = 0.2
+        original_get = _FakeDocument.get
+
+        def get_lento(doc):
+            time.sleep(lento)  # o SDK real bloqueia assim enquanto espera o Google
+            return original_get(doc)
+
+        async def usuario():
+            return {"id": "u1", "role": "employee"}
+
+        async def disparar(n):
+            transporte = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(transport=transporte, base_url="http://t") as cliente:
+                pedido = lambda: cliente.post("/work-schedule/punch", json={"record_type": "check_in"})  # noqa: E731
+                inicio = time.perf_counter()
+                respostas = await asyncio.gather(*(pedido() for _ in range(n)))
+                return time.perf_counter() - inicio, respostas
+
+        main.app.dependency_overrides[main.require_authenticated_user] = usuario
+        self.addCleanup(main.app.dependency_overrides.clear)
+        with mock.patch.object(main, "get_firestore_admin", return_value=_FakeDb()), \
+                mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")), \
+                mock.patch.object(_FakeDocument, "get", get_lento):
+            gasto, respostas = asyncio.run(disparar(10))
+        self.assertTrue(all(r.status_code in (200, 409) for r in respostas), [r.status_code for r in respostas])
+        # Em fila: 10 leituras lentas uma apos a outra = 2 s. Em paralelo, perto de uma so.
+        self.assertLess(gasto, 10 * lento / 3)
+
+    def test_token_conferido_uma_vez_e_cliente_reaproveitado(self):
+        chamadas = []
+
+        class Resposta:
+            is_success = True
+
+            def json(self):
+                return {"users": [{"localId": "u1"}]}
+
+        class Cliente:
+            is_closed = False
+
+            async def post(self, *args, **kwargs):
+                chamadas.append(args)
+                return Resposta()
+
+        async def duas_vezes():
+            return [await main.verify_firebase_user_token("tok-abc"), await main.verify_firebase_user_token("tok-abc")]
+
+        main._verified_tokens.clear()
+        self.addCleanup(main._verified_tokens.clear)
+        with mock.patch.object(main, "FIREBASE_WEB_API_KEY", "k"), \
+                mock.patch.object(main, "_http_client", lambda: Cliente()):
+            self.assertEqual(asyncio.run(duas_vezes()), ["u1", "u1"])
+        self.assertEqual(len(chamadas), 1)
+
+    def test_um_cliente_http_por_event_loop(self):
+        async def dois():
+            return main._http_client() is main._http_client()
+
+        self.assertTrue(asyncio.run(dois()))
 
 
 @needs_main
