@@ -4,6 +4,7 @@ usuario so pelo admin (sem apagar auditorias) e webhook da ZapSign fechado sem s
     python -m unittest test_seguranca
 """
 import asyncio
+import os
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -257,6 +258,60 @@ class DesempenhoTest(unittest.TestCase):
             return main._http_client() is main._http_client()
 
         self.assertTrue(asyncio.run(dois()))
+
+
+@needs_main
+class ArquivoExportadoApagadoTest(unittest.TestCase):
+    """Folha, lote e relatorio exportados ficavam no /tmp do servidor para sempre (28/10/2026)."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        async def usuario():
+            return {"id": "a1", "role": "admin"}
+
+        main.app.dependency_overrides[main.require_authenticated_user] = usuario
+        self.addCleanup(main.app.dependency_overrides.clear)
+        self.cliente = TestClient(main.app)
+        self.dados = {"employee_name": "Fulano", "employee_role": "Aux", "cpf": "1", "month": "10", "year": "2026",
+                      "is_campo": False, "daily_records": []}
+        self.gerados = []
+        for nome in ("generate_excel_file", "generate_batch_html_file"):
+            original = getattr(main, nome)
+
+            def anotar(*args, _original=original, **kwargs):
+                caminho = _original(*args, **kwargs)
+                self.gerados.append(caminho)
+                return caminho
+
+            patcher = mock.patch.object(main, nome, anotar)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _exportar(self, rota, corpo):
+        try:
+            resposta = self.cliente.post(rota, json=corpo)
+        except FileNotFoundError as exc:  # modelo do Excel fora do lugar nesta maquina
+            self.skipTest(str(exc))
+        if resposta.status_code == 500 and "No such file" in resposta.text:
+            self.skipTest(resposta.text)
+        self.assertEqual(resposta.status_code, 200, resposta.text)
+        self.assertGreater(len(resposta.content), 0)
+        self.assertTrue(self.gerados)
+        for caminho in self.gerados:
+            self.assertFalse(os.path.exists(caminho), caminho)
+
+    def test_folha_excel(self):
+        self._exportar("/export-excel", self.dados)
+
+    def test_lote_zip(self):
+        import zipfile
+        with mock.patch.object(main.zipfile, "ZipFile", wraps=zipfile.ZipFile) as zip_criado:
+            self._exportar("/export-batch", [self.dados])
+        self.assertFalse(os.path.exists(os.path.dirname(zip_criado.call_args[0][0])))
+
+    def test_relatorio_html(self):
+        self._exportar("/export-batch-html", [self.dados])
 
 
 @needs_main

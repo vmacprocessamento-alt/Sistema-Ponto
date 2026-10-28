@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -2578,6 +2579,20 @@ function showTab(id){{
     tmp.close()
     return tmp.name
 
+def _remove_after_send(path: str, whole_dir: bool = False) -> BackgroundTask:
+    """Apaga o arquivo gerado (ou a pasta temporaria dele) depois que a
+    resposta foi enviada. Sem isso cada folha, lote ou relatorio exportado
+    ficava no /tmp do container para sempre, enchendo o disco do servidor."""
+    def remove():
+        if whole_dir:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return BackgroundTask(remove)
+
 @app.post("/export-excel")
 def export_excel(
     data: ExportData,
@@ -2585,7 +2600,12 @@ def export_excel(
 ):
     try:
         file_path = generate_excel_file(data)
-        return FileResponse(file_path, filename=excel_download_filename(data), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return FileResponse(
+            file_path,
+            filename=excel_download_filename(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            background=_remove_after_send(file_path),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2602,7 +2622,12 @@ def export_batch(
                 file_path = generate_excel_file(data)
                 zipf.write(file_path, arcname=excel_download_filename(data))
                 os.unlink(file_path)
-        return FileResponse(zip_path, filename="Folhas_Ponto_Lote.zip", media_type="application/zip")
+        return FileResponse(
+            zip_path,
+            filename="Folhas_Ponto_Lote.zip",
+            media_type="application/zip",
+            background=_remove_after_send(zip_path, whole_dir=True),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2618,6 +2643,7 @@ def export_batch_html(
             file_path,
             filename=f"Folhas_Ponto_VM_{first.month}-{first.year}.html",
             media_type="text/html; charset=utf-8",
+            background=_remove_after_send(file_path),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
