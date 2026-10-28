@@ -10,6 +10,8 @@ import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
 
 import 'user_chat_list_screen.dart';
+import '../widgets/content_width.dart';
+import '../utils/work_schedule_rules.dart' show isInternProfile;
 
 /// Como fechar um turno aberto de outro dia: saida agora (turno da noite) ou
 /// saida esquecida (fecha sem horas, o gestor corrige).
@@ -274,10 +276,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  bool get _isInternUser {
-    final role = (_user?['role'] ?? '').toString().toLowerCase();
-    return role.contains('estag') || role.contains('intern');
-  }
+  /// Mesma regra do backend: papel de estagiario ou cargo "Estagiario".
+  /// Pelo papel so, o cargo "Estagiario" com papel de funcionario batia
+  /// ponto como operador e o backend recusava fora do horario.
+  bool get _isInternUser => isInternProfile(_user);
 
   /// Ha turno aberto: o da vespera ou uma entrada de hoje sem saida. Pelo
   /// ultimo ponto, as pausas soltas de uma entrada recusada na sincronizacao
@@ -1368,7 +1370,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                    builder: (context) => const UserChatListScreen()),
+                    builder: (context) => const ContentWidth(child: UserChatListScreen())),
               );
             },
           ),

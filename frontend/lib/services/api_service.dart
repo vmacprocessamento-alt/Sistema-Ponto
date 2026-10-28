@@ -1748,7 +1748,11 @@ class ApiService {
       ..removeWhere((day, _) =>
           day.compareTo(firstDay) < 0 || day.compareTo(lastDay) > 0);
 
-    final role = user['role']?.toString() ?? 'employee';
+    // Folha do estagiario pela mesma regra do backend (papel ou cargo):
+    // so ele tem as horas fora da janela 13:30-19:30 como extras.
+    final role = isInternProfile(user)
+        ? 'intern'
+        : user['role']?.toString() ?? 'employee';
     return _timesheetResult(user, [
       for (final MapEntry(key: date, value: dayRecords) in grouped.entries)
         computeWorkDay(date, dayRecords, role),
@@ -2030,7 +2034,11 @@ class ApiService {
         ? await getMyDailyEntries(start: start, end: end)
         : await getDailyEntries(start: start, end: end, userId: userId);
     final name = user['name']?.toString() ?? '';
-    final role = user['role']?.toString() ?? 'employee';
+    // Folha do estagiario pela mesma regra do backend (papel ou cargo):
+    // so ele tem as horas fora da janela 13:30-19:30 como extras.
+    final role = isInternProfile(user)
+        ? 'intern'
+        : user['role']?.toString() ?? 'employee';
     return [
       for (final entry in entries)
         {
