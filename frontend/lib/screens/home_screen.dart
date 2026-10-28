@@ -11,6 +11,7 @@ import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
 
 import 'user_chat_list_screen.dart';
+import '../utils/screen_watch.dart';
 
 /// Como fechar um turno aberto de outro dia: saida agora (turno da noite) ou
 /// saida esquecida (fecha sem horas, o gestor corrige).
@@ -168,6 +169,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Bater ponto ja recarrega na hora; o pull-to-refresh tambem.
       if (_isInternUser &&
           !_refreshingSchedule &&
+          isScreenWatched(context) &&
           (_lastScheduleRefresh == null ||
               now.difference(_lastScheduleRefresh!).inSeconds >= 90)) {
         _lastScheduleRefresh = now;

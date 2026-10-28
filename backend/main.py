@@ -1681,7 +1681,21 @@ async def _auto_close_breaks_loop() -> None:
 # guarda local (host, via bind mount) e envia copia off-machine ao Storage.
 
 _BACKUP_DIR = "/app/data/backups"
-_BACKUP_RETENTION = 14
+# Completo uma vez por semana; nos outros dias so o que mudou nas colecoes que
+# so crescem. Ler o banco inteiro todo dia comia a cota diaria do plano Spark
+# (50 mil leituras) conforme os pontos se acumulavam (28/10/2026).
+_BACKUP_FULL_EVERY = timedelta(days=7)
+_BACKUP_FULLS_KEPT = 3
+# Colecoes que crescem sem parar. No incremental entram so os documentos com
+# created_at ou updated_at depois do ultimo backup; as demais (usuarios,
+# configuracoes...) sao pequenas e vao inteiras.
+_GROWING_COLLECTIONS = {
+    "time_records", "time_record_audits", "system_audits", "user_audits",
+    "user_notifications", "daily_entries", "work_schedule_approval_requests",
+    "adjustment_requests", "adjustment_conversations", "signature_documents",
+}
+# Folga na janela do incremental: relogios e o tempo do proprio backup.
+_BACKUP_OVERLAP = timedelta(hours=1)
 _BACKUP_MIN_INTERVAL = timedelta(hours=20)      # nao repete se ja ha um recente
 _BACKUP_CHECK_INTERVAL_SECONDS = 6 * 3600        # confere a cada 6h
 _BACKUP_STORAGE_PREFIX = "backups/"
@@ -1696,25 +1710,57 @@ def _json_default(obj):
         return base64.b64encode(obj).decode("ascii")
     return str(obj)
 
-def _export_firestore(db) -> dict:
-    dump = {}
+def _export_firestore(db, since: Optional[datetime] = None) -> tuple:
+    """(dump, colecoes completas). Com since (incremental), as colecoes de
+    _GROWING_COLLECTIONS levam so o criado ou alterado desde since."""
+    dump, complete = {}, []
     for coll in db.collections():
-        dump[coll.id] = [
-            {"id": doc.id, **(doc.to_dict() or {})} for doc in coll.stream()
-        ]
-    return dump
+        if since is None or coll.id not in _GROWING_COLLECTIONS:
+            dump[coll.id] = [{"id": doc.id, **(doc.to_dict() or {})} for doc in coll.stream()]
+            complete.append(coll.id)
+            continue
+        changed = {}
+        for field in ("created_at", "updated_at"):
+            for doc in coll.where(field, ">=", since).stream():
+                changed[doc.id] = {"id": doc.id, **(doc.to_dict() or {})}
+        dump[coll.id] = list(changed.values())
+    return dump, complete
+
+def _is_incremental(name: str) -> bool:
+    return name.endswith("-inc.zip")
+
+def _backup_order(name: str) -> tuple:
+    """Pela data do nome; na mesma data o completo antes do incremental (na
+    ordem alfabetica "-inc.zip" viria antes de ".zip")."""
+    stamp = name[:-len("-inc.zip")] if _is_incremental(name) else name[:-len(".zip")]
+    return stamp, _is_incremental(name)
 
 def _local_backups() -> List[str]:
     try:
         return sorted(
-            f for f in os.listdir(_BACKUP_DIR)
-            if f.startswith("backup-") and f.endswith(".zip")
+            (f for f in os.listdir(_BACKUP_DIR)
+             if f.startswith("backup-") and f.endswith(".zip")),
+            key=_backup_order,
         )
     except FileNotFoundError:
         return []
 
+def _backups_to_delete(names: List[str]) -> List[str]:
+    """Os _BACKUP_FULLS_KEPT completos mais novos ficam, e os incrementais a
+    partir do mais antigo deles (um incremental sem o completo de antes nao
+    restaura nada)."""
+    names = sorted(names, key=_backup_order)
+    fulls = [n for n in names if not _is_incremental(n)]
+    if len(fulls) <= _BACKUP_FULLS_KEPT:
+        oldest_kept = fulls[0] if fulls else None
+    else:
+        oldest_kept = fulls[-_BACKUP_FULLS_KEPT]
+    if oldest_kept is None:
+        return []
+    return [n for n in names if _backup_order(n) < _backup_order(oldest_kept)]
+
 def _rotate_local_backups():
-    for old in _local_backups()[:-_BACKUP_RETENTION]:
+    for old in _backups_to_delete(_local_backups()):
         try:
             os.remove(os.path.join(_BACKUP_DIR, old))
         except OSError:
@@ -1726,12 +1772,12 @@ def _upload_backup_to_storage(path: str, name: str) -> str:
     try:
         bucket = storage.bucket(_BACKUP_STORAGE_BUCKET)
         bucket.blob(_BACKUP_STORAGE_PREFIX + name).upload_from_filename(path)
-        remote = sorted(
-            (b for b in bucket.list_blobs(prefix=_BACKUP_STORAGE_PREFIX)
-             if b.name.endswith(".zip")),
-            key=lambda b: b.name,
-        )
-        for old in remote[:-_BACKUP_RETENTION]:
+        remote = {
+            b.name[len(_BACKUP_STORAGE_PREFIX):]: b
+            for b in bucket.list_blobs(prefix=_BACKUP_STORAGE_PREFIX)
+            if b.name.endswith(".zip")
+        }
+        for old in (remote[n] for n in _backups_to_delete(list(remote))):
             try:
                 old.delete()
             except Exception:
@@ -1754,15 +1800,36 @@ def _run_backup(force: bool = False) -> dict:
             if datetime.now().timestamp() - newest < _BACKUP_MIN_INTERVAL.total_seconds():
                 return {"status": "skip", "reason": "backup recente ja existe"}
 
+    existing = _local_backups()
+    fulls = [n for n in existing if not _is_incremental(n)]
+    now = datetime.now().timestamp()
+    full = force or not fulls or (
+        now - os.path.getmtime(os.path.join(_BACKUP_DIR, fulls[-1]))
+        >= _BACKUP_FULL_EVERY.total_seconds()
+    )
+    since = None
+    if not full:
+        last = os.path.getmtime(os.path.join(_BACKUP_DIR, existing[-1]))
+        since = datetime.fromtimestamp(last, ZoneInfo("UTC")) - _BACKUP_OVERLAP
+
     stamp = datetime.now(ZoneInfo(_AUTO_CLOSE_TZ)).strftime("%Y%m%d-%H%M%S")
-    name = f"backup-{stamp}.zip"
+    name = f"backup-{stamp}.zip" if full else f"backup-{stamp}-inc.zip"
     zip_path = os.path.join(_BACKUP_DIR, name)
     tmp_dir = tempfile.mkdtemp()
     try:
-        fs_dump = _export_firestore(db)
+        fs_dump, complete = _export_firestore(db, since)
         fs_path = os.path.join(tmp_dir, "firestore.json")
         with open(fs_path, "w", encoding="utf-8") as handle:
             json.dump(fs_dump, handle, ensure_ascii=False, default=_json_default)
+        # Para o restore_backup.py juntar o completo e os incrementais.
+        manifest_path = os.path.join(tmp_dir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "type": "full" if full else "incremental",
+                "since": since.isoformat() if since else None,
+                "base": None if full else fulls[-1],
+                "complete_collections": complete,
+            }, handle, ensure_ascii=False)
 
         sqlite_path = os.path.join(tmp_dir, "ponto.db")
         source = sqlite3.connect(DATABASE_PATH)
@@ -1775,6 +1842,7 @@ def _run_backup(force: bool = False) -> dict:
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(fs_path, "firestore.json")
+            archive.write(manifest_path, "manifest.json")
             if os.path.exists(sqlite_path):
                 archive.write(sqlite_path, "ponto.db")
     finally:
@@ -1785,8 +1853,8 @@ def _run_backup(force: bool = False) -> dict:
     counts = {k: len(v) for k, v in fs_dump.items()}
     size = os.path.getsize(zip_path)
     print(f"[backup] {name} ({size} bytes) upload={upload} colecoes={counts}")
-    return {"status": "ok", "file": name, "bytes": size,
-            "upload": upload, "collections": counts}
+    return {"status": "ok", "file": name, "type": "full" if full else "incremental",
+            "bytes": size, "upload": upload, "collections": counts}
 
 # Copia off-machine por email (semanal). O Storage exige plano pago; o email
 # reusa o SMTP ja configurado. O anexo vai cifrado (AES) por conter dados
@@ -1825,7 +1893,8 @@ def _send_backup_email() -> str:
         return "sem senha configurada (BACKUP_ZIP_PASSWORD)"
     if not MAIL_PASSWORD or MAIL_PASSWORD == "mude-me":
         return "SMTP nao configurado"
-    backups = _local_backups()
+    # So o completo: o incremental sozinho nao restaura nada.
+    backups = [n for n in _local_backups() if not _is_incremental(n)]
     if not backups:
         return "sem backup para enviar"
     latest = os.path.join(_BACKUP_DIR, backups[-1])
@@ -1915,7 +1984,7 @@ async def email_backup_endpoint(admin=Depends(require_admin_user)):
 @app.get("/admin/backup/list")
 def list_backups_endpoint(admin=Depends(require_admin_user)):
     out = []
-    for name in sorted(_local_backups(), reverse=True):
+    for name in reversed(_local_backups()):
         path = os.path.join(_BACKUP_DIR, name)
         out.append({
             "file": name,
