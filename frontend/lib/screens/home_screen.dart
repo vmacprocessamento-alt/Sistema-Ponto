@@ -10,6 +10,7 @@ import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
 
 import 'user_chat_list_screen.dart';
+import '../utils/screen_watch.dart';
 
 /// Como fechar um turno aberto de outro dia: saida agora (turno da noite) ou
 /// saida esquecida (fecha sem horas, o gestor corrige).
@@ -167,6 +168,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Bater ponto ja recarrega na hora; o pull-to-refresh tambem.
       if (_isInternUser &&
           !_refreshingSchedule &&
+          isScreenWatched(context) &&
           (_lastScheduleRefresh == null ||
               now.difference(_lastScheduleRefresh!).inSeconds >= 90)) {
         _lastScheduleRefresh = now;
@@ -235,10 +237,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         timestamp: closedAt.toIso8601String(),
         notes: "Retorno automatico (pausa excedeu 3h; ajustado para 1h)",
         location: "Sistema (Auto)",
-        // Mesmo id do job do backend que fecha pausas esquecidas: o job, este
-        // aparelho e qualquer outro gravam o MESMO retorno, nunca dois.
-        recordId: breakStartId.isEmpty ? null : 'autoclose_$breakStartId',
-        extraFields: const {'auto_closed': true},
+        // O backend confere a pausa e grava com o mesmo id do job que fecha
+        // pausas esquecidas: o job, este aparelho e qualquer outro gravam o
+        // MESMO retorno, nunca dois.
+        punchKind: breakStartId.isEmpty ? null : 'auto_break_close',
+        refRecordId: breakStartId.isEmpty ? null : breakStartId,
       );
       _autoClosedBreakKey = _breakKey(breakStart);
       // Recarrega logo depois de gravar: enquanto a lista mostrar a pausa
@@ -267,8 +270,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             'Sua pausa excedeu 3h e foi fechada automaticamente com 1 hora de pausa.'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('OK'))
+              onPressed: () => Navigator.pop(context), child: const Text('OK'))
         ],
       ),
     );
@@ -489,9 +491,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         pendingRecords.where(ApiService.isBlockedOfflineRecord).toList();
     _pendingOfflineRecordsCount = pendingRecords.length;
     _blockedOfflineRecordsCount = blocked.length;
-    _awaitingApprovalOfflineRecordsCount = blocked
-        .where(ApiService.isAwaitingApprovalOfflineRecord)
-        .length;
+    _awaitingApprovalOfflineRecordsCount =
+        blocked.where(ApiService.isAwaitingApprovalOfflineRecord).length;
     // Motivo para o aviso dos recusados por outra regra.
     final other = blocked
         .where((record) => !ApiService.isAwaitingApprovalOfflineRecord(record))
@@ -516,9 +517,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final todayMidnight = DateTime(now.year, now.month, now.day);
       final windowStart =
           todayMidnight.subtract(const Duration(days: 14)).toIso8601String();
-      final windowRecords =
-          await _apiService.getTimeRecords(
-              startDate: windowStart, endDate: end, localOnly: localOnly);
+      final windowRecords = await _apiService.getTimeRecords(
+          startDate: windowStart, endDate: end, localOnly: localOnly);
       final carried = _carriedOpenShift(todayMidnight, windowRecords);
       // Com turno aberto de outro dia, a tela segue o turno desde a entrada:
       // status, pausas e saida valem para ele, nao so para os pontos de hoje.
@@ -669,7 +669,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<bool> _resolveParkedExit() async {
     final parked = await _parkedExitsOfOpenShift();
     if (parked.isEmpty) return false;
-    final shiftStart = openShiftCheckIn(_todayRecords)?['timestamp']?.toString();
+    final shiftStart =
+        openShiftCheckIn(_todayRecords)?['timestamp']?.toString();
     final at = DateFormat('dd/MM HH:mm')
         .format(DateTime.parse(parked.first['timestamp'].toString()).toLocal());
     await ApiService.waitForOfflineSync();
@@ -738,6 +739,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Posicao para a batida; null sem permissao ou sem sinal. Nunca lanca:
+  /// pode ficar sem ninguem esperando (batida cancelada numa confirmacao).
+  Future<Position?> _punchPosition() async {
+    try {
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission != LocationPermission.always &&
+          permission != LocationPermission.whileInUse) {
+        return null;
+      }
+      try {
+        return await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+          timeLimit: const Duration(seconds: 5),
+        );
+      } catch (e) {
+        // Sem sinal no prazo a batida sai sem localizacao (o navegador nao
+        // tem "ultima posicao conhecida").
+        debugPrint('Localizacao atual indisponivel: $e');
+        return null;
+      }
+    } catch (e) {
+      debugPrint('Erro ao obter localização: $e');
+      return null;
+    }
+  }
+
   Future<void> _registerPunch(
     String type, {
     DateTime? timestamp,
@@ -751,6 +781,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // da localizacao (ate ~25s com sinal ruim): a saida tocada 19:34:50 ia
     // como 19:35:10, depois do limite, e pedia liberacao de hora extra.
     final tappedAt = DateTime.now();
+    // GPS comeca ja, junto com a conferencia abaixo e as confirmacoes: antes
+    // so comecava depois delas e somava ate 5 s a cada batida (dentro de
+    // predio o sinal costuma gastar o prazo inteiro).
+    final positionFuture = _punchPosition();
 
     // Confere de novo antes de QUALQUER batida: a tela pode estar velha (app
     // aberto desde ontem, ponto batido em outro aparelho). Ex.: o celular
@@ -771,7 +805,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
     if (!_punchOptions().allows(type)) {
-      _showError('A tela estava desatualizada. Confira o status e tente de novo.');
+      _showError(
+          'A tela estava desatualizada. Confira o status e tente de novo.');
       setState(() => _punchInFlight = false);
       return;
     }
@@ -787,7 +822,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     if (!mounted) return;
 
-    String? recordId;
+    // "Esqueci de bater a saida": o backend fecha o turno sem horas.
+    var forgottenExit = false;
+    String? forgottenShiftId;
     if (type == 'check_out' && _carriedOpenShiftStart != null) {
       final shiftStart = _carriedOpenShiftStart!;
       final checkInId = _carriedOpenShiftId ?? '';
@@ -804,9 +841,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         timestamp = shiftStart.add(const Duration(seconds: 1));
         notes = 'Saida esquecida: o gestor precisa lancar o horario real';
         location = 'App (saida esquecida)';
-        // Id fixo pela entrada: "Esqueci" em dois aparelhos, ou a fila
-        // offline fechando o mesmo turno, gravam a mesma saida, nao duas.
-        if (checkInId.isNotEmpty) recordId = 'forgot_$checkInId';
+        // O backend calcula a hora (1s depois da entrada) e grava com id fixo
+        // pela entrada: "Esqueci" em dois aparelhos, ou a fila offline
+        // fechando o mesmo turno, gravam a mesma saida, nao duas. Vale tambem
+        // para o estagiario: pelo horario controlado, a saida de um turno de
+        // ontem seria recusada como "muito distante do relogio".
+        forgottenExit = true;
+        if (checkInId.isNotEmpty) forgottenShiftId = checkInId;
       }
     }
 
@@ -841,29 +882,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _isLoading = true);
 
     try {
-      // 1. Obter localização atual
-      Position? position;
-      try {
-        LocationPermission permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied) {
-          permission = await Geolocator.requestPermission();
-        }
-
-        if (permission == LocationPermission.always ||
-            permission == LocationPermission.whileInUse) {
-          position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-            timeLimit: const Duration(seconds: 5),
-          );
-        }
-      } catch (e) {
-        debugPrint('Erro ao obter localização: $e');
-      }
+      // 1. Localizacao (pedida no toque, ver _punchPosition)
+      final position = await positionFuture;
 
       // 2. Estagiarios usam validacao autoritativa do backend na entrada/saida.
       final attemptedAt = timestamp ?? tappedAt;
       Map<String, dynamic> result;
-      if (_isInternUser && (type == 'check_in' || type == 'check_out')) {
+      if (_isInternUser &&
+          !forgottenExit &&
+          (type == 'check_in' || type == 'check_out')) {
         // Id gerado ANTES do envio: se a rede cair depois de o backend gravar
         // (resposta perdida), a fila reenvia com o mesmo id e o backend
         // devolve o ponto que ja existe em vez de duplicar ou recusar.
@@ -941,7 +968,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           location: location,
           latitude: position?.latitude,
           longitude: position?.longitude,
-          recordId: recordId,
+          punchKind: forgottenExit ? 'forgotten_exit' : null,
+          refRecordId: forgottenShiftId,
         );
       }
 
@@ -1040,8 +1068,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context),
-              child: const Text('Cancelar',
-                  style: TextStyle(color: Colors.grey))),
+              child:
+                  const Text('Cancelar', style: TextStyle(color: Colors.grey))),
           if (allowForgot)
             TextButton(
               onPressed: () => Navigator.pop(context, _CarriedExit.forgot),
@@ -1178,7 +1206,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       (record) => record['record_type'] == 'check_in',
     );
     if (lastCheckInIndex >= 0) {
-      return DateTime.parse(_todayRecords[lastCheckInIndex]['timestamp']).toLocal();
+      return DateTime.parse(_todayRecords[lastCheckInIndex]['timestamp'])
+          .toLocal();
     }
     // Turno que comecou em um dia anterior e nunca foi fechado.
     return _carriedOpenShiftStart;
@@ -1316,20 +1345,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   void _showError(String msg) {
+    // O aviso novo entra no lugar do anterior: em fila, o "Entrada salva"
+    // ainda aparecia depois da pausa batida.
     ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(msg), backgroundColor: wineColor));
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(msg), backgroundColor: wineColor));
   }
 
   void _showSuccess(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Row(children: [
-        const Icon(Icons.check_circle, color: Colors.white),
-        const SizedBox(width: 8),
-        Text(msg)
-      ]),
-      backgroundColor: Colors.blue.shade800,
-      behavior: SnackBarBehavior.floating,
-    ));
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Row(children: [
+          const Icon(Icons.check_circle, color: Colors.white),
+          const SizedBox(width: 8),
+          Expanded(child: Text(msg)),
+        ]),
+        backgroundColor: Colors.blue.shade800,
+        behavior: SnackBarBehavior.floating,
+      ));
   }
 
   String _getRecordLabel(String type) {
@@ -1553,8 +1587,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             style: OutlinedButton.styleFrom(
                               foregroundColor: wineColor,
                               side: const BorderSide(color: wineColor),
-                              padding:
-                                  const EdgeInsets.symmetric(vertical: 14),
+                              padding: const EdgeInsets.symmetric(vertical: 14),
                             ),
                             icon: const Icon(Icons.cloud_off),
                             label: const Text('FINALIZAR EXPEDIENTE AGORA'),
@@ -1664,9 +1697,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
-        color: Colors.orange.withOpacity(0.12),
+        color: Colors.orange.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.orange.withOpacity(0.35)),
+        border: Border.all(color: Colors.orange.withValues(alpha: 0.35)),
       ),
       child: Row(
         children: [
@@ -1812,7 +1845,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: isDark ? Colors.white10 : Colors.black.withOpacity(0.05),
+        color: isDark ? Colors.white10 : Colors.black.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(20),
       ),
       child: Row(
@@ -1820,7 +1853,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         children: [
           CircleAvatar(
               radius: 8,
-              backgroundColor: theme.primaryColor.withOpacity(0.8),
+              backgroundColor: theme.primaryColor.withValues(alpha: 0.8),
               child: Text(_displayUserName[0].toUpperCase(),
                   style: const TextStyle(fontSize: 9, color: Colors.white))),
           const SizedBox(width: 6),
@@ -1959,8 +1992,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         width: double.infinity,
         height: 44,
         child: OutlinedButton(
-          onPressed:
-              _punchInFlight ? null : () => _registerPunch('check_out'),
+          onPressed: _punchInFlight ? null : () => _registerPunch('check_out'),
           style: buttonStyle,
           child: const Text(
             'FINALIZAR EXPEDIENTE',
@@ -1977,7 +2009,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           Expanded(
             child: OutlinedButton(
               onPressed:
-              _punchInFlight ? null : () => _registerPunch('check_out'),
+                  _punchInFlight ? null : () => _registerPunch('check_out'),
               style: buttonStyle.copyWith(
                 shape: WidgetStateProperty.all(
                   const RoundedRectangleBorder(
@@ -2043,8 +2075,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   child: Text('Nenhum registro encontrado hoje',
                       style: TextStyle(color: Colors.grey, fontSize: 12)))),
         ..._todayRecords.reversed
-            .map((r) => _buildHistoryItem(r, theme, isDark))
-            .toList(),
+            .map((r) => _buildHistoryItem(r, theme, isDark)),
       ],
     );
   }
@@ -2092,7 +2123,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
       decoration: BoxDecoration(
-        color: theme.cardColor.withOpacity(0.5),
+        color: theme.cardColor.withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(10),
       ),
       child: Row(
@@ -2103,8 +2134,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               Container(
                 padding: const EdgeInsets.all(6),
                 decoration: BoxDecoration(
-                  color:
-                      isDark ? Colors.black26 : Colors.black.withOpacity(0.05),
+                  color: isDark
+                      ? Colors.black26
+                      : Colors.black.withValues(alpha: 0.05),
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Icon(icon, color: iconColor, size: 18),

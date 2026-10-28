@@ -1,17 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart' show Uint8List, debugPrint, kIsWeb;
+import 'package:flutter/foundation.dart' show Uint8List, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 import '../services/api_service.dart';
@@ -93,7 +90,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _sendMessage(
       {String? text,
-      String? audioPath,
       Uint8List? audioBytes,
       List<double>? audioLevels}) async {
     final user = _auth.currentUser;
@@ -102,7 +98,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final userDoc = await _db.collection('users').doc(user.uid).get();
     final userName =
         (userDoc.data()?['name'] ?? user.email ?? 'Usuario').toString();
-    final hasAudio = audioPath != null || audioBytes != null;
+    final hasAudio = audioBytes != null;
     final now = DateTime.now().toIso8601String();
     final message = text ?? (hasAudio ? 'Mensagem de audio' : '');
 
@@ -141,8 +137,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }, SetOptions(merge: true));
 
     if (hasAudio) {
-      unawaited(_uploadAudio(docRef.id,
-          audioPath: audioPath, audioBytes: audioBytes));
+      unawaited(_uploadAudio(docRef.id, audioBytes: audioBytes));
     }
 
     if (mounted) {
@@ -252,19 +247,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _uploadAudio(String requestId,
-      {String? audioPath, Uint8List? audioBytes}) async {
+      {Uint8List? audioBytes}) async {
     try {
-      Uint8List bytes;
-      String mimeType;
-      if (kIsWeb && audioBytes != null) {
-        bytes = audioBytes;
-        mimeType = 'audio/webm';
-      } else if (!kIsWeb && audioPath != null) {
-        bytes = await File(audioPath).readAsBytes();
-        mimeType = 'audio/mp4';
-      } else {
-        throw Exception('Audio nao encontrado.');
-      }
+      if (audioBytes == null) throw Exception('Audio nao encontrado.');
+      final bytes = audioBytes;
+      const mimeType = 'audio/webm';
 
       const maxEmbeddedBytes = 700 * 1024;
       if (bytes.length > maxEmbeddedBytes) {
@@ -373,13 +360,8 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _startRecording() async {
-    bool hasPermission;
-    if (kIsWeb) {
-      hasPermission = await _audioRecorder.hasPermission();
-    } else {
-      final status = await Permission.microphone.request();
-      hasPermission = status.isGranted && await _audioRecorder.hasPermission();
-    }
+    // No navegador o proprio pedido de gravacao pede o microfone.
+    final hasPermission = await _audioRecorder.hasPermission();
 
     if (!hasPermission) {
       if (mounted) {
@@ -389,23 +371,17 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    String? path;
-    if (!kIsWeb) {
-      final dir = await getTemporaryDirectory();
-      path =
-          '${dir.path}/adjustment_${DateTime.now().millisecondsSinceEpoch}.m4a';
-    }
-
     await _audioRecorder.start(
       const RecordConfig(
-        encoder: kIsWeb ? AudioEncoder.opus : AudioEncoder.aacLc,
+        encoder: AudioEncoder.opus,
         bitRate: 64000,
         sampleRate: 16000,
         numChannels: 1,
         echoCancel: true,
         noiseSuppress: true,
       ),
-      path: path ?? '',
+      // No navegador a gravacao fica na memoria (blob); o caminho nao vale.
+      path: '',
     );
 
     setState(() {
@@ -486,15 +462,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
     if (path == null) return;
 
-    if (kIsWeb) {
-      final response =
-          await http.get(Uri.parse(path)).timeout(const Duration(seconds: 15));
-      if (response.bodyBytes.isEmpty) return;
-      await _sendMessage(
-          audioBytes: response.bodyBytes, audioLevels: audioLevels);
-    } else {
-      await _sendMessage(audioPath: path, audioLevels: audioLevels);
-    }
+    // No navegador o stop() devolve a URL do blob gravado.
+    final response =
+        await http.get(Uri.parse(path)).timeout(const Duration(seconds: 15));
+    if (response.bodyBytes.isEmpty) return;
+    await _sendMessage(audioBytes: response.bodyBytes, audioLevels: audioLevels);
   }
 
   Future<void> _cancelRecording() async {

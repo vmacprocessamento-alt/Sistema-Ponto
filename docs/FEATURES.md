@@ -4,7 +4,7 @@
 
 ### Autenticação
 - [x] Tela de Login (pelo CPF; "Entrar com e-mail" fica de reserva)
-- [x] Cadastro só pelo admin (Gestão → Usuários → Novo usuário), com senha padrão 123456 e mensagem pronta para mandar (copiar ou WhatsApp); não há mais cadastro pelo app
+- [x] Cadastro só pelo admin (Gestão → Usuários → Novo usuário), com senha temporária aleatória (mostrada uma vez) e mensagem pronta para mandar (copiar ou WhatsApp); não há mais cadastro pelo app
 - [x] Primeiro acesso (ou senha redefinida pelo admin): a pessoa cria a própria senha antes de usar o app
 - [x] Trocar senha pelo Perfil
 - [x] Validação de email

@@ -4,19 +4,21 @@ usuario so pelo admin (sem apagar auditorias) e webhook da ZapSign fechado sem s
     python -m unittest test_seguranca
 """
 import asyncio
+import os
 import types
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from test_work_schedule import _FakeDb, _FakeDocument, main, needs_main
+from test_work_schedule import _FakeDb, _FakeDocument, _FakeQuery, main, needs_main
 
 FUSO = ZoneInfo("America/Sao_Paulo")
 
 
-def _rodar(coro):
-    return asyncio.run(coro)
+def _rodar(resultado):
+    # Endpoint `def` ja devolve o resultado; `async def` devolve a corrotina.
+    return asyncio.run(resultado) if asyncio.iscoroutine(resultado) else resultado
 
 
 @needs_main
@@ -45,6 +47,359 @@ class HoraDaBatidaTest(unittest.TestCase):
             _rodar(main.schedule_controlled_punch_endpoint(payload, self.user))
         self.assertEqual(erro.exception.status_code, 400)
         self.assertEqual(self.db.store.get("time_records", {}), {})
+
+
+class _ContaLeituras:
+    """Conta documentos lidos do Firestore simulado (o que entra na cota do plano gratuito)."""
+
+    def __init__(self, test):
+        self.lidos = 0
+        original = _FakeQuery.stream
+
+        def stream(consulta):
+            for snap in original(consulta):
+                self.lidos += 1
+                yield snap
+
+        patcher = mock.patch.object(_FakeQuery, "stream", stream)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+
+@needs_main
+class MenosLeiturasTest(unittest.TestCase):
+    def setUp(self):
+        self.db = _FakeDb()
+        self.db.store["users"] = {f"u{i}": {"cpf": f"{i:011d}", "cpf_digits": f"{i:011d}"} for i in range(200)}
+        main._backfill_cpf_digits(self.db)  # feito uma vez quando o servidor sobe
+        self.addCleanup(main._cpf_digits_backfilled.clear)
+        self.leituras = _ContaLeituras(self)
+
+    def test_login_le_um_cadastro_nao_todos(self):
+        achados = main._users_with_cpf(self.db, "00000000007", thorough=False)
+        self.assertEqual([d.id for d in achados], ["u7"])
+        self.assertEqual(self.leituras.lidos, 1)
+
+    def test_cadastro_antigo_sem_cpf_digits_e_achado_e_corrigido(self):
+        self.db.store["users"]["velho"] = {"cpf": "529.982.247-25"}
+        self.assertEqual([d.id for d in main._users_with_cpf(self.db, "52998224725", thorough=False)], ["velho"])
+        self.assertEqual(self.db.store["users"]["velho"]["cpf_digits"], "52998224725")
+        self.leituras.lidos = 0
+        main._users_with_cpf(self.db, "52998224725", thorough=False)
+        self.assertEqual(self.leituras.lidos, 1)
+
+    def test_cpf_digits_velho_nao_engana(self):
+        # CPF trocado pelo plano B do app: "cpf" novo, cpf_digits ainda o antigo.
+        self.db.store["users"]["u7"]["cpf"] = "529.982.247-25"
+        self.assertEqual(main._users_with_cpf(self.db, "00000000007", thorough=False), [])
+        self.assertEqual([d.id for d in main._users_with_cpf(self.db, "52998224725", thorough=False)], ["u7"])
+
+    def test_admin_ainda_ve_cpf_repetido_em_cadastro_antigo(self):
+        self.db.store["users"]["velho"] = {"cpf": "000.000.000-07"}
+        self.assertEqual(sorted(d.id for d in main._users_with_cpf(self.db, "00000000007")), ["u7", "velho"])
+
+    def test_horario_efetivo_le_so_os_pedidos_do_dia(self):
+        self.db.store["work_schedule_approval_requests"] = {
+            f"a{i}": {"user_id": "e1", "request_type": "overtime", "day_key": f"2026-09-{i % 28 + 1:02d}",
+                      "status": "approved"} for i in range(80)}
+        with mock.patch.object(main, "get_firestore_admin", return_value=self.db):
+            _rodar(main.get_effective_work_schedule_endpoint(None, {"id": "e1", "role": "intern"}))
+        self.assertLessEqual(self.leituras.lidos, 2)
+
+
+@needs_main
+@unittest.skipIf(main is None or main.firestore is None, "firebase-admin ausente")
+class RespostaViraJsonTest(unittest.TestCase):
+    """Com o SERVER_TIMESTAMP de verdade (sem trocar o firestore por um texto, como os testes acima): a resposta
+    precisa virar JSON. Antes a batida e o pedido de liberacao gravavam e devolviam 500 (28/10/2026)."""
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.intern = {"id": "e1", "role": "intern", "name": "Estagiaria"}
+        patcher = mock.patch.object(main, "get_firestore_admin", return_value=self.db)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _json(self, resposta):
+        from fastapi.encoders import jsonable_encoder
+        return jsonable_encoder(resposta)
+
+    def test_batida_do_estagiario(self):
+        payload = main.SchedulePunchRequest(record_type="check_out", close_at_scheduled_end=False,
+                                            timestamp=datetime.now(FUSO).isoformat())
+        self.db.store["time_records"] = {"in": {"user_id": "u1", "record_type": "check_in",
+                                                "timestamp": main._local_iso(datetime.now(FUSO) - timedelta(hours=1))}}
+        r = _rodar(main.schedule_controlled_punch_endpoint(payload, {"id": "u1", "role": "employee"}))
+        self.assertEqual(self._json(r)["status"], "created")
+        self.assertIs(self.db.store["time_records"][r["id"]]["created_at"], main.firestore.SERVER_TIMESTAMP)
+
+    def test_pedido_de_liberacao(self):
+        self.db.store["time_records"] = {"in": {"user_id": "e1", "record_type": "check_in",
+                                                "timestamp": main._local_iso(datetime.now(FUSO) - timedelta(hours=1))}}
+        payload = main.ScheduleApprovalCreateRequest(request_type="overtime", notes="Fechamento da obra",
+                                                     attempted_at=datetime.now(FUSO).isoformat())
+        r = _rodar(main.create_schedule_approval_request_endpoint(payload, self.intern))
+        self.assertEqual(self._json(r)["status"], "created")
+
+
+@needs_main
+class BloqueioDeLoginTest(unittest.TestCase):
+    """Atras do tunel da Cloudflare todo pedido chega com o mesmo X-Real-IP: a senha errada de uma pessoa nao
+    pode travar o login das outras (28/10/2026)."""
+    TUNEL = "172.18.0.1"
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.db.store["users"] = {"ana": {"cpf": "529.982.247-25"}, "bruno": {"cpf": "111.444.777-35"}}
+        auth = types.SimpleNamespace(get_user=lambda uid: types.SimpleNamespace(email=f"{uid}@x"),
+                                     UserNotFoundError=type("NF", (Exception,), {}))
+
+        async def senha(email, password):
+            return "ok" if password == "certa" else "invalid"
+
+        main._login_failures.clear()
+        for patcher in (mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+                        mock.patch.object(main, "firebase_auth", auth),
+                        mock.patch.object(main, "_check_firebase_password", senha)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(main._login_failures.clear)
+
+    def _login(self, cpf, senha, ip_real):
+        pedido = types.SimpleNamespace(headers={"x-real-ip": self.TUNEL, "cf-connecting-ip": ip_real}, client=None)
+        return _rodar(main.cpf_login_endpoint(main.CpfLoginRequest(cpf=cpf, password=senha), pedido))
+
+    def _errar(self, vezes, ip_real):
+        for _ in range(vezes):
+            with self.assertRaises(main.HTTPException):
+                self._login("52998224725", "errada", ip_real)
+
+    def test_senha_errada_de_uma_pessoa_nao_trava_outra_em_outro_aparelho(self):
+        self._errar(10, "200.1.1.1")
+        self.assertEqual(self._login("11144477735", "certa", "200.2.2.2"), {"email": "bruno@x"})
+
+    def test_mesmo_wifi_do_escritorio(self):
+        self._errar(10, "200.1.1.1")
+        self.assertEqual(self._login("11144477735", "certa", "200.1.1.1"), {"email": "bruno@x"})
+
+    def test_cpf_continua_travando_apos_10_erros(self):
+        self._errar(10, "200.1.1.1")
+        with self.assertRaises(main.HTTPException) as erro:
+            self._login("52998224725", "certa", "200.9.9.9")
+        self.assertEqual(erro.exception.status_code, 429)
+
+
+@needs_main
+class DesempenhoTest(unittest.TestCase):
+    """O Firestore do Admin SDK e bloqueante: nos endpoints `async def` uma batida travava o servidor inteiro e
+    as do pico entravam em fila (30 juntas: a ultima esperava ~10 s). E o token era conferido no Google em toda
+    requisicao, com cliente HTTP novo (28/10/2026)."""
+
+    def test_batidas_simultaneas_nao_esperam_umas_pelas_outras(self):
+        import time
+        import httpx
+
+        lento = 0.2
+        original_get = _FakeDocument.get
+
+        def get_lento(doc):
+            time.sleep(lento)  # o SDK real bloqueia assim enquanto espera o Google
+            return original_get(doc)
+
+        async def usuario():
+            return {"id": "u1", "role": "employee"}
+
+        async def disparar(n):
+            transporte = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(transport=transporte, base_url="http://t") as cliente:
+                pedido = lambda: cliente.post("/work-schedule/punch", json={"record_type": "check_in"})  # noqa: E731
+                inicio = time.perf_counter()
+                respostas = await asyncio.gather(*(pedido() for _ in range(n)))
+                return time.perf_counter() - inicio, respostas
+
+        main.app.dependency_overrides[main.require_authenticated_user] = usuario
+        self.addCleanup(main.app.dependency_overrides.clear)
+        with mock.patch.object(main, "get_firestore_admin", return_value=_FakeDb()), \
+                mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")), \
+                mock.patch.object(_FakeDocument, "get", get_lento):
+            gasto, respostas = asyncio.run(disparar(10))
+        self.assertTrue(all(r.status_code in (200, 409) for r in respostas), [r.status_code for r in respostas])
+        # Em fila: 10 leituras lentas uma apos a outra = 2 s. Em paralelo, perto de uma so.
+        self.assertLess(gasto, 10 * lento / 3)
+
+    def test_token_conferido_uma_vez_e_cliente_reaproveitado(self):
+        chamadas = []
+
+        class Resposta:
+            is_success = True
+
+            def json(self):
+                return {"users": [{"localId": "u1"}]}
+
+        class Cliente:
+            is_closed = False
+
+            async def post(self, *args, **kwargs):
+                chamadas.append(args)
+                return Resposta()
+
+        async def duas_vezes():
+            return [await main.verify_firebase_user_token("tok-abc"), await main.verify_firebase_user_token("tok-abc")]
+
+        main._verified_tokens.clear()
+        self.addCleanup(main._verified_tokens.clear)
+        with mock.patch.object(main, "FIREBASE_WEB_API_KEY", "k"), \
+                mock.patch.object(main, "_http_client", lambda: Cliente()):
+            self.assertEqual(asyncio.run(duas_vezes()), ["u1", "u1"])
+        self.assertEqual(len(chamadas), 1)
+
+    def test_um_cliente_http_por_event_loop(self):
+        async def dois():
+            return main._http_client() is main._http_client()
+
+        self.assertTrue(asyncio.run(dois()))
+
+
+@needs_main
+class ArquivoExportadoApagadoTest(unittest.TestCase):
+    """Folha, lote e relatorio exportados ficavam no /tmp do servidor para sempre (28/10/2026)."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        async def usuario():
+            return {"id": "a1", "role": "admin"}
+
+        main.app.dependency_overrides[main.require_authenticated_user] = usuario
+        self.addCleanup(main.app.dependency_overrides.clear)
+        self.cliente = TestClient(main.app)
+        self.dados = {"employee_name": "Fulano", "employee_role": "Aux", "cpf": "1", "month": "10", "year": "2026",
+                      "is_campo": False, "daily_records": []}
+        self.gerados = []
+        for nome in ("generate_excel_file", "generate_batch_html_file"):
+            original = getattr(main, nome)
+
+            def anotar(*args, _original=original, **kwargs):
+                caminho = _original(*args, **kwargs)
+                self.gerados.append(caminho)
+                return caminho
+
+            patcher = mock.patch.object(main, nome, anotar)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _exportar(self, rota, corpo):
+        try:
+            resposta = self.cliente.post(rota, json=corpo)
+        except FileNotFoundError as exc:  # modelo do Excel fora do lugar nesta maquina
+            self.skipTest(str(exc))
+        if resposta.status_code == 500 and "No such file" in resposta.text:
+            self.skipTest(resposta.text)
+        self.assertEqual(resposta.status_code, 200, resposta.text)
+        self.assertGreater(len(resposta.content), 0)
+        self.assertTrue(self.gerados)
+        for caminho in self.gerados:
+            self.assertFalse(os.path.exists(caminho), caminho)
+
+    def test_folha_excel(self):
+        self._exportar("/export-excel", self.dados)
+
+    def test_lote_zip(self):
+        import zipfile
+        with mock.patch.object(main.zipfile, "ZipFile", wraps=zipfile.ZipFile) as zip_criado:
+            self._exportar("/export-batch", [self.dados])
+        self.assertFalse(os.path.exists(os.path.dirname(zip_criado.call_args[0][0])))
+
+    def test_relatorio_html(self):
+        self._exportar("/export-batch-html", [self.dados])
+
+
+@needs_main
+class BatidaPeloBackendTest(unittest.TestCase):
+    """Quem nao e estagiario batia direto no Firestore com a hora do celular, e as regras aceitavam qualquer
+    horario (ponto retroativo). Agora a batida passa por /time-records/punch (28/10/2026)."""
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.user = {"id": "u1", "role": "employee", "name": "Fulano"}
+        for patcher in (mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+                        mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts"))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ids = iter(f"rec{i:05d}abc" for i in range(1000))
+
+    def _agora(self, **delta):
+        return datetime.now(FUSO) + timedelta(**delta)
+
+    def _ponto(self, tipo, quando, doc_id=None):
+        self.db.store.setdefault("time_records", {})[doc_id or next(self.ids)] = {
+            "user_id": "u1", "record_type": tipo, "timestamp": main._local_iso(quando)}
+
+    def _bater(self, tipo, quando=None, user=None, **extra):
+        payload = main.TimeRecordPunchRequest(record_type=tipo, client_record_id=extra.pop("cid", next(self.ids)),
+                                              timestamp=(quando or self._agora()).isoformat(), **extra)
+        return _rodar(main.time_record_punch_endpoint(payload, user or self.user))
+
+    def _status(self, *args, **kwargs):
+        with self.assertRaises(main.HTTPException) as erro:
+            self._bater(*args, **kwargs)
+        return erro.exception.status_code
+
+    def test_online_vale_a_hora_do_servidor(self):
+        r = self._bater("check_in", self._agora(minutes=-10))
+        gravada = datetime.fromisoformat(r["timestamp"]).replace(tzinfo=FUSO)
+        self.assertLess(abs((gravada - self._agora()).total_seconds()), 60)
+        self.assertIn("device_timestamp", r)
+
+    def test_ponto_retroativo_online_recusado(self):
+        self.assertEqual(self._status("check_in", self._agora(days=-5)), 400)
+        self.assertEqual(self.db.store.get("time_records", {}), {})
+
+    def test_offline_aceita_ate_7_dias(self):
+        r = self._bater("check_in", self._agora(days=-5), offline=True)
+        self.assertTrue(r["synced_from_offline"])
+        self.assertEqual(self._status("check_in", self._agora(days=-8), offline=True), 400)
+        self.assertEqual(self._status("check_out", self._agora(hours=2), offline=True), 400)  # futuro
+
+    def test_regras_de_turno(self):
+        self.assertEqual(self._status("check_out"), 409)
+        self._bater("check_in")
+        self.assertEqual(self._status("check_in"), 409)
+        self.assertEqual(self._bater("break_start")["record_type"], "break_start")
+        self.assertEqual(self._bater("check_out")["status"], "created")
+
+    def test_entrada_offline_fecha_turno_velho_esquecido(self):
+        self._ponto("check_in", self._agora(days=-3), "velha")
+        self._bater("check_in", self._agora(hours=-1), offline=True)
+        saida = self.db.store["time_records"]["forgot_velha"]
+        self.assertEqual(saida["record_type"], "check_out")
+
+    def test_saida_esquecida_calculada_no_servidor(self):
+        inicio = self._agora(days=-1)
+        self._ponto("check_in", inicio, "entradaX1")
+        r = self._bater("check_out", self._agora(), kind="forgotten_exit", ref_record_id="entradaX1")
+        self.assertEqual(r["id"], "forgot_entradaX1")
+        self.assertEqual(r["timestamp"], main._local_iso(inicio + timedelta(seconds=1)))
+        self.assertEqual(self._bater("check_out", kind="forgotten_exit", cid="outroid123", ref_record_id="entradaX1")["id"], "forgot_entradaX1")
+
+    def test_fechamento_automatico_da_pausa(self):
+        self._ponto("check_in", self._agora(hours=-6))
+        self._ponto("break_start", self._agora(hours=-1), "pausaRecente")
+        self.assertEqual(self._status("break_end", kind="auto_break_close", ref_record_id="pausaRecente"), 409)
+        inicio = self._agora(hours=-4)
+        self.db.store["time_records"]["pausaRecente"]["timestamp"] = main._local_iso(inicio)
+        r = self._bater("break_end", kind="auto_break_close", ref_record_id="pausaRecente")
+        self.assertEqual(r["id"], "autoclose_pausaRecente")
+        self.assertEqual(r["timestamp"], main._local_iso(inicio + timedelta(hours=1)))
+        self.assertTrue(r["auto_closed"])
+
+    def test_reenvio_devolve_o_mesmo_ponto(self):
+        primeiro = self._bater("check_in", cid="mesmoid123")
+        self.assertEqual(self._bater("check_in", cid="mesmoid123")["id"], primeiro["id"])
+        self.assertEqual(len(self.db.store["time_records"]), 1)
+
+    def test_estagiario_entra_pelo_horario_controlado(self):
+        self.assertEqual(self._status("check_in", user={"id": "e1", "role": "intern"}), 400)
 
 
 @needs_main

@@ -8,6 +8,7 @@ import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import 'monthly_dashboard_screen.dart';
+import '../utils/screen_watch.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -49,7 +50,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     super.initState();
     _fetchInitialData();
     _timer = Timer.periodic(const Duration(seconds: 30), (timer) {
-      if (mounted) {
+      if (mounted && isScreenWatched(context)) {
         setState(() => _now = DateTime.now());
         _fetchDashboardData();
       }
@@ -431,18 +432,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
             height: 40,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: wineColor.withOpacity(0.45)),
+              border: Border.all(color: wineColor.withValues(alpha: 0.45)),
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
                 colors: [
-                  wineColor.withOpacity(isDark ? 0.30 : 0.10),
-                  wineColor.withOpacity(0.02),
+                  wineColor.withValues(alpha: isDark ? 0.30 : 0.10),
+                  wineColor.withValues(alpha: 0.02),
                 ],
               ),
               boxShadow: [
                 BoxShadow(
-                  color: wineColor.withOpacity(isDark ? 0.35 : 0.18),
+                  color: wineColor.withValues(alpha: isDark ? 0.35 : 0.18),
                   blurRadius: 10,
                   spreadRadius: -2,
                 ),
@@ -464,7 +465,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: DropdownButtonFormField<dynamic>(
-        value: _selectedUser?['id'],
+        // initialValue so vale na criacao: a chave recria o campo quando
+        // a selecao muda pelo codigo (recarga volta ao primeiro da lista).
+        key: ValueKey(_selectedUser?['id']),
+        initialValue: _selectedUser?['id'],
         dropdownColor: Theme.of(context).cardColor,
         decoration: InputDecoration(
           labelText: 'Selecionar Funcionário',
@@ -569,7 +573,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget _buildCard(String title, String value, String sub,
       {bool isPrimary = false}) {
     final cardColor =
-        isPrimary ? wineColor.withOpacity(0.1) : Theme.of(context).cardColor;
+        isPrimary ? wineColor.withValues(alpha: 0.1) : Theme.of(context).cardColor;
     final textColor = Theme.of(context).textTheme.bodyLarge?.color;
 
     return Expanded(
@@ -579,7 +583,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           color: cardColor,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
-              color: isPrimary ? wineColor : Colors.white.withOpacity(0.05),
+              color: isPrimary ? wineColor : Colors.white.withValues(alpha: 0.05),
               width: 1),
         ),
         child: Column(
@@ -612,7 +616,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -673,21 +677,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             ? Colors.orange
                             : (type == 3
                                 ? Colors.blue
-                                : Colors.blue.withOpacity(0.4)),
+                                : Colors.blue.withValues(alpha: 0.4)),
                         width: 6,
                         borderRadius: BorderRadius.circular(1),
                       ),
                     ],
                   );
                 }),
-                gridData: FlGridData(show: false),
+                gridData: const FlGridData(show: false),
                 titlesData: FlTitlesData(
                   leftTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   topTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   rightTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   bottomTitles: AxisTitles(
                     sideTitles: SideTitles(
                       showTitles: true,
@@ -714,7 +718,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           const SizedBox(height: 12),
           Row(
             children: [
-              _buildLegend(Colors.blue.withOpacity(0.4), 'Trabalhado'),
+              _buildLegend(Colors.blue.withValues(alpha: 0.4), 'Trabalhado'),
               const SizedBox(width: 12),
               _buildLegend(Colors.orange, 'Pausa'),
               const SizedBox(width: 12),
@@ -778,7 +782,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -801,29 +805,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     barRods: [
                       BarChartRodData(
                         toY: hours > 0 ? hours : 0.1,
-                        color: wineColor.withOpacity(0.8),
+                        color: wineColor.withValues(alpha: 0.8),
                         width: 10,
                         borderRadius: BorderRadius.circular(2),
                         backDrawRodData: BackgroundBarChartRodData(
                           show: true,
                           toY: 10,
                           color: Theme.of(context).brightness == Brightness.dark
-                              ? Colors.white.withOpacity(0.03)
-                              : Colors.black.withOpacity(0.03),
+                              ? Colors.white.withValues(alpha: 0.03)
+                              : Colors.black.withValues(alpha: 0.03),
                         ),
                       ),
                     ],
                     showingTooltipIndicators: [0],
                   );
                 }),
-                gridData: FlGridData(show: false),
+                gridData: const FlGridData(show: false),
                 titlesData: FlTitlesData(
                   leftTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   topTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   rightTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   bottomTitles: AxisTitles(
                     sideTitles: SideTitles(
                       showTitles: true,
@@ -899,7 +903,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -920,8 +924,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   strokeWidth: 6,
                   backgroundColor:
                       Theme.of(context).brightness == Brightness.dark
-                          ? Colors.white.withOpacity(0.03)
-                          : Colors.black.withOpacity(0.03),
+                          ? Colors.white.withValues(alpha: 0.03)
+                          : Colors.black.withValues(alpha: 0.03),
                   color: wineColor,
                 ),
               ),
@@ -945,7 +949,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
-                              color: Colors.orange.withOpacity(0.2),
+                              color: Colors.orange.withValues(alpha: 0.2),
                               borderRadius: BorderRadius.circular(20)),
                           child: const Text('ATENÇÃO',
                               style: TextStyle(

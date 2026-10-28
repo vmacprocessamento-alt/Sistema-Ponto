@@ -5,21 +5,18 @@ import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show debugPrint, kIsWeb;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_config.dart';
-import 'session_service.dart';
 import '../utils/chat_timestamp.dart';
 import '../utils/cpf.dart';
 import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
-import '../utils/work_schedule_rules.dart';
 
 class AdjustmentRequestResult {
   final String id;
@@ -44,6 +41,19 @@ class PunchRejectedException implements Exception {
   /// Recusada so por falta da liberacao do gestor: com a liberacao, a mesma
   /// batida passa.
   final bool awaitingApproval;
+
+  @override
+  String toString() => 'Exception: $message';
+}
+
+/// Backend fora do ar (404/5xx) numa batida: a batida vai para a fila
+/// offline e a sincronizacao reenvia pelo backend. Antes o app gravava pelo
+/// plano B direto no Firestore; com as regras fechadas (so o backend e o
+/// lote do gestor gravam ponto) esse caminho nao existe mais.
+class ServerUnavailableException implements Exception {
+  const ServerUnavailableException(this.message);
+
+  final String message;
 
   @override
   String toString() => 'Exception: $message';
@@ -90,6 +100,13 @@ class ApiService {
     }
     return {'Authorization': 'Bearer $token'};
   }
+
+  /// O backend falhou (404/5xx) e a operacao segue pelo plano B direto no
+  /// Firestore. Fica registrado: foi um plano B silencioso que escondeu por
+  /// meses o erro 500 em toda batida de estagiario.
+  void _logPlanB(http.Response response) => debugPrint(
+      'Plano B pelo Firestore: ${response.request?.method} '
+      '${response.request?.url.path} respondeu ${response.statusCode}');
 
   String _apiError(http.Response response) {
     try {
@@ -206,6 +223,9 @@ class ApiService {
       'job_title': jobTitle.trim(),
       'daily_hours': dailyHours,
       'cpf': cpf.trim(),
+      // O login por CPF procura por este campo: sem ele, a troca de CPF por
+      // aqui deixava o backend buscando pelo CPF antigo.
+      'cpf_digits': cpfDigits(cpf),
       'disabled': disabled,
       'work_schedule_override_enabled': workScheduleOverrideEnabled,
       'work_schedule_override':
@@ -352,9 +372,9 @@ class ApiService {
   // --- MÉTODOS DE AJUSTE (CHAT INTERNO) ---
 
   Future<AdjustmentRequestResult> createAdjustmentRequest(
-      {String? text, String? audioPath, Uint8List? audioBytes}) async {
+      {String? text, Uint8List? audioBytes}) async {
     final user = await getCurrentUser();
-    final hasAudio = audioPath != null || audioBytes != null;
+    final hasAudio = audioBytes != null;
 
     try {
       final docRef = await _db.collection('adjustment_requests').add({
@@ -373,7 +393,6 @@ class ApiService {
       if (hasAudio) {
         unawaited(_uploadAndAttachAdjustmentAudio(
           requestId: docRef.id,
-          audioPath: audioPath,
           audioBytes: audioBytes,
         ));
       }
@@ -388,21 +407,13 @@ class ApiService {
 
   Future<void> _uploadAndAttachAdjustmentAudio({
     required String requestId,
-    String? audioPath,
     Uint8List? audioBytes,
   }) async {
     try {
-      String audioUrl;
-      if (kIsWeb && audioBytes != null) {
-        debugPrint(
-            'ApiService: Iniciando upload áudio Web (${audioBytes.length} bytes)');
-        audioUrl = await uploadAdjustmentAudioWeb(audioBytes);
-      } else if (!kIsWeb && audioPath != null) {
-        debugPrint('ApiService: Iniciando upload áudio Mobile ($audioPath)');
-        audioUrl = await uploadAdjustmentAudioMobile(audioPath);
-      } else {
-        throw Exception('Áudio não encontrado para upload.');
-      }
+      if (audioBytes == null) throw Exception('Áudio não encontrado para upload.');
+      debugPrint(
+          'ApiService: Iniciando upload áudio (${audioBytes.length} bytes)');
+      final audioUrl = await uploadAdjustmentAudioWeb(audioBytes);
 
       await _db.collection('adjustment_requests').doc(requestId).update({
         'audio_url': audioUrl,
@@ -414,17 +425,6 @@ class ApiService {
       if (audioBytes != null &&
           await _embedAudioInRequest(requestId, audioBytes, 'audio/webm')) {
         return;
-      }
-
-      if (audioPath != null && !kIsWeb) {
-        try {
-          final bytes = await File(audioPath).readAsBytes();
-          if (await _embedAudioInRequest(requestId, bytes, 'audio/mp4')) {
-            return;
-          }
-        } catch (fileError) {
-          debugPrint('Erro ao ler áudio local para fallback: $fileError');
-        }
       }
 
       try {
@@ -461,16 +461,6 @@ class ApiService {
       debugPrint('Erro ao embutir áudio no Firestore: $e');
       return false;
     }
-  }
-
-  Future<String> uploadAdjustmentAudioMobile(String filePath) async {
-    final user = _auth.currentUser;
-    if (user == null) throw Exception('Usuário não logado');
-
-    final ref = _storage.ref().child(
-        'adjustments/${user.uid}/${DateTime.now().millisecondsSinceEpoch}.m4a');
-    await ref.putFile(File(filePath)).timeout(const Duration(seconds: 45));
-    return await ref.getDownloadURL();
   }
 
   Future<String> uploadAdjustmentAudioWeb(Uint8List bytes) async {
@@ -577,9 +567,10 @@ class ApiService {
 
   // --- MÉTODOS DE AUTH ---
 
-  /// Senha com que o admin cadastra (e redefine) a conta. No primeiro acesso
-  /// a pessoa cria a propria (must_change_password).
-  static const String defaultUserPassword = '123456';
+  /// Senha com que as contas eram criadas ate 28/10/2026. Hoje o backend gera
+  /// uma temporaria aleatoria a cada cadastro ou redefinicao; esta nao vale
+  /// mais como senha nova.
+  static const String legacyDefaultPassword = '123456';
 
   /// Login pelo CPF: o backend confere a senha e devolve o e-mail da conta
   /// no Firebase (o de verdade ou o interno do CPF), e o login segue por ele.
@@ -648,7 +639,6 @@ class ApiService {
       };
       await _cacheCurrentUser(
           Map<String, dynamic>.from(response['user'] as Map));
-      await SessionService.saveCredentials(email, password);
       return response;
     } on FirebaseAuthException catch (e) {
       // Mapeamento de erros amigáveis para o usuário
@@ -734,7 +724,6 @@ class ApiService {
       try {
         await _auth.signInWithEmailAndPassword(
             email: email, password: newPassword);
-        await SessionService.saveCredentials(email, newPassword);
       } catch (e) {
         debugPrint('Senha trocada; novo login fica para a proxima abertura: $e');
       }
@@ -780,9 +769,6 @@ class ApiService {
   Future<void> clearToken() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_cachedUserKey);
-    // Precisa vir antes do signOut: e o unico ponto que encerra a sessao
-    // permanente, senao o app se relogaria sozinho na proxima abertura.
-    await SessionService.clearCredentials();
     await _auth.signOut();
   }
 
@@ -897,47 +883,6 @@ class ApiService {
   /// reaparecendo a cada leitura.
   Future<void> clearOfflineRecords() async {
     await _replaceOfflineRecords([]);
-  }
-
-  /// Ponto [recordId] lido direto do servidor, ou null (nao existe, e de
-  /// outro usuario ou nao deu para ler).
-  Future<Map<String, dynamic>?> _serverTimeRecord(String recordId) async {
-    try {
-      final snapshot = await _db
-          .collection('time_records')
-          .doc(recordId)
-          .get(const GetOptions(source: Source.server))
-          .timeout(const Duration(seconds: 15));
-      final data = snapshot.data();
-      if (!snapshot.exists || data == null) return null;
-      return {'id': snapshot.id, ...data};
-    } catch (e) {
-      debugPrint('Nao deu para conferir o ponto $recordId no servidor: $e');
-      return null;
-    }
-  }
-
-  Future<bool> _recordExistsOnServer(String recordId) async =>
-      await _serverTimeRecord(recordId) != null;
-
-  /// Grava um ponto com id fixo. O SDK do Firestore continua tentando uma
-  /// escrita anterior em segundo plano (e, com o cache local ligado, ate
-  /// depois de fechar o app), e o backend grava a pausa automatica com o mesmo
-  /// id. Quando o documento ja existe, o set() vira um UPDATE, que as regras
-  /// so permitem ao admin: permission-denied. O ponto ja esta no servidor;
-  /// sem esta checagem ele ficava preso na fila para sempre.
-  Future<void> _setNewTimeRecord(
-      String recordId, Map<String, dynamic> data) async {
-    try {
-      await _db
-          .collection('time_records')
-          .doc(recordId)
-          .set(data)
-          .timeout(const Duration(seconds: 15));
-    } catch (e) {
-      if (!await _recordExistsOnServer(recordId)) rethrow;
-      debugPrint('Ponto $recordId ja estava no servidor.');
-    }
   }
 
   /// Id novo de documento de time_records, gerado no aparelho (sem rede).
@@ -1143,26 +1088,11 @@ class ApiService {
             debugPrint('Registro offline sem identificador.');
             continue;
           }
-          if (recordType == 'check_in') {
-            await _closeForgottenShiftBefore(
-                userId, record['timestamp']?.toString() ?? '');
-          }
-
-          final firestoreData = Map<String, dynamic>.from(record)
-            ..remove('id')
-            ..remove('offline')
-            ..remove('sync_status')
-            ..remove('sync_error')
-            ..remove('sync_awaiting_approval')
-            ..remove('sync_refused_at')
-            ..remove('close_at_scheduled_end')
-            ..remove('created_at_local');
-
-          firestoreData['created_at'] = FieldValue.serverTimestamp();
-          firestoreData['synced_from_offline'] = true;
-
-          await _setNewTimeRecord(recordId, firestoreData);
-          await _cacheSentRecord({'id': recordId, ...firestoreData});
+          // Pelo backend, com a hora do aparelho no momento da batida (no
+          // maximo 7 dias). A entrada com um turno velho aberto antes dela
+          // fecha esse turno como saida esquecida la (o app fazia isso
+          // gravando direto no Firestore).
+          await _cacheSentRecord(await _sendPunch(record, offline: true));
         }
         syncedCount++;
         syncedKeys.add(key);
@@ -1183,55 +1113,26 @@ class ApiService {
     return syncedCount;
   }
 
-  /// Antes de gravar uma entrada que estava na fila (ponto direto no
-  /// Firestore, sem a trava de turno aberto do backend): se o servidor mostra
-  /// um turno ainda aberto antes dela, fecha esse turno como saida esquecida,
-  /// 1s depois da entrada dele. Sem isso a entrada nova caia dentro do turno
-  /// velho e o dia pagava as horas entre os dois. Uma falha na leitura
-  /// propaga: a entrada fica na fila para a proxima tentativa.
-  Future<void> _closeForgottenShiftBefore(
-      String userId, String timestamp) async {
-    final at = DateTime.tryParse(timestamp);
-    if (at == null) return;
-    // Mesma janela de 14 dias da tela de ponto e do backend.
-    final snapshot = await _db
-        .collection('time_records')
-        .where('user_id', isEqualTo: userId)
-        .where('timestamp',
-            isGreaterThanOrEqualTo:
-                at.subtract(const Duration(days: 14)).toIso8601String())
-        .where('timestamp', isLessThan: timestamp)
-        .get(const GetOptions(source: Source.server))
-        .timeout(const Duration(seconds: 15));
-    final open = openShiftCheckIn(
-        snapshot.docs.map((doc) => {'id': doc.id, ...doc.data()}));
-    final openId = open?['id']?.toString() ?? '';
-    final openAt = DateTime.tryParse(open?['timestamp']?.toString() ?? '');
-    if (openId.isEmpty || openAt == null) return;
-    final forgot = {
-      'user_id': userId,
-      'record_type': 'check_out',
-      'location': 'App (saida esquecida)',
-      'notes': 'Saida esquecida (fechada na sincronizacao): o gestor precisa '
-          'lancar o horario real',
-      'timestamp': openAt.add(const Duration(seconds: 1)).toIso8601String(),
-      'latitude': null,
-      'longitude': null,
-      'created_at': FieldValue.serverTimestamp(),
-    };
-    await _setNewTimeRecord('forgot_$openId', forgot);
-    await _cacheSentRecord({'id': 'forgot_$openId', ...forgot});
-    debugPrint('Turno $openId fechado como saida esquecida na sincronizacao.');
-  }
-
   // Calculo da folha (arredondamento, feriados, turnos e classificacao das
   // horas): utils/timesheet.dart.
 
   // --- MÉTODOS DE DADOS ---
 
-  /// [recordId]: id fixo do documento (ex.: "autoclose_<id da pausa>",
-  /// "forgot_<id da entrada>"), para a mesma batida nunca virar dois pontos.
-  /// Sem ele, um id novo. [extraFields] entra junto no ponto.
+  /// Batida da propria pessoa ([userId] nulo): vai pelo backend
+  /// (/time-records/punch), que vale a hora do servidor online e no maximo 7
+  /// dias de atraso offline. Sem internet ou com o backend fora, entra na fila
+  /// offline e a sincronizacao reenvia pelo mesmo endpoint. Antes gravava
+  /// direto no Firestore com a hora do celular, e as regras aceitavam ponto
+  /// com qualquer horario.
+  ///
+  /// [punchKind]: "forgotten_exit" (fecha o turno [refRecordId] sem horas) ou
+  /// "auto_break_close" (fecha a pausa [refRecordId], aberta ha 3h+, com 1h).
+  /// O servidor calcula a hora e o id dessas; [timestamp] so serve para a
+  /// tela enquanto a batida espera na fila.
+  ///
+  /// [userId] (lote do gestor, inclusive para o proprio gestor): grava direto
+  /// no Firestore, que as regras so permitem a admin e gestor. [extraFields]
+  /// entra junto nesse caso.
   Future<Map<String, dynamic>> createTimeRecord({
     required String recordType,
     String? location,
@@ -1240,7 +1141,8 @@ class ApiService {
     String? userId,
     double? latitude,
     double? longitude,
-    String? recordId,
+    String? punchKind,
+    String? refRecordId,
     Map<String, dynamic>? extraFields,
   }) async {
     final currentUser = _auth.currentUser;
@@ -1250,77 +1152,123 @@ class ApiService {
       throw Exception(
           'Faca login com internet uma vez antes de registrar offline.');
     }
-
-    final targetUid = userId ?? currentUserId;
     final now = DateTime.now();
     final recordTimestamp = timestamp ?? now.toIso8601String();
-    final recordData = {
-      'user_id': targetUid,
+
+    if (userId != null) {
+      final recordData = {
+        'user_id': userId,
+        'record_type': recordType,
+        'location': location ?? 'App',
+        'notes': notes,
+        'timestamp': recordTimestamp,
+        'latitude': latitude,
+        'longitude': longitude,
+        if (userId != currentUserId) 'created_by_admin': true,
+        ...?extraFields,
+      };
+      final docRef = _db.collection('time_records').doc();
+      await docRef.set({
+        ...recordData,
+        'created_at': FieldValue.serverTimestamp(),
+      }).timeout(const Duration(seconds: 10));
+      if (userId == currentUserId) {
+        await _appendCachedTimeRecord(
+            currentUserId, {'id': docRef.id, ...recordData});
+      }
+      return {'id': docRef.id, ...recordData};
+    }
+
+    // Id gerado ANTES do envio: se a resposta se perder, o reenvio da fila
+    // com o mesmo id devolve o ponto gravado em vez de duplicar.
+    final punch = <String, dynamic>{
+      'id': newTimeRecordId(),
+      'user_id': currentUserId,
       'record_type': recordType,
       'location': location ?? 'App',
       'notes': notes,
       'timestamp': recordTimestamp,
       'latitude': latitude,
       'longitude': longitude,
-      if (userId != null && userId != currentUserId) 'created_by_admin': true,
-      ...?extraFields,
+      if (punchKind != null) 'punch_kind': punchKind,
+      if (refRecordId != null) 'ref_record_id': refRecordId,
     };
-
-    // Id gerado localmente ANTES de escrever. O timeout abaixo nao cancela a
-    // escrita: o SDK do Firestore continua tentando em background. Se a fila
-    // offline usasse outro id, o mesmo toque viraria dois registros iguais
-    // (era a origem das pausas duplicadas no mesmo segundo). Com id fixo, a
-    // sincronizacao offline regrava o mesmo documento.
-    final docRef = _db.collection('time_records').doc(recordId);
-
-    try {
-      if (currentUser == null) {
-        throw Exception('Sem sessao online.');
+    if (currentUser != null && await _hasNetworkConnection()) {
+      try {
+        final result = await _sendPunch(punch, offline: false);
+        await _cacheSentRecord(result);
+        return result;
+      } catch (e) {
+        // Recusa do servidor (turno ja aberto...) aparece na tela; so a falta
+        // de rede ou o backend fora do ar vao para a fila.
+        if (!isNetworkFailure(e)) rethrow;
+        debugPrint('Backend inacessivel, guardando ponto na fila: $e');
       }
-      if (!await _hasNetworkConnection()) {
-        throw Exception('Sem conexao de rede.');
-      }
-
-      await docRef.set({
-        ...recordData,
-        'created_at': FieldValue.serverTimestamp(),
-      }).timeout(const Duration(seconds: 10));
-      if (targetUid == currentUserId) {
-        await _appendCachedTimeRecord(
-            currentUserId, {'id': docRef.id, ...recordData});
-      }
-      return {'id': docRef.id, ...recordData};
-    } catch (e) {
-      if (userId != null && userId != currentUserId) rethrow;
-
-      // Id fixo e permission-denied: as regras so deixam CRIAR, entao quase
-      // sempre e o documento que ja existe (outra tentativa, outro aparelho
-      // ou o job do backend gravou o mesmo ponto). Vale o que esta la; na
-      // fila ele apareceria como pendente sem nada para enviar.
-      if (recordId != null &&
-          e is FirebaseException &&
-          e.code == 'permission-denied') {
-        final existing = await _serverTimeRecord(recordId);
-        if (existing != null) {
-          if (targetUid == currentUserId) {
-            await _appendCachedTimeRecord(currentUserId, existing);
-          }
-          return existing;
-        }
-      }
-
-      final offlineRecord = {
-        'id': docRef.id,
-        ...recordData,
-        'offline': true,
-        'sync_status': 'pending',
-        'created_at_local': now.toIso8601String(),
-      };
-      await _saveOfflineRecord(offlineRecord);
-      debugPrint(
-          'Ponto salvo offline para sincronizar depois: ${offlineRecord['id']}');
-      return offlineRecord;
     }
+    final offlineRecord = {
+      ...punch,
+      'offline': true,
+      'sync_status': 'pending',
+      'created_at_local': now.toIso8601String(),
+    };
+    await _saveOfflineRecord(offlineRecord);
+    debugPrint(
+        'Ponto salvo offline para sincronizar depois: ${offlineRecord['id']}');
+    return offlineRecord;
+  }
+
+  /// Envia [punch] (formato da fila) a /time-records/punch. Recusa da regra:
+  /// PunchRejectedException. Backend fora: ServerUnavailableException.
+  Future<Map<String, dynamic>> _sendPunch(Map<String, dynamic> punch,
+      {required bool offline}) async {
+    final id = punch['id']?.toString() ?? '';
+    // Fila antiga (antes do backend): o tipo especial vinha so no id.
+    var kind = punch['punch_kind']?.toString();
+    var ref = punch['ref_record_id']?.toString();
+    for (final prefix in const {
+      'autoclose_': 'auto_break_close',
+      'forgot_': 'forgotten_exit'
+    }.entries) {
+      if (kind == null && id.startsWith(prefix.key)) {
+        kind = prefix.value;
+        ref = id.substring(prefix.key.length);
+      }
+    }
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/time-records/punch'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'record_type': punch['record_type'],
+            'client_record_id':
+                _clientRecordIdPattern.hasMatch(id) ? id : newTimeRecordId(),
+            'timestamp': punch['timestamp'],
+            'offline': offline,
+            'location': punch['location'],
+            'notes': punch['notes'],
+            'latitude': (punch['latitude'] as num?)?.toDouble(),
+            'longitude': (punch['longitude'] as num?)?.toDouble(),
+            if (kind != null) 'kind': kind,
+            if (ref != null) 'ref_record_id': ref,
+          }),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode == 404 || response.statusCode >= 500) {
+      throw ServerUnavailableException(_apiError(response));
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      // 401, 403, 408 e 429 podem passar na proxima tentativa; o resto dos
+      // 4xx e a regra recusando a batida.
+      if (const {401, 403, 408, 429}.contains(response.statusCode)) {
+        throw Exception(_apiError(response));
+      }
+      throw PunchRejectedException(_apiError(response));
+    }
+    return Map<String, dynamic>.from(
+        jsonDecode(utf8.decode(response.bodyBytes)) as Map);
   }
 
   /// Guarda o ponto na fila local SEM tentar o servidor.
@@ -1376,7 +1324,11 @@ class ApiService {
   /// Erro de rede (sem sinal, DNS, timeout), em oposicao a uma resposta do
   /// servidor recusando o pedido.
   static bool isNetworkFailure(Object error) {
-    if (error is TimeoutException || error is http.ClientException) return true;
+    if (error is TimeoutException ||
+        error is http.ClientException ||
+        error is ServerUnavailableException) {
+      return true;
+    }
     // Sem sinal, a renovacao do token (expira em 1h) falha antes de qualquer
     // pedido HTTP: era o caso mais comum de batida offline do estagiario, e
     // ela se perdia em vez de entrar na fila.
@@ -2098,8 +2050,8 @@ class ApiService {
     return users;
   }
 
-  /// Admin cadastra uma pessoa: ela entra com o CPF e a senha padrao
-  /// ([defaultUserPassword]) e cria a propria no primeiro acesso. Sem
+  /// Admin cadastra uma pessoa: ela entra com o CPF e a senha temporaria
+  /// (gerada pelo backend, em temporary_password) e cria a propria no primeiro acesso. Sem
   /// [email], a conta usa um e-mail interno tirado do CPF.
   Future<Map<String, dynamic>> createUserAdmin({
     required String name,
@@ -2146,6 +2098,7 @@ class ApiService {
     required String cpf,
     bool disabled = false,
     String? newPassword,
+    bool resetPassword = false,
     bool workScheduleOverrideEnabled = false,
     Map<String, dynamic>? workScheduleOverride,
     bool dailyMode = false,
@@ -2166,6 +2119,8 @@ class ApiService {
             'cpf': cpf,
             'disabled': disabled,
             'new_password': newPassword,
+            // O backend gera a senha temporaria e devolve em temporary_password.
+            'reset_password': resetPassword,
             'work_schedule_override_enabled': workScheduleOverrideEnabled,
             'work_schedule_override': workScheduleOverride,
             'daily_mode': dailyMode,
@@ -2174,6 +2129,7 @@ class ApiService {
         .timeout(const Duration(seconds: 45));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _updateUserAdminInFirestore(
           userId.toString(),
           name: name,
@@ -2183,7 +2139,9 @@ class ApiService {
           dailyHours: dailyHours,
           cpf: cpf,
           disabled: disabled,
-          newPassword: newPassword,
+          // Senha temporaria so o backend gera: o plano B recusa como a
+          // senha digitada.
+          newPassword: resetPassword ? 'senha temporaria' : newPassword,
           workScheduleOverrideEnabled: workScheduleOverrideEnabled,
           workScheduleOverride: workScheduleOverride,
           dailyMode: dailyMode,
@@ -2205,6 +2163,7 @@ class ApiService {
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         final user = _auth.currentUser;
         if (user == null) return [];
         // So as nao lidas: e o unico que o sininho exibe, e a colecao so cresce.
@@ -2237,6 +2196,7 @@ class ApiService {
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         final user = _auth.currentUser;
         if (user == null) return;
         // Le so o que precisa mudar, em vez da caixa inteira do usuario.
@@ -2386,19 +2346,10 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
-        final result = await _createScheduleControlledPunchInFirestore(
-          recordType: recordType,
-          timestamp: timestamp,
-          location: location,
-          notes: notes,
-          latitude: latitude,
-          longitude: longitude,
-          closeAtScheduledEnd: closeAtScheduledEnd,
-          clientRecordId: clientRecordId,
-          offline: offline,
-        );
-        if (result['status'] == 'created') await _cacheSentRecord(result);
-        return result;
+        _logPlanB(response);
+        // A tela guarda na fila (isNetworkFailure) e a sincronizacao reenvia
+        // pelo backend, com as regras de horario.
+        throw ServerUnavailableException(_apiError(response));
       }
       // 401 e 403 (sessao ou perfil: so a autenticacao do backend devolve
       // 403 neste endpoint), 408 e 429 podem passar na proxima tentativa; o
@@ -2473,6 +2424,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _createScheduleApprovalRequestInFirestore(
           requestType: requestType,
           attemptedAt: attemptedAt,
@@ -2498,6 +2450,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _getScheduleApprovalRequestsFromFirestore(status: status);
       }
       throw Exception(_apiError(response));
@@ -2527,6 +2480,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         await _decideScheduleApprovalInFirestore(
           requestId,
           approve: approve,
@@ -2547,6 +2501,7 @@ class ApiService {
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         return _getGlobalWorkScheduleFromFirestore();
       }
       throw Exception(_apiError(response));
@@ -2569,6 +2524,7 @@ class ApiService {
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       if (response.statusCode == 404 || response.statusCode >= 500) {
+        _logPlanB(response);
         await _db
             .collection('work_schedule_settings')
             .doc('intern_default')
@@ -2593,17 +2549,6 @@ class ApiService {
     'overtime_prompt_after': '19:35',
     'timezone': 'America/Sao_Paulo',
   };
-
-  DateTime _scheduleTime(DateTime day, dynamic value) {
-    final parts = value.toString().split(':');
-    return DateTime(
-      day.year,
-      day.month,
-      day.day,
-      int.tryParse(parts.first) ?? 0,
-      parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0,
-    );
-  }
 
   DateTime _firestoreCreatedAt(Map<String, dynamic> item) {
     final value = item['created_at'];
@@ -2685,165 +2630,6 @@ class ApiService {
       'start_request': startRequest,
       'compatibility_mode': true,
     };
-  }
-
-  /// Um registro ja gravado corresponde a esta mesma tentativa de batida?
-  /// Usado so no fallback pos-falha do backend, para diferenciar "o ponto ja
-  /// entrou" (mesmo minuto) de um conflito real de turno.
-  static const Duration _sameAttemptWindow = Duration(minutes: 5);
-
-  bool _matchesAttempt(Map<String, dynamic>? record, DateTime attempted) {
-    if (record == null) return false;
-    final moment = DateTime.tryParse(record['timestamp']?.toString() ?? '');
-    if (moment == null) return false;
-    return moment.difference(attempted).abs() <= _sameAttemptWindow;
-  }
-
-  Future<Map<String, dynamic>> _createScheduleControlledPunchInFirestore({
-    required String recordType,
-    String? timestamp,
-    String? location,
-    String? notes,
-    double? latitude,
-    double? longitude,
-    bool closeAtScheduledEnd = false,
-    String? clientRecordId,
-    bool offline = false,
-  }) async {
-    final user = await getCurrentUser();
-    // Mesmo contrato do backend: reenvio da mesma batida devolve o ponto ja
-    // gravado, sem reavaliar as regras.
-    if (clientRecordId != null) {
-      final existing = await _serverTimeRecord(clientRecordId);
-      if (existing != null) return {'status': 'created', ...existing};
-    }
-    final now = DateTime.now();
-    var attempted = DateTime.tryParse(timestamp ?? '') ?? now;
-    // Mesma janela do backend para a batida offline: no maximo 15 min no
-    // futuro (relogio adiantado) e 7 dias de atraso.
-    if (offline && !closeAtScheduledEnd) {
-      final delay = now.difference(attempted);
-      if (delay < const Duration(minutes: -15) ||
-          delay > const Duration(days: 7)) {
-        throw const PunchRejectedException(
-            'O horario da batida offline esta fora do periodo aceito.');
-      }
-    }
-    // Turno aberto ha mais de 14 dias e dado quebrado; limitar a janela evita
-    // ler o historico inteiro so para detectar o turno em aberto.
-    final scanFrom = (offline ? attempted : now)
-        .subtract(const Duration(days: 14))
-        .toIso8601String();
-    final serverRecords =
-        (await getTimeRecords(userId: user['id'], startDate: scanFrom))
-            .map((item) => Map<String, dynamic>.from(item as Map))
-            // So o que esta no servidor: a fila offline traz a propria batida
-            // que esta sendo sincronizada, que passaria por "ja gravada".
-            .where((record) => record['offline'] != true)
-            .toList();
-    // Batida offline: o turno aberto e o do momento dela (recordsBeforePunch,
-    // como o backend).
-    final records = offline
-        ? recordsBeforePunch(serverRecords, {
-            'user_id': user['id'],
-            'record_type': recordType,
-            'timestamp': attempted.toIso8601String(),
-          })
-        : sortRecords(serverRecords);
-    // Mesma regra do backend: a noite do lote do gestor ja vem fechada.
-    final openShift = openShiftCheckIn(records);
-    Map<String, dynamic>? lastCheckOut;
-    for (final record in records) {
-      if (record['record_type'] == 'check_out') lastCheckOut = record;
-    }
-    // Hora extra pelo dia em que o turno aberto comecou, como no backend.
-    final state = await _getEffectiveWorkScheduleFromFirestore(
-        shiftDay: DateTime.tryParse(openShift?['timestamp']?.toString() ?? ''));
-    final schedule = Map<String, dynamic>.from(state['schedule'] as Map);
-
-    if (recordType == 'check_in') {
-      // Este caminho so roda quando o backend falhou (timeout/5xx). A batida
-      // pode ter sido gravada la antes da falha: se o turno recem-aberto e o
-      // desta tentativa, o ponto ja existe e repetir seria duplicar. Devolver
-      // sucesso evita o erro na tela de um registro que na verdade entrou.
-      if (_matchesAttempt(openShift, attempted)) {
-        return {'status': 'created', 'duplicate': true, ...openShift!};
-      }
-      if (openShift != null) {
-        throw const PunchRejectedException('Ja existe um turno aberto.');
-      }
-      if (!isInternStartWithinSchedule(attempted, schedule)) {
-        return {
-          'status': 'approval_required',
-          'request_type': 'start_exception',
-          'reason': isInternWorkday(attempted)
-              ? 'outside_start_window'
-              : 'non_working_day',
-          'attempted_at': attempted.toIso8601String(),
-          'schedule': schedule,
-        };
-      }
-    } else if (recordType == 'check_out') {
-      // Mesma protecao da entrada: a saida pode ter sido gravada pelo backend
-      // antes do erro de rede. Se o ultimo check_out e desta tentativa, o turno
-      // ja foi encerrado com sucesso.
-      if (openShift == null && _matchesAttempt(lastCheckOut, attempted)) {
-        return {'status': 'created', 'duplicate': true, ...lastCheckOut!};
-      }
-      if (openShift == null) {
-        throw const PunchRejectedException('Nao existe turno aberto.');
-      }
-      final shiftStart = DateTime.parse(openShift['timestamp'].toString());
-      final scheduledEnd = _scheduleTime(shiftStart, schedule['shift_end']);
-      if (closeAtScheduledEnd) {
-        if (scheduledEnd.isBefore(shiftStart)) {
-          throw const PunchRejectedException(
-              'A entrada ocorreu depois do fim programado. Encerre no horario real.');
-        }
-        // Saida no futuro fecharia o turno antes da hora e pagaria minutos
-        // nao trabalhados.
-        if (scheduledEnd.isAfter(now)) {
-          throw const PunchRejectedException(
-              'Ainda nao deu o fim do horario programado. Para sair agora, use Finalizar expediente.');
-        }
-        attempted = scheduledEnd;
-      } else {
-        final threshold =
-            _scheduleTime(shiftStart, schedule['overtime_prompt_after']);
-        final overtime = state['overtime_request'];
-        if (!attempted.isBefore(threshold) &&
-            (overtime is! Map || overtime['status'] != 'approved')) {
-          return {
-            'status': 'approval_required',
-            'request_type': 'overtime',
-            'attempted_at': attempted.toIso8601String(),
-            'schedule': schedule,
-          };
-        }
-      }
-    }
-
-    final data = {
-      'user_id': user['id'],
-      'record_type': recordType,
-      'location': location ?? 'App',
-      'notes': notes,
-      'timestamp': attempted.toIso8601String(),
-      'latitude': latitude,
-      'longitude': longitude,
-      'schedule_controlled': true,
-      'schedule_snapshot': schedule,
-      'compatibility_mode': true,
-      'created_at': FieldValue.serverTimestamp(),
-      if (offline) 'synced_from_offline': true,
-      if (offline)
-        'offline_delay_minutes': attempted.isAfter(now)
-            ? 0
-            : now.difference(attempted).inMinutes,
-    };
-    final ref = _db.collection('time_records').doc(clientRecordId);
-    await ref.set(data);
-    return {'status': 'created', 'id': ref.id, ...data};
   }
 
   /// Turno aberto do usuario pelo que esta no servidor (14 dias, como o

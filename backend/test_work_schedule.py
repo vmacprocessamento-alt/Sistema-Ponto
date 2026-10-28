@@ -1,4 +1,5 @@
 import asyncio
+import io
 import itertools
 import os
 import sys
@@ -47,6 +48,12 @@ def _import_main():
 
 main = _import_main()
 needs_main = unittest.skipIf(main is None, "dependencias do main.py ausentes")
+
+
+def _call(result):
+    """Chama o endpoint como o FastAPI: os que so fazem trabalho bloqueante sao
+    `def` (rodam fora do event loop); os que esperam HTTP sao `async def`."""
+    return asyncio.run(result) if asyncio.iscoroutine(result) else result
 
 
 class WorkScheduleRulesTest(unittest.TestCase):
@@ -726,7 +733,7 @@ class BatchMinuteOrderTest(unittest.TestCase):
             timestamp=f"{morning.isoformat()}T07:00:14.512000",
             offline=True,
         )
-        result = asyncio.run(main.schedule_controlled_punch_endpoint(payload, user))
+        result = _call(main.schedule_controlled_punch_endpoint(payload, user))
         self.assertEqual(result["status"], "approval_required")
         self.assertEqual(result["request_type"], "overtime")
 
@@ -768,11 +775,11 @@ class StaleStartRequestTest(unittest.TestCase):
         payload = main.ScheduleApprovalCreateRequest(
             request_type="start_exception", attempted_at=self.now.isoformat(), notes="de novo"
         )
-        return asyncio.run(main.create_schedule_approval_request_endpoint(payload, self.user))
+        return _call(main.create_schedule_approval_request_endpoint(payload, self.user))
 
     def approve(self, request_id):
         payload = main.ScheduleApprovalDecisionRequest(reason="ok")
-        return asyncio.run(main.approve_schedule_request_endpoint(request_id, payload, self.admin))
+        return _call(main.approve_schedule_request_endpoint(request_id, payload, self.admin))
 
     def test_old_pending_request_is_superseded_by_new_attempt(self):
         self.add_request("old", self.now - timedelta(hours=7))
@@ -834,7 +841,7 @@ class FirestoreProfileReadTest(unittest.TestCase):
                 return Response()
 
         with mock.patch.dict(os.environ, {"FIREBASE_PROJECT_ID": "p"}), \
-                mock.patch.object(main.httpx, "AsyncClient", Client):
+                mock.patch.object(main, "_http_client", Client):
             return asyncio.run(main.get_firestore_document_with_user_token("users", "u1", "t"))
 
     def status_of(self, status):
@@ -937,7 +944,10 @@ class ExcelExportTest(unittest.TestCase):
         except FileNotFoundError as exc:
             self.skipTest(str(exc))
         self.addCleanup(os.unlink, path)
-        workbook = openpyxl.load_workbook(path)
+        # Da memoria: no Windows o openpyxl segura o arquivo aberto mesmo depois
+        # do close() e o unlink da limpeza falhava (so no teste).
+        with open(path, "rb") as handle:
+            workbook = openpyxl.load_workbook(io.BytesIO(handle.read()))
         self.addCleanup(workbook.close)
         return workbook.active
 
@@ -1023,7 +1033,7 @@ class DailyEntryTest(unittest.TestCase):
         self.now = main._local_now().replace(microsecond=0)
 
     def add(self, user=None, **payload):
-        return asyncio.run(main.create_daily_entry_endpoint(
+        return _call(main.create_daily_entry_endpoint(
             main.DailyEntryRequest(**payload), user or self.user,
         ))
 
@@ -1072,7 +1082,7 @@ class DailyEntryTest(unittest.TestCase):
             store[f"{user_id}_{day}"] = {"user_id": user_id, "date": day}
 
         def listing(user, **params):
-            return asyncio.run(main.list_daily_entries_endpoint(user=user, **params))["entries"]
+            return _call(main.list_daily_entries_endpoint(user=user, **params))["entries"]
 
         own = listing(self.user, start="2026-09-29", end="2026-10-28")
         self.assertEqual([entry["date"] for entry in own], ["2026-10-01", "2026-10-15"])
@@ -1105,11 +1115,11 @@ class AdminDailyEntryTest(unittest.TestCase):
 
     def add(self, day, admin=None, user_id="u1", reason="esqueceu de marcar"):
         payload = main.AdminDailyEntryCreateRequest(user_id=user_id, date=day.isoformat(), reason=reason)
-        return asyncio.run(main.admin_create_daily_entry_endpoint(payload, admin or self.admin))
+        return _call(main.admin_create_daily_entry_endpoint(payload, admin or self.admin))
 
     def delete(self, entry_id, admin=None, reason="marcou por engano"):
         payload = main.AdminDailyEntryDeleteRequest(reason=reason)
-        return asyncio.run(main.admin_delete_daily_entry_endpoint(entry_id, payload, admin or self.admin))
+        return _call(main.admin_delete_daily_entry_endpoint(entry_id, payload, admin or self.admin))
 
     def status_of(self, call, *args, **kwargs):
         with self.assertRaises(main.HTTPException) as ctx:
@@ -1207,7 +1217,10 @@ class DailyModeExportTest(unittest.TestCase):
         except FileNotFoundError as exc:
             self.skipTest(str(exc))
         self.addCleanup(os.unlink, path)
-        workbook = openpyxl.load_workbook(path)
+        # Da memoria: no Windows o openpyxl segura o arquivo aberto mesmo depois
+        # do close() e o unlink da limpeza falhava (so no teste).
+        with open(path, "rb") as handle:
+            workbook = openpyxl.load_workbook(io.BytesIO(handle.read()))
         self.addCleanup(workbook.close)
         return workbook
 
@@ -1311,7 +1324,7 @@ class AdminDailyModeUpdateTest(unittest.TestCase):
             name="Pessoa", email="p@x.com", role=role, job_title="Aux. Geral",
             daily_hours=8.0, cpf="", **extra,
         )
-        asyncio.run(main.update_user_admin_endpoint("u1", payload, self.admin))
+        _call(main.update_user_admin_endpoint("u1", payload, self.admin))
         return self.db.store["users"]["u1"]
 
     def test_daily_mode_is_saved(self):
@@ -1327,6 +1340,8 @@ class AdminDailyModeUpdateTest(unittest.TestCase):
 
 # CPF valido de teste (digitos verificadores certos).
 VALID_CPF = "52998224725"
+# Senha temporaria fixa nos testes de login (a de verdade e aleatoria).
+TEMP_PASSWORD = "73914628"
 
 
 class _FakeAuth:
@@ -1384,6 +1399,18 @@ class CpfRulesTest(unittest.TestCase):
 
 
 @needs_main
+class TemporaryPasswordTest(unittest.TestCase):
+    """Senha do primeiro acesso: aleatoria, 8 digitos, nunca a 123456 de antes."""
+
+    def test_random_digits(self):
+        senhas = [main._temporary_password() for _ in range(200)]
+        self.assertTrue(all(len(p) == 8 and p.isdigit() for p in senhas))
+        self.assertNotIn(main.LEGACY_DEFAULT_PASSWORD, senhas)
+        self.assertGreater(len(set(senhas)), 195)
+        self.assertTrue(all(len(set(p)) > 2 for p in senhas))
+
+
+@needs_main
 class CpfAccessTest(unittest.TestCase):
     """Login por CPF, cadastro pelo admin e troca de senha no primeiro acesso."""
 
@@ -1394,6 +1421,10 @@ class CpfAccessTest(unittest.TestCase):
         self.auth = _FakeAuth()
         self.passwords_ok = {}
         main._login_failures.clear()
+        main._cpf_digits_backfilled.clear()
+        patcher = mock.patch.object(main, "_temporary_password", lambda: TEMP_PASSWORD)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         async def check_password(email, password):
             account = next(a for a in self.auth.accounts.values() if a["email"] == email)
@@ -1414,28 +1445,29 @@ class CpfAccessTest(unittest.TestCase):
 
     def create(self, admin=None, **fields):
         payload = main.AdminUserCreateRequest(**{"name": "Pessoa Nova", "cpf": "529.982.247-25", **fields})
-        return asyncio.run(main.create_user_admin_endpoint(payload, admin or self.admin))
+        return _call(main.create_user_admin_endpoint(payload, admin or self.admin))
 
     def login(self, cpf, password, ip="1.2.3.4"):
         request = types.SimpleNamespace(headers={"x-real-ip": ip}, client=None)
-        return asyncio.run(main.cpf_login_endpoint(main.CpfLoginRequest(cpf=cpf, password=password), request))
+        return _call(main.cpf_login_endpoint(main.CpfLoginRequest(cpf=cpf, password=password), request))
 
     def status_of(self, call, *args, **kwargs):
         with self.assertRaises(main.HTTPException) as ctx:
             call(*args, **kwargs)
         return ctx.exception.status_code, ctx.exception.detail
 
-    def test_admin_creates_user_with_default_password(self):
+    def test_admin_creates_user_with_temporary_password(self):
         response = self.create(daily_mode=True)
         uid = response["id"]
-        self.assertEqual((response["cpf"], response["default_password"]), ("529.982.247-25", "123456"))
+        self.assertEqual((response["cpf"], response["temporary_password"]), ("529.982.247-25", TEMP_PASSWORD))
+        self.assertEqual(response["default_password"], TEMP_PASSWORD)  # nome antigo, app antigo
         profile = self.db.store["users"][uid]
         self.assertTrue(profile["must_change_password"])
         self.assertTrue(profile["daily_mode"])
         self.assertEqual((profile["email"], profile["cpf_digits"], profile["job_title"]), ("", VALID_CPF, "Aux. Geral"))
         # Sem e-mail, a conta usa o interno do CPF.
         self.assertEqual(self.auth.accounts[uid]["email"], f"{VALID_CPF}@{main.CPF_LOGIN_EMAIL_DOMAIN}")
-        self.assertEqual(self.auth.accounts[uid]["password"], "123456")
+        self.assertEqual(self.auth.accounts[uid]["password"], TEMP_PASSWORD)
 
     def test_create_refuses_duplicate_invalid_cpf_and_manager(self):
         self.create()
@@ -1447,35 +1479,43 @@ class CpfAccessTest(unittest.TestCase):
 
     def test_login_by_cpf_in_any_format(self):
         uid = self.create(email="pessoa@x.com")["id"]
-        self.assertEqual(self.login("52998224725", "123456"), {"email": "pessoa@x.com"})
+        self.assertEqual(self.login("52998224725", TEMP_PASSWORD), {"email": "pessoa@x.com"})
         # Cadastro antigo gravava "529.982.247.25".
         self.db.store["users"][uid]["cpf"] = "529.982.247.25"
-        self.assertEqual(self.login("529.982.247-25", "123456"), {"email": "pessoa@x.com"})
+        self.assertEqual(self.login("529.982.247-25", TEMP_PASSWORD), {"email": "pessoa@x.com"})
 
     def test_wrong_password_and_unknown_cpf_look_the_same(self):
         self.create()
         wrong = self.status_of(self.login, VALID_CPF, "errada")
-        unknown = self.status_of(self.login, "11144477735", "123456")
+        unknown = self.status_of(self.login, "11144477735", TEMP_PASSWORD)
         self.assertEqual(wrong, unknown)
         self.assertEqual(wrong[0], 401)
 
     def test_disabled_and_duplicate(self):
         uid = self.create()["id"]
         self.auth.accounts[uid]["disabled"] = True
-        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 403)
-        self.db.store["users"]["outro"] = {"cpf": VALID_CPF}
-        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 409)
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD)[0], 403)
+        # Todo caminho grava cpf_digits (backend e o plano B do app).
+        self.db.store["users"]["outro"] = {"cpf": VALID_CPF, "cpf_digits": main.cpf_digits(VALID_CPF)}
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD)[0], 409)
+
+    def test_duplicate_in_old_record_without_cpf_digits(self):
+        # Cadastro antigo, de antes do cpf_digits, ja no banco quando o servidor sobe.
+        self.create()
+        self.db.store["users"]["antigo"] = {"cpf": VALID_CPF}
+        main._cpf_digits_backfilled.clear()
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD)[0], 409)
 
     def test_too_many_failures_block_for_a_while(self):
         self.create()
         for _ in range(main._LOGIN_MAX_FAILURES):
             self.status_of(self.login, VALID_CPF, "errada")
         # Bloqueado mesmo com a senha certa, e de outro aparelho (por CPF).
-        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456", ip="9.9.9.9")[0], 429)
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD, ip="9.9.9.9")[0], 429)
 
     def change(self, user, password):
         payload = main.OwnPasswordChangeRequest(new_password=password)
-        return asyncio.run(main.change_own_password_endpoint(payload, user))
+        return _call(main.change_own_password_endpoint(payload, user))
 
     def test_first_access_password_change(self):
         uid = self.create()["id"]
@@ -1493,15 +1533,20 @@ class CpfAccessTest(unittest.TestCase):
             "daily_hours": 8.0, "cpf": "529.982.247-25",
         }
         values.update(fields)
-        asyncio.run(main.update_user_admin_endpoint(uid, main.AdminUserUpdateRequest(**values), self.admin))
+        _call(main.update_user_admin_endpoint(uid, main.AdminUserUpdateRequest(**values), self.admin))
         return self.db.store["users"][uid]
 
     def test_admin_reset_password_forces_change(self):
         uid = self.create()["id"]
         self.change({"id": uid, **self.db.store["users"][uid]}, "minhaSenha9")
-        profile = self.update(uid, new_password="123456")
-        self.assertTrue(profile["must_change_password"])
-        self.assertEqual(self.auth.accounts[uid]["password"], "123456")
+        values = {"name": "Pessoa Nova", "email": "", "role": "employee", "job_title": "Aux. Geral",
+                  "daily_hours": 8.0, "cpf": "529.982.247-25", "reset_password": True}
+        response = _call(main.update_user_admin_endpoint(uid, main.AdminUserUpdateRequest(**values), self.admin))
+        self.assertEqual(response["temporary_password"], TEMP_PASSWORD)
+        self.assertTrue(self.db.store["users"][uid]["must_change_password"])
+        self.assertEqual(self.auth.accounts[uid]["password"], TEMP_PASSWORD)
+        # A senha padrao antiga nao volta nem digitada pelo admin.
+        self.assertEqual(self.status_of(self.update, uid, new_password="123456")[0], 400)
 
     def test_admin_edit_email_and_cpf(self):
         uid = self.create()["id"]

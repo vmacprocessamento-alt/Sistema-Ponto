@@ -1,13 +1,10 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
-sqlalchemy==2.0.30
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
-python-jose[cryptography]==3.3.0
 python-multipart==0.0.9
 pydantic[email]==2.10.0
 openpyxl==3.1.2
-python-dotenv==1.0.0
 firebase-admin==6.5.0
-fastapi-mail
+fastapi-mail==1.4.1
 httpx==0.28.1
+# Cifra o backup enviado por email (main._encrypt_backup, restore_backup.py).
+cryptography==50.0.2

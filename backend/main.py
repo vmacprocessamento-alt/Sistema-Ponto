@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import secrets
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, time, date
 from calendar import monthrange
 from typing import Optional, List, Dict, Any
@@ -27,9 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 from pydantic import BaseModel
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from starlette.background import BackgroundTask
 
 from work_schedule_rules import (
     DEFAULT_INTERN_WORK_SCHEDULE as RULES_DEFAULT_INTERN_WORK_SCHEDULE,
@@ -137,7 +136,22 @@ SUMMARY_ROW_VALUE = 43
 SUMMARY_ROW_FINAL = 44
 SUMMARY_START_COL = 2
 
+@asynccontextmanager
+async def _lifespan(_app):
+    """Sobe com o servidor: tabela local das assinaturas e os jobs de fundo
+    (fechar pausas vencidas, backup). Desce fechando os clientes HTTP. As
+    funcoes ficam mais abaixo; o nome so e resolvido quando o servidor sobe."""
+    init_signature_documents_table()
+    jobs = [asyncio.create_task(_auto_close_breaks_loop()), asyncio.create_task(_backup_loop())]
+    try:
+        yield
+    finally:
+        for job in jobs:
+            job.cancel()
+        await _close_http_clients()
+
 app = FastAPI(
+    lifespan=_lifespan,
     title="Ponto System API",
     docs_url="/docs" if ENABLE_API_DOCS else None,
     redoc_url="/redoc" if ENABLE_API_DOCS else None,
@@ -609,6 +623,8 @@ class AdminUserUpdateRequest(BaseModel):
     cpf: str
     disabled: bool = False
     new_password: Optional[str] = None
+    # Gera uma senha temporaria (devolvida na resposta) em vez de new_password.
+    reset_password: bool = False
     work_schedule_override_enabled: bool = False
     work_schedule_override: Optional[Dict[str, str]] = None
     # None (app antigo, sem o campo) mantem o modo diaria como esta.
@@ -665,6 +681,17 @@ def init_firebase_admin():
 
     service_account_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
     service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if not (service_account_path or service_account_json
+            or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("FIRESTORE_EMULATOR_HOST")):
+        # Sem credencial nenhuma o SDK procurava a padrao do Google (servidor de
+        # metadados do Google Cloud) e cada requisicao travava ~30 s, com o
+        # servidor inteiro parado junto. Recusa na hora.
+        raise HTTPException(
+            status_code=503,
+            detail="Credencial do Firebase Admin nao configurada no servidor "
+                   "(FIREBASE_SERVICE_ACCOUNT_PATH ou FIREBASE_SERVICE_ACCOUNT_JSON).",
+        )
     project_id = os.getenv("FIREBASE_PROJECT_ID", "")
     options = {"projectId": project_id} if project_id else None
     if service_account_json:
@@ -673,8 +700,28 @@ def init_firebase_admin():
     elif service_account_path:
         cred = credentials.Certificate(service_account_path)
         firebase_admin.initialize_app(cred, options=options)
+    elif os.getenv("FIRESTORE_EMULATOR_HOST"):
+        # Emulador local (testes): nao ha credencial; sem esta anonima o SDK
+        # procuraria a padrao do Google e travaria.
+        firebase_admin.initialize_app(_EmulatorCredential(), options=options)
     else:
         firebase_admin.initialize_app(options=options)
+
+if credentials is not None:
+    class _EmulatorCredential(credentials.Base):
+        def get_credential(self):
+            from google.auth.credentials import AnonymousCredentials
+            return AnonymousCredentials()
+
+def _google_api(host: str, path: str) -> str:
+    """URL de uma API do Google, ou do emulador quando ligado (testes):
+    FIRESTORE_EMULATOR_HOST e FIREBASE_AUTH_EMULATOR_HOST, as mesmas variaveis
+    que o Admin SDK usa."""
+    if host == "firestore.googleapis.com" and os.getenv("FIRESTORE_EMULATOR_HOST"):
+        return f"http://{os.environ['FIRESTORE_EMULATOR_HOST']}/{path}"
+    if host == "identitytoolkit.googleapis.com" and os.getenv("FIREBASE_AUTH_EMULATOR_HOST"):
+        return f"http://{os.environ['FIREBASE_AUTH_EMULATOR_HOST']}/identitytoolkit.googleapis.com/{path}"
+    return f"https://{host}/{path}"
 
 def get_firestore_admin():
     init_firebase_admin()
@@ -1062,10 +1109,20 @@ def _find_schedule_requests(
     day_key: str,
     statuses: Optional[set] = None,
 ) -> List[Any]:
-    """Pedidos do usuario para o tipo/dia, do mais novo para o mais antigo."""
-    candidates = db.collection("work_schedule_approval_requests").where(
-        "user_id", "==", user_id
-    ).stream()
+    """Pedidos do usuario para o tipo/dia, do mais novo para o mais antigo.
+
+    Filtra tipo e dia no Firestore: so pelo usuario, lia todos os pedidos que
+    ele ja fez, duas vezes a cada 90 s com a tela do estagiario aberta, e a
+    conta so crescia. So igualdades: o Firestore resolve com os indices de
+    campo unico, sem indice composto.
+    """
+    candidates = (
+        db.collection("work_schedule_approval_requests")
+        .where("user_id", "==", user_id)
+        .where("request_type", "==", request_type)
+        .where("day_key", "==", day_key)
+        .stream()
+    )
     matches = []
     for item in candidates:
         data = item.to_dict() or {}
@@ -1108,6 +1165,12 @@ def _create_user_notification(
         "created_at": firestore.SERVER_TIMESTAMP,
     })
 
+# Push no navegador: o app e so web desde 28/10/2026 (sem Android/iOS).
+_WEB_PUSH = (
+    messaging.WebpushConfig(notification=messaging.WebpushNotification(icon="/icons/Icon-192.png"))
+    if messaging is not None else None
+)
+
 def _send_user_push(user_id: str, title: str, body: str, data: Optional[dict] = None):
     if messaging is None:
         return
@@ -1123,17 +1186,8 @@ def _send_user_push(user_id: str, title: str, body: str, data: Optional[dict] = 
             tokens=tokens,
             notification=messaging.Notification(title=title, body=body),
             data={key: str(value) for key, value in (data or {}).items()},
-            android=messaging.AndroidConfig(
-                priority="high",
-                notification=messaging.AndroidNotification(
-                    channel_id="work_schedule_approvals",
-                    icon="notification_icon",
-                    color="#8B0000",
-                ),
-            ),
-            apns=messaging.APNSConfig(
-                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
-            ),
+            # So web (PWA): o service worker mostra com o icone do app.
+            webpush=_WEB_PUSH,
         ))
         invalid = []
         for token, result in zip(tokens, response.responses):
@@ -1173,17 +1227,8 @@ def send_document_push_notification(user_id: str, title: str, body: str, documen
                 tokens=batch_tokens,
                 notification=messaging.Notification(title=title, body=body),
                 data={"type": "signature_document", "document_id": document_id},
-                android=messaging.AndroidConfig(
-                    priority="high",
-                    notification=messaging.AndroidNotification(
-                        channel_id="signature_documents",
-                        icon="notification_icon",
-                        color="#8B0000",
-                    ),
-                ),
-                apns=messaging.APNSConfig(
-                    payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
-                ),
+                # So web (PWA): o service worker mostra com o icone do app.
+                webpush=_WEB_PUSH,
             )
             response = messaging.send_each_for_multicast(message)
             for token, item in zip(batch_tokens, response.responses):
@@ -1221,6 +1266,55 @@ def decode_firestore_value(value: dict):
         ]
     return None
 
+# Um cliente HTTP so, reaproveitado: criar um httpx.AsyncClient carrega os
+# certificados de novo (~200 ms) e cada um abria conexao TLS nova com o
+# Google. Eram dois por requisicao autenticada. Um por event loop: o cliente
+# nao pode ser usado num loop diferente do que o criou (os testes rodam cada
+# chamada num asyncio.run proprio).
+_http_clients: Dict[int, httpx.AsyncClient] = {}
+
+def _http_client() -> httpx.AsyncClient:
+    loop_id = id(asyncio.get_running_loop())
+    client = _http_clients.get(loop_id)
+    if client is None or client.is_closed:
+        _http_clients.clear()
+        client = _http_clients[loop_id] = httpx.AsyncClient(timeout=20.0)
+    return client
+
+# Token ja conferido no Google vale por alguns minutos sem nova consulta: o
+# app manda o mesmo token (dura 1h) em todas as chamadas. Desativar ou excluir
+# a conta pelo painel tira os tokens dela daqui na hora (_forget_user_tokens).
+_TOKEN_CACHE_TTL = timedelta(minutes=5)
+_TOKEN_CACHE_MAX = 2000
+_verified_tokens: Dict[str, tuple] = {}
+
+def _token_key(id_token: str) -> str:
+    return hashlib.sha256(id_token.encode("utf-8")).hexdigest()
+
+def _cached_token_uid(id_token: str) -> Optional[str]:
+    hit = _verified_tokens.get(_token_key(id_token))
+    if hit and hit[1] > datetime.utcnow():
+        return hit[0]
+    return None
+
+def _forget_user_tokens(user_uid: str) -> None:
+    for key in [k for k, (uid, _) in _verified_tokens.items() if uid == user_uid]:
+        del _verified_tokens[key]
+
+def _remember_token(id_token: str, user_uid: str) -> None:
+    now = datetime.utcnow()
+    if len(_verified_tokens) >= _TOKEN_CACHE_MAX:
+        for key in [k for k, (_, exp) in _verified_tokens.items() if exp <= now]:
+            del _verified_tokens[key]
+        if len(_verified_tokens) >= _TOKEN_CACHE_MAX:
+            _verified_tokens.clear()
+    _verified_tokens[_token_key(id_token)] = (user_uid, now + _TOKEN_CACHE_TTL)
+
+async def _close_http_clients() -> None:
+    for client in list(_http_clients.values()):
+        await client.aclose()
+    _http_clients.clear()
+
 async def get_firestore_document_with_user_token(
     collection_name: str,
     document_id: str,
@@ -1230,15 +1324,14 @@ async def get_firestore_document_with_user_token(
     if not project_id:
         raise HTTPException(status_code=503, detail="FIREBASE_PROJECT_ID nao configurado.")
 
-    url = (
-        f"https://firestore.googleapis.com/v1/projects/{project_id}"
-        f"/databases/(default)/documents/{collection_name}/{document_id}"
+    url = _google_api(
+        "firestore.googleapis.com",
+        f"v1/projects/{project_id}/databases/(default)/documents/{collection_name}/{document_id}",
     )
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {id_token}"},
-        )
+    response = await _http_client().get(
+        url,
+        headers={"Authorization": f"Bearer {id_token}"},
+    )
     if response.status_code == 404:
         return None
     if response.status_code == 429:
@@ -1268,26 +1361,29 @@ async def get_firestore_document_with_user_token(
     return {key: decode_firestore_value(value) for key, value in fields.items()}
 
 async def verify_firebase_user_token(id_token: str) -> str:
+    cached_uid = _cached_token_uid(id_token)
+    if cached_uid:
+        return cached_uid
     if FIREBASE_WEB_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
-                    "https://identitytoolkit.googleapis.com/v1/accounts:lookup",
-                    params={"key": FIREBASE_WEB_API_KEY},
-                    json={"idToken": id_token},
-                )
+            response = await _http_client().post(
+                _google_api("identitytoolkit.googleapis.com", "v1/accounts:lookup"),
+                params={"key": FIREBASE_WEB_API_KEY},
+                json={"idToken": id_token},
+            )
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail="Falha ao validar a sessao Firebase.") from exc
 
         users = response.json().get("users", []) if response.is_success else []
         user_uid = users[0].get("localId") if users else None
         if user_uid:
+            _remember_token(id_token, user_uid)
             return user_uid
         raise HTTPException(status_code=401, detail="Token invalido ou expirado.")
 
     init_firebase_admin()
     try:
-        decoded = firebase_auth.verify_id_token(id_token)
+        decoded = await asyncio.to_thread(firebase_auth.verify_id_token, id_token)
         user_uid = decoded.get("uid")
     except Exception as exc:
         logger.warning("Firebase token validation failed: %s: %s", type(exc).__name__, exc)
@@ -1295,6 +1391,7 @@ async def verify_firebase_user_token(id_token: str) -> str:
 
     if not user_uid:
         raise HTTPException(status_code=401, detail="Usuario nao autenticado.")
+    _remember_token(id_token, user_uid)
     return user_uid
 
 async def require_authenticated_user(token: HTTPAuthorizationCredentials = Depends(security)):
@@ -1319,6 +1416,17 @@ async def require_admin_user(user=Depends(require_authenticated_user)):
         raise HTTPException(status_code=403, detail="Apenas admin ou manager pode executar esta acao.")
     return user
 
+def _response_safe(data: dict) -> dict:
+    """Copia de `data` para devolver na resposta: o SERVER_TIMESTAMP do
+    Firestore e um marcador que so o banco preenche e nao vira JSON. Com ele
+    na resposta o endpoint gravava o documento e devolvia 500, e o app caia no
+    plano B pelo Firestore (o dobro do tempo em toda batida do estagiario)."""
+    server_now = datetime.utcnow().isoformat() + "Z"
+    return {
+        key: server_now if value is firestore.SERVER_TIMESTAMP else value
+        for key, value in data.items()
+    }
+
 def serialize_firestore_document(document) -> dict:
     data = document.to_dict() or {}
     for key, value in list(data.items()):
@@ -1339,13 +1447,13 @@ def get_zapsign_headers() -> dict:
 
 async def zapsign_request(method: str, path: str, json_data: Optional[dict] = None) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.request(
-                method,
-                f"{ZAPSIGN_API_BASE_URL}/{path.lstrip('/')}",
-                headers=get_zapsign_headers(),
-                json=json_data,
-            )
+        response = await _http_client().request(
+            method,
+            f"{ZAPSIGN_API_BASE_URL}/{path.lstrip('/')}",
+            headers=get_zapsign_headers(),
+            json=json_data,
+            timeout=60.0,
+        )
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Falha ao conectar com a ZapSign: {exc}")
 
@@ -1608,7 +1716,21 @@ async def _auto_close_breaks_loop() -> None:
 # guarda local (host, via bind mount) e envia copia off-machine ao Storage.
 
 _BACKUP_DIR = "/app/data/backups"
-_BACKUP_RETENTION = 14
+# Completo uma vez por semana; nos outros dias so o que mudou nas colecoes que
+# so crescem. Ler o banco inteiro todo dia comia a cota diaria do plano Spark
+# (50 mil leituras) conforme os pontos se acumulavam (28/10/2026).
+_BACKUP_FULL_EVERY = timedelta(days=7)
+_BACKUP_FULLS_KEPT = 3
+# Colecoes que crescem sem parar. No incremental entram so os documentos com
+# created_at ou updated_at depois do ultimo backup; as demais (usuarios,
+# configuracoes...) sao pequenas e vao inteiras.
+_GROWING_COLLECTIONS = {
+    "time_records", "time_record_audits", "system_audits", "user_audits",
+    "user_notifications", "daily_entries", "work_schedule_approval_requests",
+    "adjustment_requests", "adjustment_conversations", "signature_documents",
+}
+# Folga na janela do incremental: relogios e o tempo do proprio backup.
+_BACKUP_OVERLAP = timedelta(hours=1)
 _BACKUP_MIN_INTERVAL = timedelta(hours=20)      # nao repete se ja ha um recente
 _BACKUP_CHECK_INTERVAL_SECONDS = 6 * 3600        # confere a cada 6h
 _BACKUP_STORAGE_PREFIX = "backups/"
@@ -1623,25 +1745,57 @@ def _json_default(obj):
         return base64.b64encode(obj).decode("ascii")
     return str(obj)
 
-def _export_firestore(db) -> dict:
-    dump = {}
+def _export_firestore(db, since: Optional[datetime] = None) -> tuple:
+    """(dump, colecoes completas). Com since (incremental), as colecoes de
+    _GROWING_COLLECTIONS levam so o criado ou alterado desde since."""
+    dump, complete = {}, []
     for coll in db.collections():
-        dump[coll.id] = [
-            {"id": doc.id, **(doc.to_dict() or {})} for doc in coll.stream()
-        ]
-    return dump
+        if since is None or coll.id not in _GROWING_COLLECTIONS:
+            dump[coll.id] = [{"id": doc.id, **(doc.to_dict() or {})} for doc in coll.stream()]
+            complete.append(coll.id)
+            continue
+        changed = {}
+        for field in ("created_at", "updated_at"):
+            for doc in coll.where(field, ">=", since).stream():
+                changed[doc.id] = {"id": doc.id, **(doc.to_dict() or {})}
+        dump[coll.id] = list(changed.values())
+    return dump, complete
+
+def _is_incremental(name: str) -> bool:
+    return name.endswith("-inc.zip")
+
+def _backup_order(name: str) -> tuple:
+    """Pela data do nome; na mesma data o completo antes do incremental (na
+    ordem alfabetica "-inc.zip" viria antes de ".zip")."""
+    stamp = name[:-len("-inc.zip")] if _is_incremental(name) else name[:-len(".zip")]
+    return stamp, _is_incremental(name)
 
 def _local_backups() -> List[str]:
     try:
         return sorted(
-            f for f in os.listdir(_BACKUP_DIR)
-            if f.startswith("backup-") and f.endswith(".zip")
+            (f for f in os.listdir(_BACKUP_DIR)
+             if f.startswith("backup-") and f.endswith(".zip")),
+            key=_backup_order,
         )
     except FileNotFoundError:
         return []
 
+def _backups_to_delete(names: List[str]) -> List[str]:
+    """Os _BACKUP_FULLS_KEPT completos mais novos ficam, e os incrementais a
+    partir do mais antigo deles (um incremental sem o completo de antes nao
+    restaura nada)."""
+    names = sorted(names, key=_backup_order)
+    fulls = [n for n in names if not _is_incremental(n)]
+    if len(fulls) <= _BACKUP_FULLS_KEPT:
+        oldest_kept = fulls[0] if fulls else None
+    else:
+        oldest_kept = fulls[-_BACKUP_FULLS_KEPT]
+    if oldest_kept is None:
+        return []
+    return [n for n in names if _backup_order(n) < _backup_order(oldest_kept)]
+
 def _rotate_local_backups():
-    for old in _local_backups()[:-_BACKUP_RETENTION]:
+    for old in _backups_to_delete(_local_backups()):
         try:
             os.remove(os.path.join(_BACKUP_DIR, old))
         except OSError:
@@ -1653,12 +1807,12 @@ def _upload_backup_to_storage(path: str, name: str) -> str:
     try:
         bucket = storage.bucket(_BACKUP_STORAGE_BUCKET)
         bucket.blob(_BACKUP_STORAGE_PREFIX + name).upload_from_filename(path)
-        remote = sorted(
-            (b for b in bucket.list_blobs(prefix=_BACKUP_STORAGE_PREFIX)
-             if b.name.endswith(".zip")),
-            key=lambda b: b.name,
-        )
-        for old in remote[:-_BACKUP_RETENTION]:
+        remote = {
+            b.name[len(_BACKUP_STORAGE_PREFIX):]: b
+            for b in bucket.list_blobs(prefix=_BACKUP_STORAGE_PREFIX)
+            if b.name.endswith(".zip")
+        }
+        for old in (remote[n] for n in _backups_to_delete(list(remote))):
             try:
                 old.delete()
             except Exception:
@@ -1681,15 +1835,36 @@ def _run_backup(force: bool = False) -> dict:
             if datetime.now().timestamp() - newest < _BACKUP_MIN_INTERVAL.total_seconds():
                 return {"status": "skip", "reason": "backup recente ja existe"}
 
+    existing = _local_backups()
+    fulls = [n for n in existing if not _is_incremental(n)]
+    now = datetime.now().timestamp()
+    full = force or not fulls or (
+        now - os.path.getmtime(os.path.join(_BACKUP_DIR, fulls[-1]))
+        >= _BACKUP_FULL_EVERY.total_seconds()
+    )
+    since = None
+    if not full:
+        last = os.path.getmtime(os.path.join(_BACKUP_DIR, existing[-1]))
+        since = datetime.fromtimestamp(last, ZoneInfo("UTC")) - _BACKUP_OVERLAP
+
     stamp = datetime.now(ZoneInfo(_AUTO_CLOSE_TZ)).strftime("%Y%m%d-%H%M%S")
-    name = f"backup-{stamp}.zip"
+    name = f"backup-{stamp}.zip" if full else f"backup-{stamp}-inc.zip"
     zip_path = os.path.join(_BACKUP_DIR, name)
     tmp_dir = tempfile.mkdtemp()
     try:
-        fs_dump = _export_firestore(db)
+        fs_dump, complete = _export_firestore(db, since)
         fs_path = os.path.join(tmp_dir, "firestore.json")
         with open(fs_path, "w", encoding="utf-8") as handle:
             json.dump(fs_dump, handle, ensure_ascii=False, default=_json_default)
+        # Para o restore_backup.py juntar o completo e os incrementais.
+        manifest_path = os.path.join(tmp_dir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "type": "full" if full else "incremental",
+                "since": since.isoformat() if since else None,
+                "base": None if full else fulls[-1],
+                "complete_collections": complete,
+            }, handle, ensure_ascii=False)
 
         sqlite_path = os.path.join(tmp_dir, "ponto.db")
         source = sqlite3.connect(DATABASE_PATH)
@@ -1702,6 +1877,7 @@ def _run_backup(force: bool = False) -> dict:
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(fs_path, "firestore.json")
+            archive.write(manifest_path, "manifest.json")
             if os.path.exists(sqlite_path):
                 archive.write(sqlite_path, "ponto.db")
     finally:
@@ -1712,8 +1888,8 @@ def _run_backup(force: bool = False) -> dict:
     counts = {k: len(v) for k, v in fs_dump.items()}
     size = os.path.getsize(zip_path)
     print(f"[backup] {name} ({size} bytes) upload={upload} colecoes={counts}")
-    return {"status": "ok", "file": name, "bytes": size,
-            "upload": upload, "collections": counts}
+    return {"status": "ok", "file": name, "type": "full" if full else "incremental",
+            "bytes": size, "upload": upload, "collections": counts}
 
 # Copia off-machine por email (semanal). O Storage exige plano pago; o email
 # reusa o SMTP ja configurado. O anexo vai cifrado (AES) por conter dados
@@ -1752,7 +1928,8 @@ def _send_backup_email() -> str:
         return "sem senha configurada (BACKUP_ZIP_PASSWORD)"
     if not MAIL_PASSWORD or MAIL_PASSWORD == "mude-me":
         return "SMTP nao configurado"
-    backups = _local_backups()
+    # So o completo: o incremental sozinho nao restaura nada.
+    backups = [n for n in _local_backups() if not _is_incremental(n)]
     if not backups:
         return "sem backup para enviar"
     latest = os.path.join(_BACKUP_DIR, backups[-1])
@@ -1815,15 +1992,6 @@ async def _backup_loop() -> None:
             print(f"[backup] loop: {exc}")
         await asyncio.sleep(_BACKUP_CHECK_INTERVAL_SECONDS)
 
-@app.on_event("startup")
-async def _start_background_jobs() -> None:
-    asyncio.create_task(_auto_close_breaks_loop())
-    asyncio.create_task(_backup_loop())
-
-@app.on_event("startup")
-def initialize_local_tables():
-    init_signature_documents_table()
-
 @app.post("/admin/backup/run")
 async def run_backup_endpoint(admin=Depends(require_admin_user)):
     result = await asyncio.to_thread(_run_backup, True)
@@ -1840,9 +2008,9 @@ async def email_backup_endpoint(admin=Depends(require_admin_user)):
     return {"status": "ok", "sent_to": _BACKUP_EMAIL}
 
 @app.get("/admin/backup/list")
-async def list_backups_endpoint(admin=Depends(require_admin_user)):
+def list_backups_endpoint(admin=Depends(require_admin_user)):
     out = []
-    for name in sorted(_local_backups(), reverse=True):
+    for name in reversed(_local_backups()):
         path = os.path.join(_BACKUP_DIR, name)
         out.append({
             "file": name,
@@ -2508,19 +2676,38 @@ function showTab(id){{
     tmp.close()
     return tmp.name
 
+def _remove_after_send(path: str, whole_dir: bool = False) -> BackgroundTask:
+    """Apaga o arquivo gerado (ou a pasta temporaria dele) depois que a
+    resposta foi enviada. Sem isso cada folha, lote ou relatorio exportado
+    ficava no /tmp do container para sempre, enchendo o disco do servidor."""
+    def remove():
+        if whole_dir:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return BackgroundTask(remove)
+
 @app.post("/export-excel")
-async def export_excel(
+def export_excel(
     data: ExportData,
     user=Depends(require_authenticated_user),
 ):
     try:
         file_path = generate_excel_file(data)
-        return FileResponse(file_path, filename=excel_download_filename(data), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return FileResponse(
+            file_path,
+            filename=excel_download_filename(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            background=_remove_after_send(file_path),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch")
-async def export_batch(
+def export_batch(
     data_list: List[ExportData],
     user=Depends(require_authenticated_user),
 ):
@@ -2532,12 +2719,17 @@ async def export_batch(
                 file_path = generate_excel_file(data)
                 zipf.write(file_path, arcname=excel_download_filename(data))
                 os.unlink(file_path)
-        return FileResponse(zip_path, filename="Folhas_Ponto_Lote.zip", media_type="application/zip")
+        return FileResponse(
+            zip_path,
+            filename="Folhas_Ponto_Lote.zip",
+            media_type="application/zip",
+            background=_remove_after_send(zip_path, whole_dir=True),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch-html")
-async def export_batch_html(
+def export_batch_html(
     data_list: List[ExportData],
     user=Depends(require_authenticated_user),
 ):
@@ -2548,6 +2740,7 @@ async def export_batch_html(
             file_path,
             filename=f"Folhas_Ponto_VM_{first.month}-{first.year}.html",
             media_type="text/html; charset=utf-8",
+            background=_remove_after_send(file_path),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2695,7 +2888,7 @@ async def create_signature_document(
     return document
 
 @app.get("/signature-notifications")
-async def list_signature_notifications(user=Depends(require_authenticated_user)):
+def list_signature_notifications(user=Depends(require_authenticated_user)):
     with signature_db_connection() as connection:
         rows = connection.execute(
             """
@@ -2710,7 +2903,7 @@ async def list_signature_notifications(user=Depends(require_authenticated_user))
     return [dict(row) for row in rows]
 
 @app.post("/signature-notifications/read")
-async def mark_signature_notifications_read(user=Depends(require_authenticated_user)):
+def mark_signature_notifications_read(user=Depends(require_authenticated_user)):
     with signature_db_connection() as connection:
         connection.execute(
             "UPDATE signature_notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
@@ -2719,7 +2912,7 @@ async def mark_signature_notifications_read(user=Depends(require_authenticated_u
     return {"status": "success"}
 
 @app.get("/signature-documents")
-async def list_my_signature_documents(user=Depends(require_authenticated_user)):
+def list_my_signature_documents(user=Depends(require_authenticated_user)):
     with signature_db_connection() as connection:
         rows = connection.execute(
             f"""
@@ -2733,7 +2926,7 @@ async def list_my_signature_documents(user=Depends(require_authenticated_user)):
     return [dict(row) for row in rows]
 
 @app.get("/admin/signature-documents")
-async def list_all_signature_documents(admin=Depends(require_admin_user)):
+def list_all_signature_documents(admin=Depends(require_admin_user)):
     with signature_db_connection() as connection:
         rows = connection.execute(
             f"""
@@ -2774,7 +2967,7 @@ async def refresh_signature_document(
     return updated_document
 
 @app.delete("/admin/signature-documents/{document_id}")
-async def delete_signature_document(
+def delete_signature_document(
     document_id: str,
     admin=Depends(require_admin_user),
 ):
@@ -2848,7 +3041,7 @@ def _parse_shift_day(value: Optional[str], today: date) -> Optional[date]:
     return None
 
 @app.get("/work-schedule/effective")
-async def get_effective_work_schedule_endpoint(
+def get_effective_work_schedule_endpoint(
     shift_day: Optional[str] = None,
     user=Depends(require_authenticated_user),
 ):
@@ -2886,13 +3079,13 @@ async def get_effective_work_schedule_endpoint(
     }
 
 @app.get("/admin/work-schedule/settings")
-async def get_global_work_schedule_endpoint(admin=Depends(require_admin_user)):
+def get_global_work_schedule_endpoint(admin=Depends(require_admin_user)):
     db = get_firestore_admin()
     settings_doc = db.collection("work_schedule_settings").document("intern_default").get()
     return _validate_work_schedule(settings_doc.to_dict() if settings_doc.exists else None)
 
 @app.put("/admin/work-schedule/settings")
-async def update_global_work_schedule_endpoint(
+def update_global_work_schedule_endpoint(
     payload: WorkScheduleConfigRequest,
     admin=Depends(require_admin_user),
 ):
@@ -2924,7 +3117,7 @@ _OFFLINE_MAX_AHEAD = timedelta(minutes=15)
 _OFFLINE_MAX_DELAY = timedelta(days=7)
 
 @app.post("/work-schedule/punch")
-async def schedule_controlled_punch_endpoint(
+def schedule_controlled_punch_endpoint(
     payload: SchedulePunchRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3059,10 +3252,177 @@ async def schedule_controlled_punch_endpoint(
     elif not payload.close_at_scheduled_end and abs((server_now - punched_at).total_seconds()) >= 60:
         record["device_timestamp"] = _local_iso(punched_at)
     record_ref.set(record)
-    return {"status": "created", "id": record_ref.id, **record}
+    return {"status": "created", "id": record_ref.id, **_response_safe(record)}
+
+class TimeRecordPunchRequest(BaseModel):
+    record_type: str
+    # Id gerado no aparelho: o reenvio da fila offline devolve o ponto ja
+    # gravado em vez de duplicar.
+    client_record_id: str
+    timestamp: Optional[str] = None
+    offline: bool = False
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    # "forgotten_exit": fecha o turno aberto sem horas (saida 1s depois da
+    # entrada; o gestor lanca a hora real). "auto_break_close": fecha a pausa
+    # aberta ha 3h+ com 1h de pausa. Nos dois a hora e o id saem do servidor,
+    # nao do aparelho. ref_record_id: a entrada (ou a pausa) que a batida fecha.
+    kind: Optional[str] = None
+    ref_record_id: Optional[str] = None
+
+_PUNCH_TYPES = {"check_in", "check_out", "break_start", "break_end", "entry_3", "exit_3"}
+_BREAK_CLOSE_TYPE = {"break_start": "break_end", "entry_3": "exit_3"}
+_FORGOTTEN_EXIT_NOTES = "Saida esquecida: o gestor precisa lancar o horario real"
+
+def _forgotten_exit(user_id: str, open_shift: dict, location: Optional[str], notes: Optional[str]) -> tuple:
+    """(id, ponto) da saida esquecida que fecha o turno [open_shift] sem horas.
+    Id fixo pela entrada: "Esqueci" em dois aparelhos grava a mesma saida."""
+    opened = _to_local_naive(str(open_shift.get("timestamp")))
+    return f"forgot_{open_shift['id']}", {
+        "user_id": user_id,
+        "record_type": "check_out",
+        "location": location or "App (saida esquecida)",
+        "notes": notes or _FORGOTTEN_EXIT_NOTES,
+        "timestamp": _local_iso(opened + timedelta(seconds=1)),
+        "latitude": None,
+        "longitude": None,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+
+@app.post("/time-records/punch")
+def time_record_punch_endpoint(
+    payload: TimeRecordPunchRequest,
+    user=Depends(require_authenticated_user),
+):
+    """Batida de quem nao e estagiario (o estagiario usa /work-schedule/punch
+    para entrada e saida). Antes o app gravava direto no Firestore com a hora
+    do celular, e as regras deixavam qualquer um gravar ponto com qualquer
+    horario: retroativo, ou o estagiario pulando o controle de horario."""
+    record_type = payload.record_type
+    if record_type not in _PUNCH_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo de ponto invalido.")
+    if not _CLIENT_RECORD_ID_RE.fullmatch(payload.client_record_id or ""):
+        raise HTTPException(status_code=400, detail="Identificador do registro invalido.")
+    if payload.kind not in (None, "forgotten_exit", "auto_break_close"):
+        raise HTTPException(status_code=400, detail="Tipo de batida invalido.")
+    if _is_intern_profile(user) and record_type in {"check_in", "check_out"} and payload.kind is None:
+        raise HTTPException(status_code=400, detail="Entrada e saida do estagiario seguem o horario controlado.")
+
+    db = get_firestore_admin()
+    user_id = user["id"]
+
+    def existing_or_none(doc_id: str) -> Optional[dict]:
+        snapshot = db.collection("time_records").document(doc_id).get()
+        if not snapshot.exists:
+            return None
+        data = serialize_firestore_document(snapshot)
+        if data.get("user_id") != user_id:
+            raise HTTPException(status_code=409, detail="Identificador do registro ja usado por outro usuario.")
+        return {"status": "created", **data}
+
+    # Reenvio da mesma batida (resposta perdida, fila offline): vale o gravado.
+    already = existing_or_none(payload.client_record_id)
+    if already:
+        return already
+
+    records = _user_records_sorted(db, user_id)
+    server_now = datetime.now(ZoneInfo(_LOCAL_TZ))
+
+    if payload.kind == "auto_break_close":
+        break_id = (payload.ref_record_id or "").strip()
+        if not break_id or not records or records[-1].get("id") != break_id:
+            raise HTTPException(status_code=409, detail="A pausa ja foi encerrada.")
+        last = records[-1]
+        if last.get("record_type") not in _BREAK_CLOSE_TYPE:
+            raise HTTPException(status_code=409, detail="A pausa ja foi encerrada.")
+        started = _to_local_naive(str(last.get("timestamp")))
+        if started is None or server_now.replace(tzinfo=None) - started < _AUTO_CLOSE_AFTER:
+            raise HTTPException(status_code=409, detail="A pausa ainda nao passou de 3 horas.")
+        doc_id = f"autoclose_{break_id}"
+        # Mesmo id do job do backend que fecha pausas: os dois gravam o mesmo ponto.
+        return existing_or_none(doc_id) or _save_punch(db, doc_id, {
+            "user_id": user_id,
+            "record_type": _BREAK_CLOSE_TYPE[last["record_type"]],
+            "timestamp": _local_iso(started + _AUTO_CLOSE_DURATION),
+            "location": "Sistema (Auto)",
+            "notes": "Retorno automatico (pausa excedeu 3h; ajustado para 1h)",
+            "auto_closed": True,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    if payload.kind == "forgotten_exit":
+        if record_type != "check_out":
+            raise HTTPException(status_code=400, detail="Saida esquecida vale so para a saida.")
+        ref = (payload.ref_record_id or "").strip()
+        # "Esqueci" em outro aparelho ja fechou este turno: vale aquela saida.
+        if ref and _CLIENT_RECORD_ID_RE.fullmatch(ref):
+            done = existing_or_none(f"forgot_{ref}")
+            if done:
+                return done
+        open_shift = _open_shift_start(records)
+        if open_shift is None:
+            raise HTTPException(status_code=409, detail="Nao existe turno aberto.")
+        doc_id, record = _forgotten_exit(user_id, open_shift, payload.location, payload.notes)
+        return existing_or_none(doc_id) or _save_punch(db, doc_id, record)
+
+    attempted = _parse_schedule_datetime(payload.timestamp, _LOCAL_TZ)
+    punched_at = attempted
+    if payload.offline:
+        # Sem internet vale a hora do aparelho no momento da batida, como no
+        # estagiario: nada no futuro e no maximo 7 dias de atraso.
+        delay = server_now - attempted
+        if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
+            raise HTTPException(status_code=400, detail="O horario da batida offline esta fora do periodo aceito.")
+        records = _records_before_punch(records, {
+            "user_id": user_id, "record_type": record_type, "timestamp": _local_iso(attempted),
+        })
+    elif abs((server_now - attempted).total_seconds()) > 15 * 60:
+        raise HTTPException(status_code=400, detail="O horario informado esta muito distante do relogio do servidor.")
+    else:
+        # Online vale a hora do servidor, nao a do celular.
+        attempted = server_now
+
+    open_shift = _open_shift_start(records)
+    if record_type == "check_in" and open_shift is not None:
+        if not payload.offline:
+            raise HTTPException(status_code=409, detail="Ja existe um turno aberto.")
+        # Entrada que estava na fila com um turno velho ainda aberto antes
+        # dela: fecha o velho sem horas (era o que o app fazia na sincronizacao),
+        # senao o dia pagava as horas entre os dois turnos.
+        forgot_id, forgot = _forgotten_exit(
+            user_id, open_shift, None,
+            "Saida esquecida (fechada na sincronizacao): o gestor precisa lancar o horario real",
+        )
+        if not existing_or_none(forgot_id):
+            _save_punch(db, forgot_id, forgot)
+    if record_type == "check_out" and open_shift is None:
+        raise HTTPException(status_code=409, detail="Nao existe turno aberto.")
+
+    record = {
+        "user_id": user_id,
+        "record_type": record_type,
+        "location": payload.location or "App",
+        "notes": payload.notes,
+        "timestamp": _local_iso(attempted),
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    if payload.offline:
+        record["synced_from_offline"] = True
+        record["offline_delay_minutes"] = max(0, int((server_now - punched_at).total_seconds() // 60))
+    elif abs((server_now - punched_at).total_seconds()) >= 60:
+        record["device_timestamp"] = _local_iso(punched_at)
+    return _save_punch(db, payload.client_record_id, record)
+
+def _save_punch(db, doc_id: str, record: dict) -> dict:
+    db.collection("time_records").document(doc_id).set(record)
+    return {"status": "created", "id": doc_id, **_response_safe(record)}
 
 @app.post("/work-schedule/approval-requests")
-async def create_schedule_approval_request_endpoint(
+def create_schedule_approval_request_endpoint(
     payload: ScheduleApprovalCreateRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3211,10 +3571,10 @@ async def create_schedule_approval_request_endpoint(
             "type": "schedule_approval",
             "request_id": request_ref.id,
         })
-    return {"status": "created", "request": {"id": request_ref.id, **request_data}}
+    return {"status": "created", "request": {"id": request_ref.id, **_response_safe(request_data)}}
 
 @app.get("/admin/work-schedule/approval-requests")
-async def list_schedule_approval_requests_endpoint(
+def list_schedule_approval_requests_endpoint(
     status: Optional[str] = None,
     admin=Depends(require_admin_user),
 ):
@@ -3232,7 +3592,7 @@ async def list_schedule_approval_requests_endpoint(
     return requests
 
 @app.get("/notifications")
-async def list_user_notifications_endpoint(user=Depends(require_authenticated_user)):
+def list_user_notifications_endpoint(user=Depends(require_authenticated_user)):
     db = get_firestore_admin()
     # So as nao lidas: e o unico que o sininho exibe, e a colecao so cresce.
     # Ler o historico inteiro a cada 30s por aba aberta era leitura jogada fora.
@@ -3250,7 +3610,7 @@ async def list_user_notifications_endpoint(user=Depends(require_authenticated_us
     return notifications[:100]
 
 @app.post("/notifications/read")
-async def mark_user_notifications_read_endpoint(user=Depends(require_authenticated_user)):
+def mark_user_notifications_read_endpoint(user=Depends(require_authenticated_user)):
     db = get_firestore_admin()
     # Le so o que precisa mudar, em vez da caixa inteira do usuario.
     minhas = db.collection("user_notifications").where("user_id", "==", user["id"])
@@ -3272,7 +3632,7 @@ async def mark_user_notifications_read_endpoint(user=Depends(require_authenticat
     return {"status": "success", "updated": count}
 
 @app.post("/admin/work-schedule/approval-requests/{request_id}/approve")
-async def approve_schedule_request_endpoint(
+def approve_schedule_request_endpoint(
     request_id: str,
     payload: ScheduleApprovalDecisionRequest,
     admin=Depends(require_admin_user),
@@ -3363,7 +3723,7 @@ async def approve_schedule_request_endpoint(
     return {"status": "approved", "linked_time_record_id": linked_record_id}
 
 @app.post("/admin/work-schedule/approval-requests/{request_id}/reject")
-async def reject_schedule_request_endpoint(
+def reject_schedule_request_endpoint(
     request_id: str,
     payload: ScheduleApprovalDecisionRequest,
     admin=Depends(require_admin_user),
@@ -3450,7 +3810,7 @@ def _parse_day_param(value: str, name: str) -> date:
         raise HTTPException(status_code=400, detail=f"Data invalida em {name}.") from exc
 
 @app.post("/daily-entries")
-async def create_daily_entry_endpoint(
+def create_daily_entry_endpoint(
     payload: DailyEntryRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3480,7 +3840,7 @@ async def create_daily_entry_endpoint(
     return {"status": "created", "id": ref.id, **entry}
 
 @app.get("/daily-entries")
-async def list_daily_entries_endpoint(
+def list_daily_entries_endpoint(
     start: str,
     end: str,
     user_id: Optional[str] = None,
@@ -3524,7 +3884,7 @@ def _daily_entry_audit(db, action: str, admin: dict, entry: dict, reason: str) -
     })
 
 @app.post("/admin/daily-entries")
-async def admin_create_daily_entry_endpoint(
+def admin_create_daily_entry_endpoint(
     payload: AdminDailyEntryCreateRequest,
     admin=Depends(require_admin_user),
 ):
@@ -3561,7 +3921,7 @@ async def admin_create_daily_entry_endpoint(
     return {"status": "created", "id": ref.id, **entry}
 
 @app.delete("/admin/daily-entries/{entry_id}")
-async def admin_delete_daily_entry_endpoint(
+def admin_delete_daily_entry_endpoint(
     entry_id: str,
     payload: AdminDailyEntryDeleteRequest,
     admin=Depends(require_admin_user),
@@ -3589,7 +3949,19 @@ async def admin_delete_daily_entry_endpoint(
 # nunca recebe mensagem. O login por CPF (/auth/cpf-login) confere a senha e
 # devolve o e-mail da conta; o app entra com ele como antes.
 
-DEFAULT_USER_PASSWORD = "123456"
+# Senha com que as contas eram criadas ate 28/10/2026. Quem sabia o CPF da
+# pessoa entrava como ela ate o primeiro acesso. Nao vale mais como senha nova.
+LEGACY_DEFAULT_PASSWORD = "123456"
+
+def _temporary_password() -> str:
+    """Senha do primeiro acesso: 8 digitos aleatorios, mostrados uma vez ao
+    admin para entregar a pessoa, que troca no primeiro acesso
+    (must_change_password). Digitos porque e digitada no celular; o limite de
+    tentativas por CPF segura a adivinhacao."""
+    while True:
+        password = f"{secrets.randbelow(10 ** 8):08d}"
+        if len(set(password)) > 2:  # nada de 00000000, 11112111...
+            return password
 CPF_LOGIN_EMAIL_DOMAIN = os.getenv("CPF_LOGIN_EMAIL_DOMAIN", "cpf.ponto.vmacengenharia.com")
 
 def cpf_digits(value) -> str:
@@ -3623,19 +3995,66 @@ def _login_emails(email: Optional[str], digits: str) -> tuple:
         raise HTTPException(status_code=400, detail="Informe o e-mail ou um CPF valido.")
     return "", cpf_login_email(digits)
 
-def _users_with_cpf(db, digits: str) -> List[Any]:
-    """Cadastros com este CPF, em qualquer formato gravado (123.456.789-00,
-    o 123.456.789.00 do cadastro antigo ou so digitos). Le a colecao toda:
-    sao poucas pessoas, e o cadastro antigo nao tem cpf_digits."""
-    return [
-        doc for doc in db.collection("users").stream()
-        if cpf_digits((doc.to_dict() or {}).get("cpf")) == digits
-    ]
+# Bancos (um so em producao) em que todo cadastro ja tem cpf_digits.
+_cpf_digits_backfilled: set = set()
 
-# Tentativas erradas de login por CPF: no maximo 10 em 15 min por aparelho
-# (IP) e por CPF. O /api/ nao passa pela palavra-chave da empresa.
+def _backfill_cpf_digits(db) -> None:
+    """Uma vez por processo: grava cpf_digits em quem nao tem ou tem velho.
+    Sem isso, um CPF repetido num cadastro antigo nao apareceria na busca
+    pelo campo e o login nao recusaria o CPF duplicado."""
+    for doc in db.collection("users").stream():
+        data = doc.to_dict() or {}
+        digits = cpf_digits(data.get("cpf"))
+        if digits and data.get("cpf_digits") != digits:
+            try:
+                doc.reference.update({"cpf_digits": digits})
+            except Exception as exc:
+                logger.warning("Nao deu para gravar cpf_digits de %s: %s", doc.id, exc)
+                return  # tenta de novo no proximo login
+    _cpf_digits_backfilled.add(id(db))
+
+def _users_with_cpf(db, digits: str, thorough: bool = True) -> List[Any]:
+    """Cadastros com este CPF, em qualquer formato gravado (123.456.789-00,
+    o 123.456.789.00 do cadastro antigo ou so digitos).
+
+    thorough=False (login): procura pelo campo cpf_digits, uma leitura so.
+    Ler a colecao toda a cada login custava uma leitura por pessoa
+    cadastrada. O cadastro antigo nao tem o campo: na primeira vez, todos
+    ganham (_backfill_cpf_digits). Vale o "cpf" de cada achado (o campo pode
+    estar velho) e, sem achado, le a colecao toda como antes.
+    thorough=True (cadastro/edicao pelo admin): sempre a colecao toda, para
+    nao deixar passar CPF repetido num cadastro sem cpf_digits.
+    """
+    if not thorough:
+        if id(db) not in _cpf_digits_backfilled:
+            _backfill_cpf_digits(db)
+        indexed = [
+            doc for doc in db.collection("users").where("cpf_digits", "==", digits).stream()
+            if cpf_digits((doc.to_dict() or {}).get("cpf")) == digits
+        ]
+        if indexed:
+            return indexed
+    matches = []
+    for doc in db.collection("users").stream():
+        data = doc.to_dict() or {}
+        if cpf_digits(data.get("cpf")) != digits:
+            continue
+        matches.append(doc)
+        if data.get("cpf_digits") != digits:
+            # Acerta o campo para o proximo login achar numa leitura so.
+            try:
+                doc.reference.update({"cpf_digits": digits})
+            except Exception as exc:
+                logger.warning("Nao deu para gravar cpf_digits de %s: %s", doc.id, exc)
+    return matches
+
+# Tentativas erradas de login por CPF: no maximo 10 em 15 min por CPF e 30
+# por IP. O /api/ nao passa pela palavra-chave da empresa. O limite do IP e
+# maior porque o Wi-Fi do escritorio sai por um IP so: com 10, um colega
+# errando a senha travava o login da equipe toda.
 _LOGIN_FAILURE_WINDOW = timedelta(minutes=15)
 _LOGIN_MAX_FAILURES = 10
+_LOGIN_MAX_FAILURES_PER_IP = 30
 _login_failures: Dict[str, List[datetime]] = {}
 
 def _recent_login_failures(key: str, now: datetime) -> List[datetime]:
@@ -3647,7 +4066,23 @@ def _recent_login_failures(key: str, now: datetime) -> List[datetime]:
     return recent
 
 def _login_blocked(keys: List[str], now: datetime) -> bool:
-    return any(len(_recent_login_failures(key, now)) >= _LOGIN_MAX_FAILURES for key in keys)
+    return any(
+        len(_recent_login_failures(key, now))
+        >= (_LOGIN_MAX_FAILURES_PER_IP if key.startswith("ip:") else _LOGIN_MAX_FAILURES)
+        for key in keys
+    )
+
+def _client_ip(request: Request) -> str:
+    """IP de quem fez o pedido. Atras do tunel da Cloudflare o nginx so ve o
+    cloudflared (127.0.0.1/gateway do Docker): o X-Real-IP era o mesmo para
+    todo mundo e 10 senhas erradas de uma pessoa travavam o login de todos.
+    O CF-Connecting-IP e o IP real; o backend so escuta no 127.0.0.1 do VPS,
+    entao o cabecalho chega da Cloudflare, nao do aparelho."""
+    return (
+        request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-real-ip")
+        or (request.client.host if request.client else "")
+    )
 
 def _register_login_failure(keys: List[str], now: datetime) -> None:
     for key in keys:
@@ -3662,12 +4097,11 @@ async def _check_firebase_password(email: str, password: str) -> str:
             detail="Login por CPF indisponivel: configure FIREBASE_WEB_API_KEY no backend.",
         )
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword",
-                params={"key": FIREBASE_WEB_API_KEY},
-                json={"email": email, "password": password, "returnSecureToken": False},
-            )
+        response = await _http_client().post(
+            _google_api("identitytoolkit.googleapis.com", "v1/accounts:signInWithPassword"),
+            params={"key": FIREBASE_WEB_API_KEY},
+            json={"email": email, "password": password, "returnSecureToken": False},
+        )
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail="Falha ao validar o acesso. Tente novamente.") from exc
     if response.is_success:
@@ -3691,7 +4125,7 @@ async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
     """Login por CPF: com a senha certa, devolve o e-mail da conta para o app
     entrar no Firebase. CPF desconhecido e senha errada dao a mesma resposta."""
     digits = cpf_digits(payload.cpf)
-    client_ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "")
+    client_ip = _client_ip(request)
     keys = [f"ip:{client_ip}", f"cpf:{digits}"]
     now = _local_now()
     if _login_blocked(keys, now):
@@ -3702,14 +4136,14 @@ async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
         raise invalid
 
     db = get_firestore_admin()
-    matches = _users_with_cpf(db, digits)
+    matches = await asyncio.to_thread(_users_with_cpf, db, digits, False)
     if len(matches) > 1:
         raise HTTPException(status_code=409, detail="Mais de um cadastro com este CPF. Procure o administrador.")
     if not matches:
         _register_login_failure(keys, now)
         raise invalid
     try:
-        email = firebase_auth.get_user(matches[0].id).email
+        email = (await asyncio.to_thread(firebase_auth.get_user, matches[0].id)).email
     except firebase_auth.UserNotFoundError:
         email = None
     if not email:
@@ -3737,7 +4171,7 @@ class AdminUserCreateRequest(BaseModel):
     daily_mode: bool = False
 
 @app.post("/admin/users")
-async def create_user_admin_endpoint(
+def create_user_admin_endpoint(
     payload: AdminUserCreateRequest,
     admin=Depends(require_admin_user),
 ):
@@ -3759,9 +4193,10 @@ async def create_user_admin_endpoint(
     db = get_firestore_admin()
     if _users_with_cpf(db, digits):
         raise HTTPException(status_code=409, detail="Ja existe um cadastro com este CPF.")
+    temporary_password = _temporary_password()
     try:
         account = firebase_auth.create_user(
-            email=auth_email, password=DEFAULT_USER_PASSWORD, display_name=name,
+            email=auth_email, password=temporary_password, display_name=name,
         )
     except firebase_auth.EmailAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail="Este e-mail ja esta em uso.") from exc
@@ -3806,14 +4241,16 @@ async def create_user_admin_endpoint(
         "status": "created",
         "id": account.uid,
         "cpf": profile["cpf"],
-        "default_password": DEFAULT_USER_PASSWORD,
+        # "default_password" para o app antigo, que mostrava a senha por esse nome.
+        "default_password": temporary_password,
+        "temporary_password": temporary_password,
     }
 
 class OwnPasswordChangeRequest(BaseModel):
     new_password: str
 
 @app.post("/me/password")
-async def change_own_password_endpoint(
+def change_own_password_endpoint(
     payload: OwnPasswordChangeRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3823,7 +4260,7 @@ async def change_own_password_endpoint(
     password = payload.new_password
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="A senha precisa de pelo menos 6 caracteres.")
-    if password == DEFAULT_USER_PASSWORD:
+    if password == LEGACY_DEFAULT_PASSWORD:
         raise HTTPException(status_code=400, detail="Escolha uma senha diferente da senha padrao.")
     cpf = cpf_digits(user.get("cpf"))
     if cpf and password == cpf:
@@ -3846,7 +4283,7 @@ async def change_own_password_endpoint(
     return {"status": "success"}
 
 @app.put("/admin/users/{user_id}")
-async def update_user_admin_endpoint(
+def update_user_admin_endpoint(
     user_id: str,
     payload: AdminUserUpdateRequest,
     admin=Depends(require_admin_user),
@@ -3885,6 +4322,12 @@ async def update_user_admin_endpoint(
             raise HTTPException(status_code=409, detail="Ja existe outro cadastro com este CPF.")
     new_email, auth_email = _login_emails(payload.email, new_cpf)
     new_password = (payload.new_password or "").strip()
+    temporary_password = None
+    if payload.reset_password:
+        # "Gerar senha temporaria" no painel: a pessoa troca no proximo acesso.
+        new_password = temporary_password = _temporary_password()
+    if new_password == LEGACY_DEFAULT_PASSWORD:
+        raise HTTPException(status_code=400, detail="Use \"Gerar senha temporaria\" em vez da senha padrao antiga.")
     if new_password and len(new_password) < 6:
         raise HTTPException(status_code=400, detail="A nova senha deve ter pelo menos 6 caracteres.")
 
@@ -3927,6 +4370,9 @@ async def update_user_admin_endpoint(
         # Estagiario segue o horario controlado; nao entra no modo diaria.
         update_data["daily_mode"] = payload.daily_mode and role not in {"intern", "estagiario"}
     user_ref.update(update_data)
+    if payload.disabled or new_password:
+        # Conta desativada ou senha trocada: o token guardado deixa de valer ja.
+        _forget_user_tokens(target_id)
     db.collection("system_audits").document().set({
         "action": "update_user_admin",
         "target_user_id": target_id,
@@ -3942,10 +4388,14 @@ async def update_user_admin_endpoint(
         "password_was_reset": bool(new_password),
         "created_at": firestore.SERVER_TIMESTAMP,
     })
-    return {"status": "success", "id": target_id}
+    return {
+        "status": "success",
+        "id": target_id,
+        **({"temporary_password": temporary_password} if temporary_password else {}),
+    }
 
 @app.patch("/admin/time-records/{record_id}")
-async def update_time_record_admin_endpoint(
+def update_time_record_admin_endpoint(
     record_id: str,
     payload: AdminTimeRecordUpdateRequest,
     admin=Depends(require_admin_user),
@@ -3954,6 +4404,12 @@ async def update_time_record_admin_endpoint(
         raise HTTPException(status_code=403, detail="Apenas admin pode editar registros de ponto.")
     if not payload.reason.strip():
         raise HTTPException(status_code=400, detail="Informe o motivo da edicao.")
+    # Mesmo formato dos outros pontos (hora local, sem fuso): um texto qualquer
+    # aqui embaralhava a ordem dos pontos e os filtros por periodo, que
+    # comparam o texto.
+    if not (payload.new_timestamp or "").strip():
+        raise HTTPException(status_code=400, detail="Informe o novo horario.")
+    new_timestamp = _local_iso(_parse_schedule_datetime(payload.new_timestamp.strip(), _LOCAL_TZ))
 
     db = get_firestore_admin()
     record_ref = db.collection("time_records").document(record_id)
@@ -3969,7 +4425,7 @@ async def update_time_record_admin_endpoint(
 
         old_data = snapshot.to_dict() or {}
         transaction.update(record_ref, {
-            "timestamp": payload.new_timestamp,
+            "timestamp": new_timestamp,
             "notes": payload.notes or "",
             "updated_at": firestore.SERVER_TIMESTAMP,
             "edited_by_admin": True,
@@ -3984,7 +4440,7 @@ async def update_time_record_admin_endpoint(
             "record_user_id": old_data.get("user_id"),
             "record_type": old_data.get("record_type"),
             "old_timestamp": old_data.get("timestamp"),
-            "new_timestamp": payload.new_timestamp,
+            "new_timestamp": new_timestamp,
             "old_notes": old_data.get("notes"),
             "new_notes": payload.notes or "",
             "reason": payload.reason,
@@ -3999,7 +4455,7 @@ async def update_time_record_admin_endpoint(
     return {"status": "success", "id": record_id}
 
 @app.delete("/admin/users/{user_id}")
-async def delete_user_admin_endpoint(
+def delete_user_admin_endpoint(
     user_id: str,
     admin=Depends(require_admin_user),
 ):
@@ -4015,6 +4471,7 @@ async def delete_user_admin_endpoint(
 
     try:
         firebase_auth.delete_user(user_id)
+        _forget_user_tokens(user_id)
         auth_deleted = True
     except firebase_auth.UserNotFoundError:
         auth_deleted = False
@@ -4044,12 +4501,7 @@ async def delete_user_admin_endpoint(
         "deleted_counts": deleted_counts,
     }
 
-# --- DATABASE SETUP ---
-SQLALCHEMY_DATABASE_URL = "sqlite:///./ponto.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    # Mesma porta do Docker e do README.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

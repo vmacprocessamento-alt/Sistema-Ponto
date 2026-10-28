@@ -31,8 +31,10 @@ const VENDOR_CACHE = `vmac-ponto-vendor-${CACHE_VERSION}`;
 
 // Quanto esperar a rede antes de servir o cache. Arquivos grandes (main.dart.js,
 // canvaskit.wasm) continuam baixando em segundo plano e atualizam o cache
-// quando terminam.
-const NETWORK_TIMEOUT_MS = 8000;
+// quando terminam. Com 8 s, no sinal fraco da obra cada arquivo que ja estava
+// guardado esperava ate 8 s antes de abrir. Sem copia guardada (primeira
+// visita) a espera pela rede continua sem limite, como antes.
+const NETWORK_TIMEOUT_MS = 3000;
 
 // Arquivos minimos para o app abrir. Sao buscados na instalacao para o
 // offline funcionar mesmo que a primeira visita tenha sido interrompida.

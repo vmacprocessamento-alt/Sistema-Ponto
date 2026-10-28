@@ -1,306 +1,131 @@
-# Sistema de Registro de Ponto
+# Sistema de Ponto VMac
 
-Sistema completo de controle de ponto eletrônico com backend Python (FastAPI) e frontend Flutter.
+Controle de ponto eletrônico da VMac Engenharia: app web Flutter (PWA, no
+navegador do celular ou do computador), Firebase (Auth, Firestore, push) e
+backend FastAPI. Não há mais app Android (APK).
 
 ## 📋 Funcionalidades
 
-### ✅ Já Implementadas
-
-- **Autenticação e Segurança**
-  - Login e registro de usuários
-  - Autenticação JWT
-  - Controle de acesso por roles (funcionário, gerente, admin)
-
-- **Registro de Ponto**
-  - Entrada e saída
-  - Pausas (início e fim)
-  - Geolocalização (opcional)
-  - Observações personalizadas
-
-- **Dashboard**
-  - Visualização de horas normais e extras
-  - Gráficos de horas trabalhadas
-  - Consolidação mensal
-  - Detalhamento diário
-
-- **Histórico**
-  - Consulta de registros por data
-  - Filtros personalizados
-  - Visualização detalhada
-
-- **Exportação**
-  - Geração de PDF para contabilidade
-  - Relatório completo com totalizadores
-  - Formato profissional
+- **Acesso:** login por CPF e senha; o admin cadastra a pessoa e o sistema gera
+  uma senha temporária, trocada no primeiro acesso. Palavra-chave da empresa
+  no site.
+- **Ponto:** entrada, até duas pausas e saída, com localização. Online vale a
+  hora do servidor; sem internet a batida fica no aparelho e é enviada quando
+  a rede volta (até 7 dias). Turno que vira o dia, "esqueci a saída" e pausa
+  esquecida fechada sozinha depois de 3 h.
+- **Estagiário:** horário controlado (janela de entrada e limite de saída) e
+  pedido de liberação ao gestor, com notificação.
+- **Modo diária:** para quem recebe por dia, um toque marca a diária.
+- **Dash, Histórico e Meu Mês:** horas do dia, da semana e do período da folha.
+- **Gestão:** cadastro de usuários, lançamento em lote, edição de ponto com
+  auditoria, liberações de horário, diárias.
+- **Exportação:** folha de ponto em Excel (modelos administrativo e campo),
+  lote em ZIP e relatório HTML.
+- **Notificações push** no navegador; chat de ajustes com o RH.
+- **Backup:** completo semanal e incremental diário, com cópia por e-mail
+  cifrada.
 
 ## 📚 Documentação
 
 | Documento | Conteúdo |
 |---|---|
-| [QUICK_START.md](docs/QUICK_START.md) | Subir o projeto rapidamente |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Decisões de arquitetura e fluxo de dados |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Como as peças se encaixam, quem grava o quê, fluxos e coleções |
+| [VPS.md](docs/VPS.md) | Produção: VPS, túnel da Cloudflare, atualizar, diagnóstico |
 | [FEATURES.md](docs/FEATURES.md) | Funcionalidades detalhadas |
-| [DEPLOY.md](docs/DEPLOY.md) | Publicação em produção |
+| [OFFLINE.md](docs/OFFLINE.md) | Modo offline do app web (PWA) |
 | [OPERATIONAL_CONFIG.md](docs/OPERATIONAL_CONFIG.md) | Configuração operacional |
 | [RECOVERY.md](docs/RECOVERY.md) | Recuperação automática após queda de energia |
-| [OFFLINE.md](docs/OFFLINE.md) | Modo offline do app web (PWA): como funciona, regras e teste |
+| [DEPLOY.md](docs/DEPLOY.md) | Guia geral de publicação (produção atual: VPS.md) |
 
-## 🏗️ Arquitetura
+## 🏗️ Estrutura
 
 ```
-ponto-system/
-├── backend/                    # API Python FastAPI
-│   ├── main.py                # Aplicação principal
-│   ├── work_schedule_rules.py # Regras de jornada
-│   ├── seed_data.py           # Carga inicial
-│   ├── update_user_role.py    # Utilitário de roles
+Sistema-Ponto/
+├── backend/                  # FastAPI (Python 3.12)
+│   ├── main.py               # rotas, regras de ponto, jobs
+│   ├── work_schedule_rules.py
+│   ├── restore_backup.py     # decifrar e juntar backups
+│   ├── test_*.py             # testes (pytest)
 │   ├── requirements.txt
-│   ├── Dockerfile
-│   └── data/ponto.db          # SQLite (gerado, fora do git)
-│
-├── frontend/                   # App Flutter
-│   ├── lib/
-│   │   ├── main.dart
-│   │   ├── firebase_options.dart
-│   │   ├── screens/           # Telas (login, dashboard, chat, admin…)
-│   │   ├── services/          # API, config, notificações, export
-│   │   ├── utils/             # Helpers
-│   │   └── widgets/           # Componentes reutilizáveis
-│   ├── assets/                # Imagens e templates Excel
-│   └── pubspec.yaml
-│
-├── migration/                  # Scripts de migração do AppSheet
-│   ├── migrate_from_appsheet.py
-│   └── requirements.txt
-│
-├── docs/                       # Documentação (ver tabela acima)
-├── openspec/                   # Propostas e specs de mudança
-│
-├── docker-compose.yml          # Orquestração backend + nginx
-├── nginx.conf                  # Proxy do frontend web
-├── firebase.json               # Config Firebase
-└── firestore.rules             # Regras de segurança Firestore
+│   └── Dockerfile
+├── frontend/                 # app Flutter
+│   ├── lib/                  # telas, serviços, cálculo da folha
+│   ├── web/                  # index.html, service workers (PWA e push)
+│   ├── assets/               # imagens, fontes, modelos do Excel
+│   └── test/
+├── deploy/                   # scripts do VPS
+├── migration/                # migração antiga do AppSheet
+├── firestore.rules           # regras de segurança do Firestore
+├── firestore.indexes.json
+├── docker-compose.yml        # backend + nginx
+└── nginx.conf
 ```
 
-## 🚀 Como Executar
+## 🚀 Rodar localmente
 
-### Backend (Python)
-
-1. **Instalar dependências:**
+### Backend
 ```bash
 cd backend
-python -m venv venv
-source venv/bin/activate  # No Windows: venv\Scripts\activate
+python -m venv .venv
+.venv/Scripts/activate        # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
+python main.py                # http://localhost:8000
 ```
 
-2. **Executar servidor:**
-```bash
-python main.py
-```
+Variáveis em `backend/.env` (fora do Git): `FIREBASE_PROJECT_ID`,
+`FIREBASE_SERVICE_ACCOUNT_PATH` (ou `FIREBASE_SERVICE_ACCOUNT_JSON`),
+`FIREBASE_WEB_API_KEY`, `SECRET_KEY`, `SHARED_ACCESS_TOKEN` (palavra-chave do
+site), `MAIL_PASSWORD`, `BACKUP_ZIP_PASSWORD`, `ALLOWED_ORIGINS`,
+`ENABLE_API_DOCS`. Sem credencial do Firebase Admin as rotas que usam o
+Firestore respondem 503.
 
-O servidor estará disponível em: `http://localhost:8000`
-
-3. **Acessar documentação da API:**
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-
-### Frontend (Flutter)
-
-1. **Instalar dependências:**
+### App
 ```bash
 cd frontend
 flutter pub get
+flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8000
 ```
+Sem `API_BASE_URL`, o app usa `<site>/api` (o backend no mesmo site).
 
-2. **Configurar URL da API:**
-Edite o arquivo `lib/services/api_service.dart` e altere:
-```dart
-static const String baseUrl = 'http://SEU-SERVIDOR:8000';
-```
-
-3. **Executar app:**
+### Docker
 ```bash
-# Android
-flutter run
-
-# iOS
-flutter run
-
-# Web
-flutter run -d chrome
+docker compose up -d --build   # backend :8000, site :8080
 ```
 
-## 📊 Migração de Dados do AppSheet
+## 🧪 Testes
 
-1. **Exportar dados do AppSheet:**
-   - Vá para o AppSheet
-   - Exporte as tabelas como CSV
-   - Salve como `users.csv` e `time_records.csv`
-
-2. **Preparar arquivos CSV:**
-
-**users.csv:**
-```csv
-id,email,name,cpf,role,daily_hours
-1,joao@email.com,João Silva,12345678900,employee,8.0
-2,maria@email.com,Maria Santos,98765432100,manager,8.0
-```
-
-**time_records.csv:**
-```csv
-id,user_id,timestamp,type,location,notes
-1,1,2024-01-15T08:00:00,check_in,Escritório,
-2,1,2024-01-15T17:00:00,check_out,Escritório,
-```
-
-3. **Executar migração:**
 ```bash
-cd migration
-pip install -r requirements.txt
-python migrate_from_appsheet.py
+cd backend && python -m pytest    # Firestore simulado em memória
+cd frontend && flutter test
 ```
 
-## 🔧 Configuração
+**Ponta a ponta, sem tocar no Firebase real:** a pasta [`e2e/`](e2e/README.md)
+roda o app web no Chrome, o backend e o emulador (login, batidas, offline,
+liberação do estagiário, exportação...). Em resumo, com o
+[emulador do Firebase](https://firebase.google.com/docs/emulator-suite) e um
+projeto `demo-` (que não alcança nenhum projeto real):
 
-### Variáveis de Ambiente (Backend)
+```bash
+firebase emulators:start --only auth,firestore --project demo-ponto
 
-Crie um arquivo `.env` na pasta `backend`:
+# backend falando com o emulador
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8085 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 \
+FIREBASE_PROJECT_ID=demo-ponto FIREBASE_WEB_API_KEY=demo-key \
+DATABASE_PATH=./data/ponto-emu.db python -m uvicorn main:app --port 8000
 
-```env
-SECRET_KEY=sua-chave-secreta-super-segura-aqui
-DATABASE_URL=sqlite:///./ponto.db
-ACCESS_TOKEN_EXPIRE_MINUTES=30
+# app falando com o emulador
+flutter build web --dart-define=USE_FIREBASE_EMULATOR=true \
+  --dart-define=API_BASE_URL=http://127.0.0.1:8000
 ```
 
-### Configurações do App (Flutter)
+## 🚢 Publicar
 
-Edite `lib/services/api_service.dart`:
-```dart
-static const String baseUrl = 'http://seu-servidor.com:8000';
-```
+Produção roda num VPS: `bash /opt/ponto/deploy/atualizar.sh` (detalhes em
+[VPS.md](docs/VPS.md)). As **regras do Firestore** não vão nesse script:
+`firebase deploy --only firestore:rules`. O app web se atualiza sozinho na
+próxima abertura; publique as regras depois do site, não antes.
 
-## 📱 Telas do App
+## 📊 Migração do AppSheet (histórico)
 
-### 1. Login
-- Email e senha
-- Link para cadastro
-- Validação de campos
-
-### 2. Cadastro
-- Nome completo
-- Email
-- CPF (com formatação automática)
-- Senha e confirmação
-
-### 3. Home (Registro de Ponto)
-- Relógio em tempo real
-- Botões de ação contextuais:
-  - Registrar Entrada
-  - Iniciar/Encerrar Pausa
-  - Registrar Saída
-- Status atual do funcionário
-
-### 4. Dashboard
-- Seletor de mês
-- Cards de resumo:
-  - Horas normais
-  - Horas extras
-- Gráfico de horas por dia
-- Lista detalhada com:
-  - Horário de entrada/saída
-  - Total de horas
-  - Horas extras destacadas
-
-### 5. Histórico
-- Seletor de data
-- Lista de todos os registros do dia
-- Detalhes de cada marcação
-
-### 6. Perfil
-- Informações do usuário
-- Exportação de folha de ponto (PDF)
-- Logout
-
-## 🔐 Segurança
-
-- **Autenticação JWT:** Tokens com expiração configurável
-- **Senhas:** Hash bcrypt
-- **CORS:** Configurado para aceitar origens específicas
-- **SQL Injection:** Proteção via ORM SQLAlchemy
-- **Validação:** Pydantic para validação de dados
-
-## 📦 Dependências Principais
-
-### Backend
-- FastAPI: Framework web
-- SQLAlchemy: ORM
-- Passlib: Hash de senhas
-- Python-JOSE: JWT
-- Uvicorn: Servidor ASGI
-
-### Frontend
-- http/dio: Cliente HTTP
-- provider: Gerenciamento de estado
-- shared_preferences: Armazenamento local
-- fl_chart: Gráficos
-- pdf: Geração de PDFs
-- intl: Internacionalização
-
-## 🎨 Personalização
-
-### Mudar cores do app:
-Edite `frontend/lib/main.dart`:
-```dart
-theme: ThemeData(
-  primarySwatch: Colors.blue, // Mude aqui
-  // ...
-),
-```
-
-### Ajustar carga horária padrão:
-Backend `main.py`:
-```python
-daily_hours = Column(Float, default=8.0)  # Mude aqui
-```
-
-## 📈 Próximas Melhorias
-
-- [ ] Notificações push
-- [x] Modo offline (ver [OFFLINE.md](docs/OFFLINE.md))
-- [ ] Reconhecimento facial
-- [ ] Integração com sistemas de RH
-- [ ] App para gestores
-- [ ] Relatórios avançados
-- [ ] Banco de horas
-- [ ] Múltiplas empresas
-
-## 🆘 Troubleshooting
-
-### Erro de conexão com API
-- Verifique se o backend está rodando
-- Confirme a URL em `api_service.dart`
-- Verifique firewall/porta 8000
-
-### Erro de CORS
-- Ajuste `allow_origins` no backend
-- Use IP real ao invés de localhost em dispositivos móveis
-
-### Erro de migração
-- Confirme formato dos CSVs
-- Verifique nomes das colunas
-- Crie usuário admin primeiro
-
-## 📝 Licença
-
-Este projeto é de código aberto para uso educacional e comercial.
-
-## 👥 Suporte
-
-Para dúvidas e suporte:
-- Crie uma issue no repositório
-- Email: suporte@seudominio.com
-
----
-
-Desenvolvido com ❤️ usando Flutter e Python
+Scripts da migração inicial em `migration/` (`migrate_from_appsheet.py`, com
+exemplos de CSV). Não é usada no dia a dia.

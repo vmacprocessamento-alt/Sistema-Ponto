@@ -367,8 +367,8 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
           color: Theme.of(context).brightness == Brightness.dark
-              ? Colors.white.withOpacity(0.08)
-              : Colors.black.withOpacity(0.06),
+              ? Colors.white.withValues(alpha: 0.08)
+              : Colors.black.withValues(alpha: 0.06),
         ),
       ),
       child: child,
@@ -602,9 +602,9 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
       width: double.infinity,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.08),
+        color: color.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withOpacity(0.3)),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Row(
         children: [
@@ -676,7 +676,7 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
           width: 10,
           height: 10,
           decoration: BoxDecoration(
-              color: color.withOpacity(0.18),
+              color: color.withValues(alpha: 0.18),
               border: Border.all(color: color),
               borderRadius: BorderRadius.circular(3)),
         ),
@@ -709,7 +709,7 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 decoration: BoxDecoration(
-                  color: _balanceColor(w.balance).withOpacity(0.12),
+                  color: _balanceColor(w.balance).withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Text(_signedHm(w.balance),
@@ -814,12 +814,12 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
             height: 44,
             alignment: Alignment.center,
             decoration: BoxDecoration(
-              color: color == null ? Colors.transparent : color.withOpacity(0.12),
+              color: color == null ? Colors.transparent : color.withValues(alpha: 0.12),
               borderRadius: BorderRadius.circular(8),
               border: Border.all(
                 color: isToday
                     ? const Color(0xFF8B0000)
-                    : (color ?? viz.grid).withOpacity(color == null ? 1 : 0.6),
+                    : (color ?? viz.grid).withValues(alpha: color == null ? 1 : 0.6),
                 width: isToday ? 2 : 1,
               ),
             ),
@@ -993,9 +993,9 @@ class _MonthlyDashboardScreenState extends State<MonthlyDashboardScreen> {
                 ),
                 titlesData: FlTitlesData(
                   topTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   rightTitles:
-                      AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      const AxisTitles(sideTitles: SideTitles(showTitles: false)),
                   leftTitles: AxisTitles(
                     sideTitles: SideTitles(
                       showTitles: true,
