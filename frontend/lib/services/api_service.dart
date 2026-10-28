@@ -2102,8 +2102,8 @@ class ApiService {
     return users;
   }
 
-  /// Admin cadastra uma pessoa: ela entra com o CPF e a senha padrao
-  /// ([defaultUserPassword]) e cria a propria no primeiro acesso. Sem
+  /// Admin cadastra uma pessoa: ela entra com o CPF e a senha temporaria
+  /// (gerada pelo backend, em temporary_password) e cria a propria no primeiro acesso. Sem
   /// [email], a conta usa um e-mail interno tirado do CPF.
   Future<Map<String, dynamic>> createUserAdmin({
     required String name,

@@ -1961,7 +1961,8 @@ class _UserEditDialogState extends State<UserEditDialog> {
 }
 
 /// Cadastro de uma pessoa pelo admin (nao ha mais cadastro pelo app). Ela
-/// entra com o CPF e a senha padrao e cria a propria no primeiro acesso.
+/// entra com o CPF e a senha temporaria gerada pelo backend e cria a propria
+/// no primeiro acesso.
 /// Devolve {'name', 'cpf'} da conta criada, ou null.
 class UserCreateDialog extends StatefulWidget {
   const UserCreateDialog({super.key});
