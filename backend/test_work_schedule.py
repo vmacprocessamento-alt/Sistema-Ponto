@@ -1,4 +1,5 @@
 import asyncio
+import io
 import itertools
 import os
 import sys
@@ -937,7 +938,10 @@ class ExcelExportTest(unittest.TestCase):
         except FileNotFoundError as exc:
             self.skipTest(str(exc))
         self.addCleanup(os.unlink, path)
-        workbook = openpyxl.load_workbook(path)
+        # Da memoria: no Windows o openpyxl segura o arquivo aberto mesmo depois
+        # do close() e o unlink da limpeza falhava (so no teste).
+        with open(path, "rb") as handle:
+            workbook = openpyxl.load_workbook(io.BytesIO(handle.read()))
         self.addCleanup(workbook.close)
         return workbook.active
 
@@ -1207,7 +1211,10 @@ class DailyModeExportTest(unittest.TestCase):
         except FileNotFoundError as exc:
             self.skipTest(str(exc))
         self.addCleanup(os.unlink, path)
-        workbook = openpyxl.load_workbook(path)
+        # Da memoria: no Windows o openpyxl segura o arquivo aberto mesmo depois
+        # do close() e o unlink da limpeza falhava (so no teste).
+        with open(path, "rb") as handle:
+            workbook = openpyxl.load_workbook(io.BytesIO(handle.read()))
         self.addCleanup(workbook.close)
         return workbook
 
