@@ -8,6 +8,7 @@ import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import 'monthly_dashboard_screen.dart';
+import '../utils/screen_watch.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -49,7 +50,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     super.initState();
     _fetchInitialData();
     _timer = Timer.periodic(const Duration(seconds: 30), (timer) {
-      if (mounted) {
+      if (mounted && isScreenWatched(context)) {
         setState(() => _now = DateTime.now());
         _fetchDashboardData();
       }

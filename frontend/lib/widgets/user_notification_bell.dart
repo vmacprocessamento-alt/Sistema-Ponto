@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../screens/chat_screen.dart';
 import '../services/api_service.dart';
+import '../utils/screen_watch.dart';
 
 class UserNotificationBell extends StatefulWidget {
   const UserNotificationBell({super.key});
@@ -28,10 +29,9 @@ class _UserNotificationBellState extends State<UserNotificationBell> {
     _loadNotifications();
     // 2 min em vez de 30s: o push ja avisa na hora; este polling e so rede de
     // seguranca e roda em toda aba aberta o dia inteiro, custando leitura.
-    _pollTimer = Timer.periodic(
-      const Duration(minutes: 2),
-      (_) => _loadNotifications(),
-    );
+    _pollTimer = Timer.periodic(const Duration(minutes: 2), (_) {
+      if (mounted && isScreenWatched(context)) _loadNotifications();
+    });
   }
 
   @override
