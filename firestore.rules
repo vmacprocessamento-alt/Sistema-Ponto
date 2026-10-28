@@ -51,10 +51,11 @@ service cloud.firestore {
       allow read: if isSignedIn()
         && (resource.data.user_id == request.auth.uid || isAdmin());
 
-      // created_at tem de ser a hora do servidor (o app sempre manda serverTimestamp): é com ela que o RH vê a
-      // batida que chegou muito depois — ou muito antes — do horário marcado no aparelho.
-      allow create: if isSignedIn()
-        && (request.resource.data.user_id == request.auth.uid || isAdmin())
+      // Batida de funcionário e estagiário só pelo backend (Admin SDK, fora destas regras), que vale a hora do
+      // servidor e confere o turno. Antes qualquer um gravava o próprio ponto com qualquer horário: retroativo,
+      // ou o estagiário pulando o controle de horário (28/10/2026). Aqui fica só o lote do gestor (admin e
+      // gerente lançando para a equipe). created_at tem de ser a hora do servidor.
+      allow create: if isAdmin()
         && request.resource.data.created_at == request.time;
 
       // Editar ou apagar batida: só admin (o app já só deixa o admin; gerente apagaria sem auditoria).

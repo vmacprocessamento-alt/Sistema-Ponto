@@ -139,7 +139,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 decoration: BoxDecoration(
                   color: isSelected ? wineColor : Colors.transparent,
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: isSelected ? Colors.transparent : Colors.grey.withOpacity(0.3)),
+                  border: Border.all(color: isSelected ? Colors.transparent : Colors.grey.withValues(alpha: 0.3)),
                 ),
                 alignment: Alignment.center,
                 child: Text(
@@ -204,7 +204,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
                   Container(
                     padding: const EdgeInsets.all(8),
                     decoration: BoxDecoration(
-                      color: Theme.of(context).brightness == Brightness.dark ? Colors.black : Colors.black.withOpacity(0.05),
+                      color: Theme.of(context).brightness == Brightness.dark ? Colors.black : Colors.black.withValues(alpha: 0.05),
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Icon(_getIcon(r['record_type']), color: _getColor(r['record_type']), size: 20),

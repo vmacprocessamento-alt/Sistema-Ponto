@@ -2,9 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:file_saver/file_saver.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
@@ -25,7 +23,6 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
   static const _documentActionButtonSize = Size(190, 42);
   final _apiService = ApiService();
   List<Map<String, dynamic>> _documents = [];
-  List<Map<String, dynamic>> _notifications = [];
   bool _isAdmin = false;
   bool _loading = true;
   bool _downloadingMonth = false;
@@ -73,12 +70,10 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
       final user = await _apiService.getCurrentUser();
       final isAdmin = user['role'] == 'admin' || user['role'] == 'manager';
       final documents = await _apiService.getSignatureDocuments(admin: isAdmin);
-      final notifications = await _apiService.getSignatureNotifications();
       if (mounted) {
         setState(() {
           _isAdmin = isAdmin;
           _documents = documents;
-          _notifications = notifications;
         });
         final pendingDocuments = documents
             .where((document) => document['status']?.toString() == 'pending')
@@ -459,8 +454,6 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
       ].join(' ').toLowerCase();
       return searchable.contains(query);
     }).toList();
-    final unreadNotifications =
-        _notifications.where((item) => item['is_read'] != 1).toList();
     final pendingDocuments = _documents
         .where((document) => document['status']?.toString() == 'pending')
         .toList();
@@ -490,70 +483,6 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
                 ),
               ),
             ),
-          if (false)
-            IconButton(
-              onPressed: _pickMonth,
-              icon: Badge(
-                isLabelVisible: _monthFilter != null,
-                label: const Text('•'),
-                child: Icon(
-                  Icons.calendar_month,
-                  color: _monthFilter == null ? null : wineColor,
-                ),
-              ),
-              tooltip: _monthFilter == null
-                  ? 'Filtrar por mês'
-                  : 'Mês: ${_monthFilter!.month.toString().padLeft(2, '0')}/${_monthFilter!.year}',
-            ),
-          if (false && _monthFilter != null)
-            IconButton(
-              onPressed: () => setState(() => _monthFilter = null),
-              icon: const Icon(Icons.event_busy),
-              tooltip: 'Limpar filtro mensal',
-            ),
-          if (false)
-            IconButton(
-              onPressed: () async {
-                await showDialog<void>(
-                  context: context,
-                  builder: (_) => AlertDialog(
-                    title: const Text('Notificações'),
-                    content: SizedBox(
-                      width: 420,
-                      child: _notifications.isEmpty
-                          ? const Text('Nenhuma notificação ainda.')
-                          : ListView(
-                              shrinkWrap: true,
-                              children: _notifications
-                                  .map((item) => ListTile(
-                                        leading: Icon(
-                                          item['is_read'] == 1
-                                              ? Icons.notifications_none
-                                              : Icons.notifications_active,
-                                          color: wineColor,
-                                        ),
-                                        title: Text(
-                                            item['title']?.toString() ?? ''),
-                                        subtitle: Text(
-                                            item['body']?.toString() ?? ''),
-                                      ))
-                                  .toList(),
-                            ),
-                    ),
-                  ),
-                );
-                if (unreadNotifications.isNotEmpty) {
-                  await _apiService.markSignatureNotificationsRead();
-                  await _load();
-                }
-              },
-              icon: Badge(
-                isLabelVisible: unreadNotifications.isNotEmpty,
-                label: Text(unreadNotifications.length.toString()),
-                child: const Icon(Icons.notifications_outlined),
-              ),
-              tooltip: 'Notificações',
-            ),
           IconButton(
             onPressed: () => showDialog<void>(
               context: context,
@@ -573,19 +502,6 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
             icon: const Icon(Icons.search),
             tooltip: 'Pesquisar',
           ),
-          if (false)
-            PopupMenuButton<String>(
-              tooltip: 'Filtrar status',
-              icon: const Icon(Icons.filter_list),
-              onSelected: (value) => setState(() => _statusFilter = value),
-              itemBuilder: (_) => const [
-                PopupMenuItem(value: 'all', child: Text('Todos os status')),
-                PopupMenuItem(
-                    value: 'pending', child: Text('Aguardando assinatura')),
-                PopupMenuItem(value: 'signed', child: Text('Assinados')),
-                PopupMenuItem(value: 'error', child: Text('Com erro')),
-              ],
-            ),
           IconButton(
             onPressed: _loading ? null : _load,
             icon: const Icon(Icons.refresh),
@@ -913,26 +829,10 @@ class _SendDocumentDialogState extends State<_SendDocumentDialog> {
     try {
       final String fileName;
       final Uint8List fileBytes;
-      if (kIsWeb) {
-        final file = await pickPdfFromBrowser();
-        if (file == null) return;
-        fileName = file.name;
-        fileBytes = file.bytes;
-      } else {
-        final result = await FilePicker.platform.pickFiles(
-          type: FileType.custom,
-          allowedExtensions: const ['pdf'],
-          allowMultiple: false,
-          withData: true,
-        );
-        if (result == null) return;
-        final file = result.files.single;
-        if (file.bytes == null) {
-          throw Exception('Nao foi possivel ler o PDF selecionado.');
-        }
-        fileName = file.name;
-        fileBytes = file.bytes!;
-      }
+      final file = await pickPdfFromBrowser();
+      if (file == null) return;
+      fileName = file.name;
+      fileBytes = file.bytes;
 
       if (!fileName.toLowerCase().endsWith('.pdf')) {
         throw Exception('Selecione um arquivo PDF.');
@@ -1054,7 +954,7 @@ class _SendDocumentDialogState extends State<_SendDocumentDialog> {
                 ),
               ),
               const SizedBox(height: 16),
-              if (kIsWeb && !_sending)
+              if (!_sending)
                 SizedBox(
                   width: 260,
                   height: 44,

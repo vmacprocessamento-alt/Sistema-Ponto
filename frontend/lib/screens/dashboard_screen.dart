@@ -7,6 +7,7 @@ import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import '../utils/work_schedule_rules.dart' show isInternProfile;
 import 'month_overview.dart';
+import '../utils/screen_watch.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -47,7 +48,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     super.initState();
     _fetchInitialData();
     _timer = Timer.periodic(const Duration(seconds: 30), (timer) {
-      if (mounted) {
+      if (mounted && isScreenWatched(context)) {
         setState(() => _now = DateTime.now());
         _fetchDashboardData();
       }
@@ -397,7 +398,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: DropdownButtonFormField<dynamic>(
-        value: _selectedUser?['id'],
+        // initialValue so vale na criacao: a chave recria o campo quando
+        // a selecao muda pelo codigo (recarga volta ao primeiro da lista).
+        key: ValueKey(_selectedUser?['id']),
+        initialValue: _selectedUser?['id'],
         dropdownColor: Theme.of(context).cardColor,
         decoration: InputDecoration(
           labelText: 'Selecionar Funcionário',
@@ -505,7 +509,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Widget _buildCard(String title, String value, String sub,
       {bool isPrimary = false}) {
     final cardColor =
-        isPrimary ? wineColor.withOpacity(0.1) : Theme.of(context).cardColor;
+        isPrimary ? wineColor.withValues(alpha: 0.1) : Theme.of(context).cardColor;
     final textColor = Theme.of(context).textTheme.bodyLarge?.color;
 
     return Expanded(
@@ -515,7 +519,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           color: cardColor,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(
-              color: isPrimary ? wineColor : Colors.white.withOpacity(0.05),
+              color: isPrimary ? wineColor : Colors.white.withValues(alpha: 0.05),
               width: 1),
         ),
         child: Column(

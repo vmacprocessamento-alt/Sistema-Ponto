@@ -7,7 +7,6 @@ import 'history_screen.dart';
 import 'admin_screen.dart';
 import 'profile_screen.dart';
 import '../services/api_service.dart';
-import '../services/app_permission_service.dart';
 import '../services/notification_service.dart';
 import '../widgets/content_width.dart';
 import '../widgets/startup_loading.dart';
@@ -39,9 +38,6 @@ class _MainScreenState extends State<MainScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      AppPermissionService.requestStartupPermissions();
-    });
     NotificationService.registerCurrentDevice();
     _loadUser();
   }
@@ -76,12 +72,43 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
+  // Abas ja abertas nesta sessao. Cada aba so e montada no primeiro toque e
+  // depois fica viva no IndexedStack. Montar todas na abertura lia o perfil
+  // 4-5 vezes e disparava Dash (que recarrega a cada 30 s), Historico e
+  // Gestao junto com a tela de ponto, disputando a internet do celular.
+  final Set<String> _openedTabs = {'ponto'};
+
+  List<String> get _tabIds => [
+        'ponto',
+        'dash',
+        'historico',
+        if (_isAdmin) 'gestao',
+        'perfil',
+      ];
+
+  Widget _screenFor(String id) {
+    switch (id) {
+      case 'ponto':
+        return _dailyMode ? const DailyModeScreen() : const HomeScreen();
+      case 'dash':
+        return const DashboardScreen();
+      case 'historico':
+        return const HistoryScreen();
+      case 'gestao':
+        return const AdminScreen();
+      default:
+        return const ProfileScreen();
+    }
+  }
+
   List<Widget> get _screens => [
-        if (_dailyMode) const DailyModeScreen() else const HomeScreen(),
-        const DashboardScreen(),
-        const HistoryScreen(),
-        if (_isAdmin) const AdminScreen(),
-        const ProfileScreen(),
+        for (final id in _tabIds)
+          KeyedSubtree(
+            key: ValueKey(id),
+            child: _openedTabs.contains(id)
+                ? _screenFor(id)
+                : const SizedBox.shrink(),
+          ),
       ];
 
   /// Abas do menu: as mesmas no celular (barra de baixo) e no computador
@@ -95,7 +122,10 @@ class _MainScreenState extends State<MainScreen> {
   ];
 
   /// Troca de aba pelo menu de baixo (celular) ou da lateral (computador).
-  void _selectTab(int index) => setState(() => _selectedIndex = index);
+  void _selectTab(int index) => setState(() {
+        _selectedIndex = index;
+        _openedTabs.add(_tabIds[index]);
+      });
 
   /// A partir desta largura (tablet deitado, computador) o menu vai para a
   /// lateral e a tela ganha espaco na vertical.

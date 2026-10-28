@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
-import '../services/app_permission_service.dart';
 import '../utils/cpf.dart';
 import 'main_screen.dart';
 
@@ -25,9 +24,6 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      AppPermissionService.requestStartupPermissions();
-    });
     _fillLastLogin();
   }
 
@@ -92,7 +88,7 @@ class _LoginScreenState extends State<LoginScreen> {
         TextEditingController(text: _loginController.text.trim());
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Esqueceu a senha?'),
         content: SingleChildScrollView(
           child: Column(
@@ -123,33 +119,33 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Fechar'),
           ),
           ElevatedButton(
             onPressed: () async {
               if (emailController.text.trim().isNotEmpty) {
+                // Pegos antes da espera: depois dela o dialogo pode ter
+                // fechado e o context dele nao vale mais.
+                final messenger = ScaffoldMessenger.of(context);
+                final navigator = Navigator.of(dialogContext);
                 try {
                   final message =
                       await _apiService.resetPassword(emailController.text);
-                  if (mounted) {
-                    Navigator.pop(context);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        content: Text(message),
-                        backgroundColor: Colors.green,
-                      ),
-                    );
-                  }
+                  if (dialogContext.mounted) navigator.pop();
+                  messenger.showSnackBar(
+                    SnackBar(
+                      content: Text(message),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
                 } catch (e) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                          content: Text(
-                              e.toString().replaceFirst('Exception: ', '')),
-                          backgroundColor: Colors.red),
-                    );
-                  }
+                  messenger.showSnackBar(
+                    SnackBar(
+                        content:
+                            Text(e.toString().replaceFirst('Exception: ', '')),
+                        backgroundColor: Colors.red),
+                  );
                 }
               }
             },

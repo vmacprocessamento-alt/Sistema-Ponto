@@ -1,11 +1,9 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:file_saver/file_saver.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter/foundation.dart' show Uint8List, kIsWeb;
+import 'package:flutter/foundation.dart' show Uint8List;
 import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
 
 import 'app_config.dart';
 
@@ -76,18 +74,12 @@ class ExportService {
         final downloadName =
             'Folha_Ponto_${data['employee']['name']}_$month$suffix';
 
-        if (kIsWeb) {
-          await FileSaver.instance.saveFile(
-            name: downloadName,
-            bytes: bytes,
-            ext: 'xlsx',
-            mimeType: MimeType.microsoftExcel,
-          );
-        } else {
-          final directory = await getApplicationDocumentsDirectory();
-          final file = File('${directory.path}/$downloadName.xlsx');
-          await file.writeAsBytes(bytes);
-        }
+        await FileSaver.instance.saveFile(
+          name: downloadName,
+          bytes: bytes,
+          ext: 'xlsx',
+          mimeType: MimeType.microsoftExcel,
+        );
       } else {
         throw Exception(
             'Erro no servidor Python (${response.statusCode}): ${response.body}');
@@ -145,19 +137,13 @@ class ExportService {
         final Uint8List bytes = response.bodyBytes;
         final downloadName = 'Folhas_Ponto_VM_$month-$year';
 
-        if (kIsWeb) {
-          await FileSaver.instance.saveFile(
-            name: downloadName,
-            bytes: bytes,
-            ext: 'html',
-            mimeType: MimeType.custom,
-            customMimeType: 'text/html',
-          );
-        } else {
-          final directory = await getApplicationDocumentsDirectory();
-          final file = File('${directory.path}/$downloadName.html');
-          await file.writeAsBytes(bytes);
-        }
+        await FileSaver.instance.saveFile(
+          name: downloadName,
+          bytes: bytes,
+          ext: 'html',
+          mimeType: MimeType.custom,
+          customMimeType: 'text/html',
+        );
       } else {
         throw Exception(
             'Erro no servidor Python HTML (${response.statusCode}): ${response.body}');
@@ -206,18 +192,12 @@ class ExportService {
         final Uint8List bytes = response.bodyBytes;
         final downloadName = 'Folhas_Ponto_Lote_$month-$year';
 
-        if (kIsWeb) {
-          await FileSaver.instance.saveFile(
-            name: downloadName,
-            bytes: bytes,
-            ext: 'zip',
-            mimeType: MimeType.zip,
-          );
-        } else {
-          final directory = await getApplicationDocumentsDirectory();
-          final file = File('${directory.path}/$downloadName.zip');
-          await file.writeAsBytes(bytes);
-        }
+        await FileSaver.instance.saveFile(
+          name: downloadName,
+          bytes: bytes,
+          ext: 'zip',
+          mimeType: MimeType.zip,
+        );
       } else {
         throw Exception(
             'Erro no servidor Python Batch (${response.statusCode}): ${response.body}');

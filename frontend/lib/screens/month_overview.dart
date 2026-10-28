@@ -349,8 +349,8 @@ class _MonthOverviewState extends State<MonthOverview> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
           color: Theme.of(context).brightness == Brightness.dark
-              ? Colors.white.withOpacity(0.08)
-              : Colors.black.withOpacity(0.06),
+              ? Colors.white.withValues(alpha: 0.08)
+              : Colors.black.withValues(alpha: 0.06),
         ),
       ),
       child: child,
@@ -755,7 +755,7 @@ class _MonthOverviewState extends State<MonthOverview> {
             child: LinearProgressIndicator(
               value: pct,
               minHeight: 8,
-              backgroundColor: _muted.withOpacity(0.2),
+              backgroundColor: _muted.withValues(alpha: 0.2),
               valueColor: const AlwaysStoppedAnimation<Color>(_blue),
             ),
           ),
@@ -837,7 +837,7 @@ class _MonthOverviewState extends State<MonthOverview> {
           width: 10,
           height: 10,
           decoration: BoxDecoration(
-              color: color.withOpacity(0.18),
+              color: color.withValues(alpha: 0.18),
               border: Border.all(color: color),
               borderRadius: BorderRadius.circular(3)),
         ),
@@ -871,7 +871,7 @@ class _MonthOverviewState extends State<MonthOverview> {
                 padding:
                     const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                 decoration: BoxDecoration(
-                  color: _balanceColor(w.balance).withOpacity(0.12),
+                  color: _balanceColor(w.balance).withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Text(_signedHm(w.balance),
@@ -949,15 +949,15 @@ class _MonthOverviewState extends State<MonthOverview> {
       alignment: Alignment.center,
       decoration: BoxDecoration(
         color: isSelected
-            ? wineColor.withOpacity(0.22)
+            ? wineColor.withValues(alpha: 0.22)
             : color == null
                 ? Colors.transparent
-                : color.withOpacity(0.12),
+                : color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
           color: isToday || isSelected
               ? wineColor
-              : (color ?? _muted).withOpacity(color == null ? 0.3 : 0.6),
+              : (color ?? _muted).withValues(alpha: color == null ? 0.3 : 0.6),
           width: isToday || isSelected ? 2 : 1,
         ),
       ),
@@ -1032,9 +1032,9 @@ class _MonthOverviewState extends State<MonthOverview> {
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: wineColor.withOpacity(0.08),
+        color: wineColor.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: wineColor.withOpacity(0.35)),
+        border: Border.all(color: wineColor.withValues(alpha: 0.35)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

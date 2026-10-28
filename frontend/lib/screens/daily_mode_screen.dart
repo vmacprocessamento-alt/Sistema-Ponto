@@ -172,8 +172,8 @@ class _DailyModeScreenState extends State<DailyModeScreen>
           ElevatedButton(
             onPressed: () => Navigator.pop(context, true),
             style: ElevatedButton.styleFrom(backgroundColor: wineColor),
-            child: const Text('Registrar',
-                style: TextStyle(color: Colors.white)),
+            child:
+                const Text('Registrar', style: TextStyle(color: Colors.white)),
           ),
         ],
       ),
@@ -202,20 +202,25 @@ class _DailyModeScreenState extends State<DailyModeScreen>
   }
 
   void _showError(String msg) {
+    // O aviso novo entra no lugar do anterior: em fila, o "Entrada salva"
+    // ainda aparecia depois da pausa batida.
     ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(msg), backgroundColor: wineColor));
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(msg), backgroundColor: wineColor));
   }
 
   void _showSuccess(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Row(children: [
-        const Icon(Icons.check_circle, color: Colors.white),
-        const SizedBox(width: 8),
-        Expanded(child: Text(msg)),
-      ]),
-      backgroundColor: Colors.blue.shade800,
-      behavior: SnackBarBehavior.floating,
-    ));
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Row(children: [
+          const Icon(Icons.check_circle, color: Colors.white),
+          const SizedBox(width: 8),
+          Expanded(child: Text(msg)),
+        ]),
+        backgroundColor: Colors.blue.shade800,
+        behavior: SnackBarBehavior.floating,
+      ));
   }
 
   /// Hora em que a diaria foi marcada ('' sem ela), ou 'gestor' na lancada
@@ -370,7 +375,8 @@ class _DailyModeScreenState extends State<DailyModeScreen>
                     fontSize: 13,
                     fontWeight: FontWeight.w500)),
           ),
-          Text(detail, style: const TextStyle(color: Colors.grey, fontSize: 11)),
+          Text(detail,
+              style: const TextStyle(color: Colors.grey, fontSize: 11)),
         ],
       ),
     );
@@ -448,7 +454,9 @@ class _DailyModeScreenState extends State<DailyModeScreen>
           Container(
             padding: const EdgeInsets.all(6),
             decoration: BoxDecoration(
-              color: isDark ? Colors.black26 : Colors.black.withValues(alpha: 0.05),
+              color: isDark
+                  ? Colors.black26
+                  : Colors.black.withValues(alpha: 0.05),
               borderRadius: BorderRadius.circular(8),
             ),
             child: Icon(pending ? Icons.cloud_off : Icons.event_available,

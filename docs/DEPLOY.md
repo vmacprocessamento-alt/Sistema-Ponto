@@ -1,5 +1,10 @@
 # 🚀 Guia de Deploy em Produção
 
+> **Produção atual:** VPS com túnel da Cloudflare, ver [VPS.md](VPS.md). Este guia
+> é genérico (opções de hospedagem) e parte dele é da versão antiga com SQLite.
+> Regras do Firestore: `firebase deploy --only firestore:rules`, sempre depois
+> de publicar o site. O app é só web (não há mais APK).
+
 ## Opção 1: Deploy Tradicional (VPS/Servidor)
 
 ### Backend
@@ -92,19 +97,6 @@ sudo certbot --nginx -d api.seudominio.com
 ```
 
 ### Frontend (App Flutter)
-
-#### Para Android:
-```bash
-cd frontend
-flutter build apk --release
-# APK estará em: build/app/outputs/flutter-apk/app-release.apk
-```
-
-#### Para iOS:
-```bash
-flutter build ios --release
-# Depois use Xcode para publicar na App Store
-```
 
 #### Para Web:
 ```bash
@@ -224,22 +216,10 @@ git pull
 sudo systemctl restart ponto-api
 ```
 
-## 📱 Distribuição dos Apps
+## 📱 Distribuição
 
-### Android:
-1. Google Play Console
-2. Criar release assinada
-3. Upload do APK/AAB
-
-### iOS:
-1. App Store Connect
-2. Xcode Archive
-3. Upload
-
-### Distribuição Interna:
-- Firebase App Distribution
-- TestFlight (iOS)
-- APK direto (Android)
+O app é só web (PWA): atualizar o site já atualiza todo mundo na próxima
+abertura. Não há mais APK nem App Store.
 
 ## 🆘 Troubleshooting
 

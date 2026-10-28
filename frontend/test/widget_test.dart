@@ -1,24 +1,18 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ponto_app/services/app_config.dart';
 
 void main() {
-  tearDown(() {
-    debugDefaultTargetPlatformOverride = null;
-  });
-
-  test('Android usa a API de producao por padrao', () {
-    debugDefaultTargetPlatformOverride = TargetPlatform.android;
-
+  test('o backend fica no mesmo site, em /api', () {
     expect(
-      AppConfig.backendUrl,
+      AppConfig.resolveBackendUrl('', Uri.parse('https://ponto.vmacengenharia.com/?k=1')),
       'https://ponto.vmacengenharia.com/api',
     );
   });
 
-  test('desktop usa o backend local por padrao', () {
-    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
-
-    expect(AppConfig.backendUrl, 'http://localhost:8000');
+  test('API_BASE_URL troca o endereco (testes locais)', () {
+    expect(
+      AppConfig.resolveBackendUrl('http://127.0.0.1:8000/', Uri.parse('http://127.0.0.1:5005/')),
+      'http://127.0.0.1:8000',
+    );
   });
 }
