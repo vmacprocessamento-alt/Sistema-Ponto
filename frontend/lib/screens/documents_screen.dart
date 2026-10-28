@@ -484,7 +484,7 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
                   textStyle: const TextStyle(fontWeight: FontWeight.w700),
                 ),
               ),
-            ),
+            ),
           IconButton(
             onPressed: () => showDialog<void>(
               context: context,
@@ -503,7 +503,7 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
             ),
             icon: const Icon(Icons.search),
             tooltip: 'Pesquisar',
-          ),
+          ),
           IconButton(
             onPressed: _loading ? null : _load,
             icon: const Icon(Icons.refresh),
