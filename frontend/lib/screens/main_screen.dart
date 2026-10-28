@@ -75,12 +75,43 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
+  // Abas ja abertas nesta sessao. Cada aba so e montada no primeiro toque e
+  // depois fica viva no IndexedStack. Montar todas na abertura lia o perfil
+  // 4-5 vezes e disparava Dash (que recarrega a cada 30 s), Historico e
+  // Gestao junto com a tela de ponto, disputando a internet do celular.
+  final Set<String> _openedTabs = {'ponto'};
+
+  List<String> get _tabIds => [
+        'ponto',
+        'dash',
+        'historico',
+        if (_isAdmin) 'gestao',
+        'perfil',
+      ];
+
+  Widget _screenFor(String id) {
+    switch (id) {
+      case 'ponto':
+        return _dailyMode ? const DailyModeScreen() : const HomeScreen();
+      case 'dash':
+        return const DashboardScreen();
+      case 'historico':
+        return const HistoryScreen();
+      case 'gestao':
+        return const AdminScreen();
+      default:
+        return const ProfileScreen();
+    }
+  }
+
   List<Widget> get _screens => [
-        if (_dailyMode) const DailyModeScreen() else const HomeScreen(),
-        const DashboardScreen(),
-        const HistoryScreen(),
-        if (_isAdmin) const AdminScreen(),
-        const ProfileScreen(),
+        for (final id in _tabIds)
+          KeyedSubtree(
+            key: ValueKey(id),
+            child: _openedTabs.contains(id)
+                ? _screenFor(id)
+                : const SizedBox.shrink(),
+          ),
       ];
 
   @override
@@ -105,7 +136,10 @@ class _MainScreenState extends State<MainScreen> {
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
-        onTap: (index) => setState(() => _selectedIndex = index),
+        onTap: (index) => setState(() {
+          _selectedIndex = index;
+          _openedTabs.add(_tabIds[index]);
+        }),
         type: BottomNavigationBarType.fixed,
         selectedItemColor: Theme.of(context).primaryColor,
         unselectedItemColor: Colors.grey,
