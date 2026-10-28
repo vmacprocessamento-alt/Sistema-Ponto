@@ -1340,6 +1340,8 @@ class AdminDailyModeUpdateTest(unittest.TestCase):
 
 # CPF valido de teste (digitos verificadores certos).
 VALID_CPF = "52998224725"
+# Senha temporaria fixa nos testes de login (a de verdade e aleatoria).
+TEMP_PASSWORD = "73914628"
 
 
 class _FakeAuth:
@@ -1397,6 +1399,18 @@ class CpfRulesTest(unittest.TestCase):
 
 
 @needs_main
+class TemporaryPasswordTest(unittest.TestCase):
+    """Senha do primeiro acesso: aleatoria, 8 digitos, nunca a 123456 de antes."""
+
+    def test_random_digits(self):
+        senhas = [main._temporary_password() for _ in range(200)]
+        self.assertTrue(all(len(p) == 8 and p.isdigit() for p in senhas))
+        self.assertNotIn(main.LEGACY_DEFAULT_PASSWORD, senhas)
+        self.assertGreater(len(set(senhas)), 195)
+        self.assertTrue(all(len(set(p)) > 2 for p in senhas))
+
+
+@needs_main
 class CpfAccessTest(unittest.TestCase):
     """Login por CPF, cadastro pelo admin e troca de senha no primeiro acesso."""
 
@@ -1408,6 +1422,9 @@ class CpfAccessTest(unittest.TestCase):
         self.passwords_ok = {}
         main._login_failures.clear()
         main._cpf_digits_backfilled.clear()
+        patcher = mock.patch.object(main, "_temporary_password", lambda: TEMP_PASSWORD)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         async def check_password(email, password):
             account = next(a for a in self.auth.accounts.values() if a["email"] == email)
@@ -1439,17 +1456,18 @@ class CpfAccessTest(unittest.TestCase):
             call(*args, **kwargs)
         return ctx.exception.status_code, ctx.exception.detail
 
-    def test_admin_creates_user_with_default_password(self):
+    def test_admin_creates_user_with_temporary_password(self):
         response = self.create(daily_mode=True)
         uid = response["id"]
-        self.assertEqual((response["cpf"], response["default_password"]), ("529.982.247-25", "123456"))
+        self.assertEqual((response["cpf"], response["temporary_password"]), ("529.982.247-25", TEMP_PASSWORD))
+        self.assertEqual(response["default_password"], TEMP_PASSWORD)  # nome antigo, app antigo
         profile = self.db.store["users"][uid]
         self.assertTrue(profile["must_change_password"])
         self.assertTrue(profile["daily_mode"])
         self.assertEqual((profile["email"], profile["cpf_digits"], profile["job_title"]), ("", VALID_CPF, "Aux. Geral"))
         # Sem e-mail, a conta usa o interno do CPF.
         self.assertEqual(self.auth.accounts[uid]["email"], f"{VALID_CPF}@{main.CPF_LOGIN_EMAIL_DOMAIN}")
-        self.assertEqual(self.auth.accounts[uid]["password"], "123456")
+        self.assertEqual(self.auth.accounts[uid]["password"], TEMP_PASSWORD)
 
     def test_create_refuses_duplicate_invalid_cpf_and_manager(self):
         self.create()
@@ -1461,39 +1479,39 @@ class CpfAccessTest(unittest.TestCase):
 
     def test_login_by_cpf_in_any_format(self):
         uid = self.create(email="pessoa@x.com")["id"]
-        self.assertEqual(self.login("52998224725", "123456"), {"email": "pessoa@x.com"})
+        self.assertEqual(self.login("52998224725", TEMP_PASSWORD), {"email": "pessoa@x.com"})
         # Cadastro antigo gravava "529.982.247.25".
         self.db.store["users"][uid]["cpf"] = "529.982.247.25"
-        self.assertEqual(self.login("529.982.247-25", "123456"), {"email": "pessoa@x.com"})
+        self.assertEqual(self.login("529.982.247-25", TEMP_PASSWORD), {"email": "pessoa@x.com"})
 
     def test_wrong_password_and_unknown_cpf_look_the_same(self):
         self.create()
         wrong = self.status_of(self.login, VALID_CPF, "errada")
-        unknown = self.status_of(self.login, "11144477735", "123456")
+        unknown = self.status_of(self.login, "11144477735", TEMP_PASSWORD)
         self.assertEqual(wrong, unknown)
         self.assertEqual(wrong[0], 401)
 
     def test_disabled_and_duplicate(self):
         uid = self.create()["id"]
         self.auth.accounts[uid]["disabled"] = True
-        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 403)
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD)[0], 403)
         # Todo caminho grava cpf_digits (backend e o plano B do app).
         self.db.store["users"]["outro"] = {"cpf": VALID_CPF, "cpf_digits": main.cpf_digits(VALID_CPF)}
-        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 409)
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD)[0], 409)
 
     def test_duplicate_in_old_record_without_cpf_digits(self):
         # Cadastro antigo, de antes do cpf_digits, ja no banco quando o servidor sobe.
         self.create()
         self.db.store["users"]["antigo"] = {"cpf": VALID_CPF}
         main._cpf_digits_backfilled.clear()
-        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456")[0], 409)
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD)[0], 409)
 
     def test_too_many_failures_block_for_a_while(self):
         self.create()
         for _ in range(main._LOGIN_MAX_FAILURES):
             self.status_of(self.login, VALID_CPF, "errada")
         # Bloqueado mesmo com a senha certa, e de outro aparelho (por CPF).
-        self.assertEqual(self.status_of(self.login, VALID_CPF, "123456", ip="9.9.9.9")[0], 429)
+        self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD, ip="9.9.9.9")[0], 429)
 
     def change(self, user, password):
         payload = main.OwnPasswordChangeRequest(new_password=password)
@@ -1521,9 +1539,14 @@ class CpfAccessTest(unittest.TestCase):
     def test_admin_reset_password_forces_change(self):
         uid = self.create()["id"]
         self.change({"id": uid, **self.db.store["users"][uid]}, "minhaSenha9")
-        profile = self.update(uid, new_password="123456")
-        self.assertTrue(profile["must_change_password"])
-        self.assertEqual(self.auth.accounts[uid]["password"], "123456")
+        values = {"name": "Pessoa Nova", "email": "", "role": "employee", "job_title": "Aux. Geral",
+                  "daily_hours": 8.0, "cpf": "529.982.247-25", "reset_password": True}
+        response = _call(main.update_user_admin_endpoint(uid, main.AdminUserUpdateRequest(**values), self.admin))
+        self.assertEqual(response["temporary_password"], TEMP_PASSWORD)
+        self.assertTrue(self.db.store["users"][uid]["must_change_password"])
+        self.assertEqual(self.auth.accounts[uid]["password"], TEMP_PASSWORD)
+        # A senha padrao antiga nao volta nem digitada pelo admin.
+        self.assertEqual(self.status_of(self.update, uid, new_password="123456")[0], 400)
 
     def test_admin_edit_email_and_cpf(self):
         uid = self.create()["id"]

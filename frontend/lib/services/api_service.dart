@@ -580,9 +580,10 @@ class ApiService {
 
   // --- MÉTODOS DE AUTH ---
 
-  /// Senha com que o admin cadastra (e redefine) a conta. No primeiro acesso
-  /// a pessoa cria a propria (must_change_password).
-  static const String defaultUserPassword = '123456';
+  /// Senha com que as contas eram criadas ate 28/10/2026. Hoje o backend gera
+  /// uma temporaria aleatoria a cada cadastro ou redefinicao; esta nao vale
+  /// mais como senha nova.
+  static const String legacyDefaultPassword = '123456';
 
   /// Login pelo CPF: o backend confere a senha e devolve o e-mail da conta
   /// no Firebase (o de verdade ou o interno do CPF), e o login segue por ele.
@@ -2149,6 +2150,7 @@ class ApiService {
     required String cpf,
     bool disabled = false,
     String? newPassword,
+    bool resetPassword = false,
     bool workScheduleOverrideEnabled = false,
     Map<String, dynamic>? workScheduleOverride,
     bool dailyMode = false,
@@ -2169,6 +2171,8 @@ class ApiService {
             'cpf': cpf,
             'disabled': disabled,
             'new_password': newPassword,
+            // O backend gera a senha temporaria e devolve em temporary_password.
+            'reset_password': resetPassword,
             'work_schedule_override_enabled': workScheduleOverrideEnabled,
             'work_schedule_override': workScheduleOverride,
             'daily_mode': dailyMode,
@@ -2186,7 +2190,9 @@ class ApiService {
           dailyHours: dailyHours,
           cpf: cpf,
           disabled: disabled,
-          newPassword: newPassword,
+          // Senha temporaria so o backend gera: o plano B recusa como a
+          // senha digitada.
+          newPassword: resetPassword ? 'senha temporaria' : newPassword,
           workScheduleOverrideEnabled: workScheduleOverrideEnabled,
           workScheduleOverride: workScheduleOverride,
           dailyMode: dailyMode,

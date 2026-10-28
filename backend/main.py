@@ -610,6 +610,8 @@ class AdminUserUpdateRequest(BaseModel):
     cpf: str
     disabled: bool = False
     new_password: Optional[str] = None
+    # Gera uma senha temporaria (devolvida na resposta) em vez de new_password.
+    reset_password: bool = False
     work_schedule_override_enabled: bool = False
     work_schedule_override: Optional[Dict[str, str]] = None
     # None (app antigo, sem o campo) mantem o modo diaria como esta.
@@ -3685,7 +3687,19 @@ def admin_delete_daily_entry_endpoint(
 # nunca recebe mensagem. O login por CPF (/auth/cpf-login) confere a senha e
 # devolve o e-mail da conta; o app entra com ele como antes.
 
-DEFAULT_USER_PASSWORD = "123456"
+# Senha com que as contas eram criadas ate 28/10/2026. Quem sabia o CPF da
+# pessoa entrava como ela ate o primeiro acesso. Nao vale mais como senha nova.
+LEGACY_DEFAULT_PASSWORD = "123456"
+
+def _temporary_password() -> str:
+    """Senha do primeiro acesso: 8 digitos aleatorios, mostrados uma vez ao
+    admin para entregar a pessoa, que troca no primeiro acesso
+    (must_change_password). Digitos porque e digitada no celular; o limite de
+    tentativas por CPF segura a adivinhacao."""
+    while True:
+        password = f"{secrets.randbelow(10 ** 8):08d}"
+        if len(set(password)) > 2:  # nada de 00000000, 11112111...
+            return password
 CPF_LOGIN_EMAIL_DOMAIN = os.getenv("CPF_LOGIN_EMAIL_DOMAIN", "cpf.ponto.vmacengenharia.com")
 
 def cpf_digits(value) -> str:
@@ -3917,9 +3931,10 @@ def create_user_admin_endpoint(
     db = get_firestore_admin()
     if _users_with_cpf(db, digits):
         raise HTTPException(status_code=409, detail="Ja existe um cadastro com este CPF.")
+    temporary_password = _temporary_password()
     try:
         account = firebase_auth.create_user(
-            email=auth_email, password=DEFAULT_USER_PASSWORD, display_name=name,
+            email=auth_email, password=temporary_password, display_name=name,
         )
     except firebase_auth.EmailAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail="Este e-mail ja esta em uso.") from exc
@@ -3964,7 +3979,9 @@ def create_user_admin_endpoint(
         "status": "created",
         "id": account.uid,
         "cpf": profile["cpf"],
-        "default_password": DEFAULT_USER_PASSWORD,
+        # "default_password" para o app antigo, que mostrava a senha por esse nome.
+        "default_password": temporary_password,
+        "temporary_password": temporary_password,
     }
 
 class OwnPasswordChangeRequest(BaseModel):
@@ -3981,7 +3998,7 @@ def change_own_password_endpoint(
     password = payload.new_password
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="A senha precisa de pelo menos 6 caracteres.")
-    if password == DEFAULT_USER_PASSWORD:
+    if password == LEGACY_DEFAULT_PASSWORD:
         raise HTTPException(status_code=400, detail="Escolha uma senha diferente da senha padrao.")
     cpf = cpf_digits(user.get("cpf"))
     if cpf and password == cpf:
@@ -4043,6 +4060,12 @@ def update_user_admin_endpoint(
             raise HTTPException(status_code=409, detail="Ja existe outro cadastro com este CPF.")
     new_email, auth_email = _login_emails(payload.email, new_cpf)
     new_password = (payload.new_password or "").strip()
+    temporary_password = None
+    if payload.reset_password:
+        # "Gerar senha temporaria" no painel: a pessoa troca no proximo acesso.
+        new_password = temporary_password = _temporary_password()
+    if new_password == LEGACY_DEFAULT_PASSWORD:
+        raise HTTPException(status_code=400, detail="Use \"Gerar senha temporaria\" em vez da senha padrao antiga.")
     if new_password and len(new_password) < 6:
         raise HTTPException(status_code=400, detail="A nova senha deve ter pelo menos 6 caracteres.")
 
@@ -4100,7 +4123,11 @@ def update_user_admin_endpoint(
         "password_was_reset": bool(new_password),
         "created_at": firestore.SERVER_TIMESTAMP,
     })
-    return {"status": "success", "id": target_id}
+    return {
+        "status": "success",
+        "id": target_id,
+        **({"temporary_password": temporary_password} if temporary_password else {}),
+    }
 
 @app.patch("/admin/time-records/{record_id}")
 def update_time_record_admin_endpoint(

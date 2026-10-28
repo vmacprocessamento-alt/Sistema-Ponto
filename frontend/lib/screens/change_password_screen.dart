@@ -43,7 +43,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   String? _validatePassword(String? value) {
     final password = value ?? '';
     if (password.length < 6) return 'Use pelo menos 6 caracteres.';
-    if (password == ApiService.defaultUserPassword) {
+    if (password == ApiService.legacyDefaultPassword) {
       return 'Escolha uma senha diferente da senha padrão.';
     }
     final cpf = cpfDigits(widget.cpf);
