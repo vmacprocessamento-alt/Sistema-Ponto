@@ -3157,6 +3157,173 @@ def schedule_controlled_punch_endpoint(
     record_ref.set(record)
     return {"status": "created", "id": record_ref.id, **_response_safe(record)}
 
+class TimeRecordPunchRequest(BaseModel):
+    record_type: str
+    # Id gerado no aparelho: o reenvio da fila offline devolve o ponto ja
+    # gravado em vez de duplicar.
+    client_record_id: str
+    timestamp: Optional[str] = None
+    offline: bool = False
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    # "forgotten_exit": fecha o turno aberto sem horas (saida 1s depois da
+    # entrada; o gestor lanca a hora real). "auto_break_close": fecha a pausa
+    # aberta ha 3h+ com 1h de pausa. Nos dois a hora e o id saem do servidor,
+    # nao do aparelho. ref_record_id: a entrada (ou a pausa) que a batida fecha.
+    kind: Optional[str] = None
+    ref_record_id: Optional[str] = None
+
+_PUNCH_TYPES = {"check_in", "check_out", "break_start", "break_end", "entry_3", "exit_3"}
+_BREAK_CLOSE_TYPE = {"break_start": "break_end", "entry_3": "exit_3"}
+_FORGOTTEN_EXIT_NOTES = "Saida esquecida: o gestor precisa lancar o horario real"
+
+def _forgotten_exit(user_id: str, open_shift: dict, location: Optional[str], notes: Optional[str]) -> tuple:
+    """(id, ponto) da saida esquecida que fecha o turno [open_shift] sem horas.
+    Id fixo pela entrada: "Esqueci" em dois aparelhos grava a mesma saida."""
+    opened = _to_local_naive(str(open_shift.get("timestamp")))
+    return f"forgot_{open_shift['id']}", {
+        "user_id": user_id,
+        "record_type": "check_out",
+        "location": location or "App (saida esquecida)",
+        "notes": notes or _FORGOTTEN_EXIT_NOTES,
+        "timestamp": _local_iso(opened + timedelta(seconds=1)),
+        "latitude": None,
+        "longitude": None,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+
+@app.post("/time-records/punch")
+def time_record_punch_endpoint(
+    payload: TimeRecordPunchRequest,
+    user=Depends(require_authenticated_user),
+):
+    """Batida de quem nao e estagiario (o estagiario usa /work-schedule/punch
+    para entrada e saida). Antes o app gravava direto no Firestore com a hora
+    do celular, e as regras deixavam qualquer um gravar ponto com qualquer
+    horario: retroativo, ou o estagiario pulando o controle de horario."""
+    record_type = payload.record_type
+    if record_type not in _PUNCH_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo de ponto invalido.")
+    if not _CLIENT_RECORD_ID_RE.fullmatch(payload.client_record_id or ""):
+        raise HTTPException(status_code=400, detail="Identificador do registro invalido.")
+    if payload.kind not in (None, "forgotten_exit", "auto_break_close"):
+        raise HTTPException(status_code=400, detail="Tipo de batida invalido.")
+    if _is_intern_profile(user) and record_type in {"check_in", "check_out"} and payload.kind is None:
+        raise HTTPException(status_code=400, detail="Entrada e saida do estagiario seguem o horario controlado.")
+
+    db = get_firestore_admin()
+    user_id = user["id"]
+
+    def existing_or_none(doc_id: str) -> Optional[dict]:
+        snapshot = db.collection("time_records").document(doc_id).get()
+        if not snapshot.exists:
+            return None
+        data = serialize_firestore_document(snapshot)
+        if data.get("user_id") != user_id:
+            raise HTTPException(status_code=409, detail="Identificador do registro ja usado por outro usuario.")
+        return {"status": "created", **data}
+
+    # Reenvio da mesma batida (resposta perdida, fila offline): vale o gravado.
+    already = existing_or_none(payload.client_record_id)
+    if already:
+        return already
+
+    records = _user_records_sorted(db, user_id)
+    server_now = datetime.now(ZoneInfo(_LOCAL_TZ))
+
+    if payload.kind == "auto_break_close":
+        break_id = (payload.ref_record_id or "").strip()
+        if not break_id or not records or records[-1].get("id") != break_id:
+            raise HTTPException(status_code=409, detail="A pausa ja foi encerrada.")
+        last = records[-1]
+        if last.get("record_type") not in _BREAK_CLOSE_TYPE:
+            raise HTTPException(status_code=409, detail="A pausa ja foi encerrada.")
+        started = _to_local_naive(str(last.get("timestamp")))
+        if started is None or server_now.replace(tzinfo=None) - started < _AUTO_CLOSE_AFTER:
+            raise HTTPException(status_code=409, detail="A pausa ainda nao passou de 3 horas.")
+        doc_id = f"autoclose_{break_id}"
+        # Mesmo id do job do backend que fecha pausas: os dois gravam o mesmo ponto.
+        return existing_or_none(doc_id) or _save_punch(db, doc_id, {
+            "user_id": user_id,
+            "record_type": _BREAK_CLOSE_TYPE[last["record_type"]],
+            "timestamp": _local_iso(started + _AUTO_CLOSE_DURATION),
+            "location": "Sistema (Auto)",
+            "notes": "Retorno automatico (pausa excedeu 3h; ajustado para 1h)",
+            "auto_closed": True,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+
+    if payload.kind == "forgotten_exit":
+        if record_type != "check_out":
+            raise HTTPException(status_code=400, detail="Saida esquecida vale so para a saida.")
+        ref = (payload.ref_record_id or "").strip()
+        # "Esqueci" em outro aparelho ja fechou este turno: vale aquela saida.
+        if ref and _CLIENT_RECORD_ID_RE.fullmatch(ref):
+            done = existing_or_none(f"forgot_{ref}")
+            if done:
+                return done
+        open_shift = _open_shift_start(records)
+        if open_shift is None:
+            raise HTTPException(status_code=409, detail="Nao existe turno aberto.")
+        doc_id, record = _forgotten_exit(user_id, open_shift, payload.location, payload.notes)
+        return existing_or_none(doc_id) or _save_punch(db, doc_id, record)
+
+    attempted = _parse_schedule_datetime(payload.timestamp, _LOCAL_TZ)
+    punched_at = attempted
+    if payload.offline:
+        # Sem internet vale a hora do aparelho no momento da batida, como no
+        # estagiario: nada no futuro e no maximo 7 dias de atraso.
+        delay = server_now - attempted
+        if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
+            raise HTTPException(status_code=400, detail="O horario da batida offline esta fora do periodo aceito.")
+        records = _records_before_punch(records, {
+            "user_id": user_id, "record_type": record_type, "timestamp": _local_iso(attempted),
+        })
+    elif abs((server_now - attempted).total_seconds()) > 15 * 60:
+        raise HTTPException(status_code=400, detail="O horario informado esta muito distante do relogio do servidor.")
+    else:
+        # Online vale a hora do servidor, nao a do celular.
+        attempted = server_now
+
+    open_shift = _open_shift_start(records)
+    if record_type == "check_in" and open_shift is not None:
+        if not payload.offline:
+            raise HTTPException(status_code=409, detail="Ja existe um turno aberto.")
+        # Entrada que estava na fila com um turno velho ainda aberto antes
+        # dela: fecha o velho sem horas (era o que o app fazia na sincronizacao),
+        # senao o dia pagava as horas entre os dois turnos.
+        forgot_id, forgot = _forgotten_exit(
+            user_id, open_shift, None,
+            "Saida esquecida (fechada na sincronizacao): o gestor precisa lancar o horario real",
+        )
+        if not existing_or_none(forgot_id):
+            _save_punch(db, forgot_id, forgot)
+    if record_type == "check_out" and open_shift is None:
+        raise HTTPException(status_code=409, detail="Nao existe turno aberto.")
+
+    record = {
+        "user_id": user_id,
+        "record_type": record_type,
+        "location": payload.location or "App",
+        "notes": payload.notes,
+        "timestamp": _local_iso(attempted),
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    if payload.offline:
+        record["synced_from_offline"] = True
+        record["offline_delay_minutes"] = max(0, int((server_now - punched_at).total_seconds() // 60))
+    elif abs((server_now - punched_at).total_seconds()) >= 60:
+        record["device_timestamp"] = _local_iso(punched_at)
+    return _save_punch(db, payload.client_record_id, record)
+
+def _save_punch(db, doc_id: str, record: dict) -> dict:
+    db.collection("time_records").document(doc_id).set(record)
+    return {"status": "created", "id": doc_id, **_response_safe(record)}
+
 @app.post("/work-schedule/approval-requests")
 def create_schedule_approval_request_endpoint(
     payload: ScheduleApprovalCreateRequest,
