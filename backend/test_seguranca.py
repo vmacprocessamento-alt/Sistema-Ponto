@@ -48,6 +48,41 @@ class HoraDaBatidaTest(unittest.TestCase):
 
 
 @needs_main
+@unittest.skipIf(main is None or main.firestore is None, "firebase-admin ausente")
+class RespostaViraJsonTest(unittest.TestCase):
+    """Com o SERVER_TIMESTAMP de verdade (sem trocar o firestore por um texto, como os testes acima): a resposta
+    precisa virar JSON. Antes a batida e o pedido de liberacao gravavam e devolviam 500 (28/10/2026)."""
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.intern = {"id": "e1", "role": "intern", "name": "Estagiaria"}
+        patcher = mock.patch.object(main, "get_firestore_admin", return_value=self.db)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _json(self, resposta):
+        from fastapi.encoders import jsonable_encoder
+        return jsonable_encoder(resposta)
+
+    def test_batida_do_estagiario(self):
+        payload = main.SchedulePunchRequest(record_type="check_out", close_at_scheduled_end=False,
+                                            timestamp=datetime.now(FUSO).isoformat())
+        self.db.store["time_records"] = {"in": {"user_id": "u1", "record_type": "check_in",
+                                                "timestamp": main._local_iso(datetime.now(FUSO) - timedelta(hours=1))}}
+        r = _rodar(main.schedule_controlled_punch_endpoint(payload, {"id": "u1", "role": "employee"}))
+        self.assertEqual(self._json(r)["status"], "created")
+        self.assertIs(self.db.store["time_records"][r["id"]]["created_at"], main.firestore.SERVER_TIMESTAMP)
+
+    def test_pedido_de_liberacao(self):
+        self.db.store["time_records"] = {"in": {"user_id": "e1", "record_type": "check_in",
+                                                "timestamp": main._local_iso(datetime.now(FUSO) - timedelta(hours=1))}}
+        payload = main.ScheduleApprovalCreateRequest(request_type="overtime", notes="Fechamento da obra",
+                                                     attempted_at=datetime.now(FUSO).isoformat())
+        r = _rodar(main.create_schedule_approval_request_endpoint(payload, self.intern))
+        self.assertEqual(self._json(r)["status"], "created")
+
+
+@needs_main
 class ExcluirUsuarioTest(unittest.TestCase):
     def setUp(self):
         self.db = _FakeDb()
