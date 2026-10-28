@@ -567,9 +567,8 @@ class ApiService {
 
   // --- MÉTODOS DE AUTH ---
 
-  /// Senha com que as contas eram criadas ate 28/10/2026. Hoje o backend gera
-  /// uma temporaria aleatoria a cada cadastro ou redefinicao; esta nao vale
-  /// mais como senha nova.
+  /// Senha padrao do primeiro acesso (norma da empresa). Nao vale como a
+  /// senha definitiva que a pessoa cria.
   static const String legacyDefaultPassword = '123456';
 
   /// Login pelo CPF: o backend confere a senha e devolve o e-mail da conta
@@ -2050,8 +2049,8 @@ class ApiService {
     return users;
   }
 
-  /// Admin cadastra uma pessoa: ela entra com o CPF e a senha temporaria
-  /// (gerada pelo backend, em temporary_password) e cria a propria no primeiro acesso. Sem
+  /// Admin cadastra uma pessoa: ela entra com o CPF e a senha padrao 123456
+  /// (devolvida em temporary_password) e cria a propria no primeiro acesso. Sem
   /// [email], a conta usa um e-mail interno tirado do CPF.
   Future<Map<String, dynamic>> createUserAdmin({
     required String name,
@@ -2139,9 +2138,9 @@ class ApiService {
           dailyHours: dailyHours,
           cpf: cpf,
           disabled: disabled,
-          // Senha temporaria so o backend gera: o plano B recusa como a
-          // senha digitada.
-          newPassword: resetPassword ? 'senha temporaria' : newPassword,
+          // Trocar senha so pelo backend: o plano B recusa como a senha
+          // digitada.
+          newPassword: resetPassword ? 'senha padrao' : newPassword,
           workScheduleOverrideEnabled: workScheduleOverrideEnabled,
           workScheduleOverride: workScheduleOverride,
           dailyMode: dailyMode,

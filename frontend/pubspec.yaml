@@ -29,6 +29,9 @@ dependencies:
   connectivity_plus: ^6.1.4
   
   # UI
+  # Fonte de icones que o Flutter usa por dentro no iPhone (Safari); sem ela
+  # alguns icones viram quadrados. So os icones usados vao para o app.
+  cupertino_icons: ^1.0.6
   intl: ^0.20.2
   fl_chart: ^0.65.0
   
