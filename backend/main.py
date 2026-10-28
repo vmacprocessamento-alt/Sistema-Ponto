@@ -1165,6 +1165,12 @@ def _create_user_notification(
         "created_at": firestore.SERVER_TIMESTAMP,
     })
 
+# Push no navegador: o app e so web desde 28/10/2026 (sem Android/iOS).
+_WEB_PUSH = (
+    messaging.WebpushConfig(notification=messaging.WebpushNotification(icon="/icons/Icon-192.png"))
+    if messaging is not None else None
+)
+
 def _send_user_push(user_id: str, title: str, body: str, data: Optional[dict] = None):
     if messaging is None:
         return
@@ -1180,17 +1186,8 @@ def _send_user_push(user_id: str, title: str, body: str, data: Optional[dict] = 
             tokens=tokens,
             notification=messaging.Notification(title=title, body=body),
             data={key: str(value) for key, value in (data or {}).items()},
-            android=messaging.AndroidConfig(
-                priority="high",
-                notification=messaging.AndroidNotification(
-                    channel_id="work_schedule_approvals",
-                    icon="notification_icon",
-                    color="#8B0000",
-                ),
-            ),
-            apns=messaging.APNSConfig(
-                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
-            ),
+            # So web (PWA): o service worker mostra com o icone do app.
+            webpush=_WEB_PUSH,
         ))
         invalid = []
         for token, result in zip(tokens, response.responses):
@@ -1230,17 +1227,8 @@ def send_document_push_notification(user_id: str, title: str, body: str, documen
                 tokens=batch_tokens,
                 notification=messaging.Notification(title=title, body=body),
                 data={"type": "signature_document", "document_id": document_id},
-                android=messaging.AndroidConfig(
-                    priority="high",
-                    notification=messaging.AndroidNotification(
-                        channel_id="signature_documents",
-                        icon="notification_icon",
-                        color="#8B0000",
-                    ),
-                ),
-                apns=messaging.APNSConfig(
-                    payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
-                ),
+                # So web (PWA): o service worker mostra com o icone do app.
+                webpush=_WEB_PUSH,
             )
             response = messaging.send_each_for_multicast(message)
             for token, item in zip(batch_tokens, response.responses):

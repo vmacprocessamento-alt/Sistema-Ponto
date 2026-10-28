@@ -6,7 +6,7 @@ encaixam, por onde passa cada operação e onde ficam as regras.
 ## Visão geral
 
 ```
- Celular (Android) / navegador (PWA)
+ Navegador (celular ou PC), app web/PWA
             │
             │  Flutter: Firebase Auth + Firestore (leitura) + HTTP (backend)
             ▼

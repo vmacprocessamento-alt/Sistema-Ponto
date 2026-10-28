@@ -1,29 +1,15 @@
-import 'package:flutter/foundation.dart'
-    show TargetPlatform, defaultTargetPlatform, kIsWeb;
-
 class AppConfig {
   static const String _apiBaseUrl = String.fromEnvironment('API_BASE_URL');
-  static const String _productionApiBaseUrl =
-      'https://ponto.vmacengenharia.com/api';
 
-  static String get backendUrl {
-    if (_apiBaseUrl.trim().isNotEmpty) {
-      return _withoutTrailingSlash(_apiBaseUrl.trim());
+  /// Endereco do backend. O app e so web: o backend fica no mesmo site, em
+  /// /api (o nginx repassa). API_BASE_URL troca isso nos testes locais.
+  static String get backendUrl => resolveBackendUrl(_apiBaseUrl, Uri.base);
+
+  static String resolveBackendUrl(String configured, Uri page) {
+    final value = configured.trim();
+    if (value.isNotEmpty) {
+      return value.endsWith('/') ? value.substring(0, value.length - 1) : value;
     }
-
-    if (kIsWeb) {
-      return '${Uri.base.origin}/api';
-    }
-
-    if (defaultTargetPlatform == TargetPlatform.android ||
-        defaultTargetPlatform == TargetPlatform.iOS) {
-      return _productionApiBaseUrl;
-    }
-
-    return 'http://localhost:8000';
-  }
-
-  static String _withoutTrailingSlash(String value) {
-    return value.endsWith('/') ? value.substring(0, value.length - 1) : value;
+    return '${page.origin}/api';
   }
 }

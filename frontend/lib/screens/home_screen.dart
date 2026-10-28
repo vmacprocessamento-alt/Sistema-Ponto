@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:intl/intl.dart';
@@ -758,10 +757,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           timeLimit: const Duration(seconds: 5),
         );
       } catch (e) {
-        // Sem sinal no prazo: a ultima posicao conhecida e melhor que
-        // nenhuma (nao existe no web).
+        // Sem sinal no prazo a batida sai sem localizacao (o navegador nao
+        // tem "ultima posicao conhecida").
         debugPrint('Localizacao atual indisponivel: $e');
-        return kIsWeb ? null : await Geolocator.getLastKnownPosition();
+        return null;
       }
     } catch (e) {
       debugPrint('Erro ao obter localização: $e');

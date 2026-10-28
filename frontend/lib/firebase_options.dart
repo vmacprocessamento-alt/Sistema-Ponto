@@ -1,6 +1,4 @@
 import 'package:firebase_core/firebase_core.dart' show FirebaseOptions;
-import 'package:flutter/foundation.dart'
-    show defaultTargetPlatform, kIsWeb, TargetPlatform;
 
 class DefaultFirebaseOptions {
   /// Build de teste contra o emulador local do Firebase:
@@ -17,22 +15,8 @@ class DefaultFirebaseOptions {
     storageBucket: 'demo-ponto.appspot.com',
   );
 
-  static FirebaseOptions get currentPlatform {
-    if (useEmulator) return emulator;
-    if (kIsWeb) {
-      return web;
-    }
-    switch (defaultTargetPlatform) {
-      case TargetPlatform.android:
-        return android;
-      case TargetPlatform.iOS:
-        return ios;
-      default:
-        throw UnsupportedError(
-          'DefaultFirebaseOptions are not supported for this platform.',
-        );
-    }
-  }
+  /// O app e so web (desde 28/10/2026).
+  static FirebaseOptions get currentPlatform => useEmulator ? emulator : web;
 
   static const FirebaseOptions web = FirebaseOptions(
     apiKey: 'AIzaSyDtE1kvZ2tnXJxMFT6gugigjkn-GrKS15o',
@@ -42,22 +26,5 @@ class DefaultFirebaseOptions {
     messagingSenderId: '702496632234',
     appId: '1:702496632234:web:62af882302344f38734fd3',
     measurementId: 'G-QND51815P3',
-  );
-
-  static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyDFzubIuTE53oSOHMlj-tuqrpa2QUlO_pE',
-    appId: '1:702496632234:android:7062b815919d31f1734fd3',
-    messagingSenderId: '702496632234',
-    projectId: 'ponto-vmac',
-    storageBucket: 'ponto-vmac.firebasestorage.app',
-  );
-
-  static const FirebaseOptions ios = FirebaseOptions(
-    apiKey: 'AIzaSyDtE1kvZ2tnXJxMFT6gugigjkn-GrKS15o',
-    appId: '1:702496632234:ios:62af882302344f38734fd3',
-    messagingSenderId: '702496632234',
-    projectId: 'ponto-vmac',
-    storageBucket: 'ponto-vmac.firebasestorage.app',
-    iosBundleId: 'com.example.pontoApp',
   );
 }

@@ -7,7 +7,6 @@ import 'history_screen.dart';
 import 'admin_screen.dart';
 import 'profile_screen.dart';
 import '../services/api_service.dart';
-import '../services/app_permission_service.dart';
 import '../services/notification_service.dart';
 import '../widgets/startup_loading.dart';
 
@@ -38,9 +37,6 @@ class _MainScreenState extends State<MainScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      AppPermissionService.requestStartupPermissions();
-    });
     NotificationService.registerCurrentDevice();
     _loadUser();
   }

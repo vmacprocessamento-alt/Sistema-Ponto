@@ -1,7 +1,8 @@
 # Sistema de Ponto VMac
 
-Controle de ponto eletrônico da VMac Engenharia: app Flutter (Android e
-navegador/PWA), Firebase (Auth, Firestore, push) e backend FastAPI.
+Controle de ponto eletrônico da VMac Engenharia: app web Flutter (PWA, no
+navegador do celular ou do computador), Firebase (Auth, Firestore, push) e
+backend FastAPI. Não há mais app Android (APK).
 
 ## 📋 Funcionalidades
 
@@ -20,7 +21,7 @@ navegador/PWA), Firebase (Auth, Firestore, push) e backend FastAPI.
   auditoria, liberações de horário, diárias.
 - **Exportação:** folha de ponto em Excel (modelos administrativo e campo),
   lote em ZIP e relatório HTML.
-- **Notificações push** no Android e no navegador; chat de ajustes com o RH.
+- **Notificações push** no navegador; chat de ajustes com o RH.
 - **Backup:** completo semanal e incremental diário, com cópia por e-mail
   cifrada.
 
@@ -84,8 +85,7 @@ cd frontend
 flutter pub get
 flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8000
 ```
-Sem `API_BASE_URL`, o app web usa `<site>/api` e o Android usa
-`https://ponto.vmacengenharia.com/api`.
+Sem `API_BASE_URL`, o app usa `<site>/api` (o backend no mesmo site).
 
 ### Docker
 ```bash
@@ -120,8 +120,8 @@ flutter build web --dart-define=USE_FIREBASE_EMULATOR=true \
 
 Produção roda num VPS: `bash /opt/ponto/deploy/atualizar.sh` (detalhes em
 [VPS.md](docs/VPS.md)). As **regras do Firestore** não vão nesse script:
-`firebase deploy --only firestore:rules`. Mudança de regra que restringe o app
-só depois que todos os celulares estiverem na versão nova do app.
+`firebase deploy --only firestore:rules`. O app web se atualiza sozinho na
+próxima abertura; publique as regras depois do site, não antes.
 
 ## 📊 Migração do AppSheet (histórico)
 

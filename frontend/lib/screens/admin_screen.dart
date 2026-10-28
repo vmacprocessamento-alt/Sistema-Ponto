@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
@@ -2199,8 +2198,8 @@ class AccessMessageDialog extends StatelessWidget {
     final firstName = name.trim().split(RegExp(r'\s+')).first;
     return [
       'Olá, $firstName! Seu acesso ao Ponto VMac:',
-      // No navegador, o endereco que o admin esta usando e o do app.
-      if (kIsWeb) 'Endereço: ${Uri.base.origin}',
+      // O endereco que o admin esta usando e o do app.
+      'Endereço: ${Uri.base.origin}',
       'Login (CPF): $cpf',
       'Senha temporária: $password',
       'No primeiro acesso o app pede para você criar uma senha nova.',

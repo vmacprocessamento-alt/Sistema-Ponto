@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
-import '../services/app_permission_service.dart';
 import '../utils/cpf.dart';
 import 'main_screen.dart';
 
@@ -25,9 +24,6 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      AppPermissionService.requestStartupPermissions();
-    });
     _fillLastLogin();
   }
 
