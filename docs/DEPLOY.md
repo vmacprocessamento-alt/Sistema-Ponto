@@ -1,5 +1,10 @@
 # 🚀 Guia de Deploy em Produção
 
+> **Produção atual:** VPS com túnel da Cloudflare, ver [VPS.md](VPS.md). Este guia
+> é genérico (opções de hospedagem) e parte dele é da versão antiga com SQLite.
+> Regras do Firestore: `firebase deploy --only firestore:rules`, sempre depois
+> de todos os celulares estarem na versão do app que elas exigem.
+
 ## Opção 1: Deploy Tradicional (VPS/Servidor)
 
 ### Backend
