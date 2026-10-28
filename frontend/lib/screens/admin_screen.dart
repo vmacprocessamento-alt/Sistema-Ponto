@@ -47,8 +47,9 @@ class _AdminScreenState extends State<AdminScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading)
+    if (_isLoading) {
       return const Center(child: CircularProgressIndicator(color: wineColor));
+    }
 
     return DefaultTabController(
       length: _isAdmin ? 5 : 4,
@@ -174,8 +175,9 @@ class _UsersListTabState extends State<_UsersListTab> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading)
+    if (_isLoading) {
       return const Center(child: CircularProgressIndicator(color: wineColor));
+    }
 
     return Scaffold(
       floatingActionButton: _isAdmin
@@ -1309,7 +1311,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
           decoration: BoxDecoration(
             color: Theme.of(context).cardColor,
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.grey.withOpacity(0.2)),
+            border: Border.all(color: Colors.grey.withValues(alpha: 0.2)),
           ),
           child: const Column(
             children: [
@@ -1414,9 +1416,9 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
         decoration: BoxDecoration(
-          color: color.withOpacity(0.1),
+          color: color.withValues(alpha: 0.1),
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: color.withOpacity(0.25)),
+          border: Border.all(color: color.withValues(alpha: 0.25)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1443,7 +1445,7 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
       decoration: BoxDecoration(
         color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withOpacity(0.35)),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1671,7 +1673,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
             ),
             const Divider(height: 28),
             DropdownButtonFormField<String>(
-              value: _selectedRole,
+              initialValue: _selectedRole,
               dropdownColor: Theme.of(context).cardColor,
               decoration: const InputDecoration(
                   labelText: 'Cargo/Modelo',
@@ -2455,8 +2457,9 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoadingUsers)
+    if (_isLoadingUsers) {
       return const Center(child: CircularProgressIndicator(color: wineColor));
+    }
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
@@ -2471,7 +2474,7 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
                   color: Colors.grey)),
           const SizedBox(height: 24),
           DropdownButtonFormField<dynamic>(
-            value: _selectedUserId,
+            initialValue: _selectedUserId,
             dropdownColor: Theme.of(context).cardColor,
             decoration: const InputDecoration(
                 labelText: 'Funcionário',
@@ -2580,7 +2583,7 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: BoxDecoration(
-            color: Theme.of(context).cardColor.withOpacity(0.5),
+            color: Theme.of(context).cardColor.withValues(alpha: 0.5),
             borderRadius: BorderRadius.circular(8),
           ),
           child: Row(

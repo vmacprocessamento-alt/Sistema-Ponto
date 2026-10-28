@@ -92,7 +92,7 @@ class _LoginScreenState extends State<LoginScreen> {
         text: _useEmail ? _loginController.text.trim() : '');
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Esqueceu a senha?'),
         content: SingleChildScrollView(
           child: Column(
@@ -100,8 +100,8 @@ class _LoginScreenState extends State<LoginScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Fale com o administrador: ele volta a sua senha para a '
-                'senha padrão e, ao entrar, você cria uma nova.',
+                'Fale com o administrador: ele redefine a sua senha e, ao '
+                'entrar, você cria uma nova.',
               ),
               const SizedBox(height: 16),
               const Text(
@@ -123,29 +123,29 @@ class _LoginScreenState extends State<LoginScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Fechar'),
           ),
           ElevatedButton(
             onPressed: () async {
               if (emailController.text.isNotEmpty) {
+                // Pegos antes da espera: depois dela o dialogo pode ter
+                // fechado e o context dele nao vale mais.
+                final messenger = ScaffoldMessenger.of(context);
+                final navigator = Navigator.of(dialogContext);
                 try {
                   await _apiService.resetPassword(emailController.text);
-                  if (mounted) {
-                    Navigator.pop(context);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('E-mail de recuperação enviado! Verifique sua caixa de entrada.'),
-                        backgroundColor: Colors.green,
-                      ),
-                    );
-                  }
+                  if (dialogContext.mounted) navigator.pop();
+                  messenger.showSnackBar(
+                    const SnackBar(
+                      content: Text('E-mail de recuperação enviado! Verifique sua caixa de entrada.'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
                 } catch (e) {
-                  if (mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(e.toString()), backgroundColor: Colors.red),
-                    );
-                  }
+                  messenger.showSnackBar(
+                    SnackBar(content: Text(e.toString()), backgroundColor: Colors.red),
+                  );
                 }
               }
             },
