@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:intl/intl.dart';
@@ -738,6 +739,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Posicao para a batida; null sem permissao ou sem sinal. Nunca lanca:
+  /// pode ficar sem ninguem esperando (batida cancelada numa confirmacao).
+  Future<Position?> _punchPosition() async {
+    try {
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission != LocationPermission.always &&
+          permission != LocationPermission.whileInUse) {
+        return null;
+      }
+      try {
+        return await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+          timeLimit: const Duration(seconds: 5),
+        );
+      } catch (e) {
+        // Sem sinal no prazo: a ultima posicao conhecida e melhor que
+        // nenhuma (nao existe no web).
+        debugPrint('Localizacao atual indisponivel: $e');
+        return kIsWeb ? null : await Geolocator.getLastKnownPosition();
+      }
+    } catch (e) {
+      debugPrint('Erro ao obter localização: $e');
+      return null;
+    }
+  }
+
   Future<void> _registerPunch(
     String type, {
     DateTime? timestamp,
@@ -751,6 +781,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // da localizacao (ate ~25s com sinal ruim): a saida tocada 19:34:50 ia
     // como 19:35:10, depois do limite, e pedia liberacao de hora extra.
     final tappedAt = DateTime.now();
+    // GPS comeca ja, junto com a conferencia abaixo e as confirmacoes: antes
+    // so comecava depois delas e somava ate 5 s a cada batida (dentro de
+    // predio o sinal costuma gastar o prazo inteiro).
+    final positionFuture = _punchPosition();
 
     // Confere de novo antes de QUALQUER batida: a tela pode estar velha (app
     // aberto desde ontem, ponto batido em outro aparelho). Ex.: o celular
@@ -841,24 +875,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _isLoading = true);
 
     try {
-      // 1. Obter localização atual
-      Position? position;
-      try {
-        LocationPermission permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied) {
-          permission = await Geolocator.requestPermission();
-        }
-
-        if (permission == LocationPermission.always ||
-            permission == LocationPermission.whileInUse) {
-          position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-            timeLimit: const Duration(seconds: 5),
-          );
-        }
-      } catch (e) {
-        debugPrint('Erro ao obter localização: $e');
-      }
+      // 1. Localizacao (pedida no toque, ver _punchPosition)
+      final position = await positionFuture;
 
       // 2. Estagiarios usam validacao autoritativa do backend na entrada/saida.
       final attemptedAt = timestamp ?? tappedAt;

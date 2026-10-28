@@ -20,7 +20,12 @@ class SessionService {
 
   /// Tempo maximo esperando o Firebase restaurar a sessao do disco antes de
   /// partir para o login silencioso.
-  static const Duration _restoreTimeout = Duration(seconds: 4);
+  ///
+  /// Quem nao esta logado espera ele inteiro antes de ver o login: com 4 s,
+  /// toda abertura deslogada (e todo primeiro acesso no web) parava 4 s na
+  /// tela de carregamento. Se a sessao chegar depois do prazo nada se perde:
+  /// o AuthGate escuta o authStateChanges e troca o login pela tela do app.
+  static const Duration _restoreTimeout = Duration(milliseconds: 1500);
 
   static Future<void> saveCredentials(String email, String password) async {
     if (kIsWeb) return;
