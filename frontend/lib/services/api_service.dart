@@ -206,6 +206,9 @@ class ApiService {
       'job_title': jobTitle.trim(),
       'daily_hours': dailyHours,
       'cpf': cpf.trim(),
+      // O login por CPF procura por este campo: sem ele, a troca de CPF por
+      // aqui deixava o backend buscando pelo CPF antigo.
+      'cpf_digits': cpfDigits(cpf),
       'disabled': disabled,
       'work_schedule_override_enabled': workScheduleOverrideEnabled,
       'work_schedule_override':
