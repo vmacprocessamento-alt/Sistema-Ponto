@@ -1,13 +1,14 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/foundation.dart' show debugPrint, debugPrintStack;
+import 'package:flutter/foundation.dart' show debugPrint, debugPrintStack, kIsWeb;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:intl/intl.dart';
 import 'package:timezone/data/latest_all.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
 
 import '../firebase_options.dart';
+import 'web_notification.dart';
 
 class NotificationService {
   NotificationService._();
@@ -134,6 +135,11 @@ class NotificationService {
       FirebaseMessaging.onMessage.listen((message) {
         final notification = message.notification;
         if (notification == null) return;
+        if (kIsWeb) {
+          showWebNotification(
+              notification.title ?? 'Nova notificação', notification.body ?? '');
+          return;
+        }
         final isScheduleNotification =
             message.data['type']?.toString().startsWith('schedule_') == true;
         final androidDetails = AndroidNotificationDetails(
