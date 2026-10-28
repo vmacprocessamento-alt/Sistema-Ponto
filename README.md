@@ -99,7 +99,9 @@ cd backend && python -m pytest    # Firestore simulado em memória
 cd frontend && flutter test
 ```
 
-**Ponta a ponta, sem tocar no Firebase real:** com o
+**Ponta a ponta, sem tocar no Firebase real:** a pasta [`e2e/`](e2e/README.md)
+roda o app web no Chrome, o backend e o emulador (login, batidas, offline,
+liberação do estagiário, exportação...). Em resumo, com o
 [emulador do Firebase](https://firebase.google.com/docs/emulator-suite) e um
 projeto `demo-` (que não alcança nenhum projeto real):
 
