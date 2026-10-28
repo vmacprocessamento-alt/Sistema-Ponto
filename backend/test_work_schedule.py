@@ -49,6 +49,12 @@ main = _import_main()
 needs_main = unittest.skipIf(main is None, "dependencias do main.py ausentes")
 
 
+def _call(result):
+    """Chama o endpoint como o FastAPI: os que so fazem trabalho bloqueante sao
+    `def` (rodam fora do event loop); os que esperam HTTP sao `async def`."""
+    return asyncio.run(result) if asyncio.iscoroutine(result) else result
+
+
 class WorkScheduleRulesTest(unittest.TestCase):
     def setUp(self):
         self.schedule = validate_work_schedule(DEFAULT_INTERN_WORK_SCHEDULE)
@@ -726,7 +732,7 @@ class BatchMinuteOrderTest(unittest.TestCase):
             timestamp=f"{morning.isoformat()}T07:00:14.512000",
             offline=True,
         )
-        result = asyncio.run(main.schedule_controlled_punch_endpoint(payload, user))
+        result = _call(main.schedule_controlled_punch_endpoint(payload, user))
         self.assertEqual(result["status"], "approval_required")
         self.assertEqual(result["request_type"], "overtime")
 
@@ -768,11 +774,11 @@ class StaleStartRequestTest(unittest.TestCase):
         payload = main.ScheduleApprovalCreateRequest(
             request_type="start_exception", attempted_at=self.now.isoformat(), notes="de novo"
         )
-        return asyncio.run(main.create_schedule_approval_request_endpoint(payload, self.user))
+        return _call(main.create_schedule_approval_request_endpoint(payload, self.user))
 
     def approve(self, request_id):
         payload = main.ScheduleApprovalDecisionRequest(reason="ok")
-        return asyncio.run(main.approve_schedule_request_endpoint(request_id, payload, self.admin))
+        return _call(main.approve_schedule_request_endpoint(request_id, payload, self.admin))
 
     def test_old_pending_request_is_superseded_by_new_attempt(self):
         self.add_request("old", self.now - timedelta(hours=7))
@@ -834,7 +840,7 @@ class FirestoreProfileReadTest(unittest.TestCase):
                 return Response()
 
         with mock.patch.dict(os.environ, {"FIREBASE_PROJECT_ID": "p"}), \
-                mock.patch.object(main.httpx, "AsyncClient", Client):
+                mock.patch.object(main, "_http_client", Client):
             return asyncio.run(main.get_firestore_document_with_user_token("users", "u1", "t"))
 
     def status_of(self, status):
@@ -1023,7 +1029,7 @@ class DailyEntryTest(unittest.TestCase):
         self.now = main._local_now().replace(microsecond=0)
 
     def add(self, user=None, **payload):
-        return asyncio.run(main.create_daily_entry_endpoint(
+        return _call(main.create_daily_entry_endpoint(
             main.DailyEntryRequest(**payload), user or self.user,
         ))
 
@@ -1072,7 +1078,7 @@ class DailyEntryTest(unittest.TestCase):
             store[f"{user_id}_{day}"] = {"user_id": user_id, "date": day}
 
         def listing(user, **params):
-            return asyncio.run(main.list_daily_entries_endpoint(user=user, **params))["entries"]
+            return _call(main.list_daily_entries_endpoint(user=user, **params))["entries"]
 
         own = listing(self.user, start="2026-09-29", end="2026-10-28")
         self.assertEqual([entry["date"] for entry in own], ["2026-10-01", "2026-10-15"])
@@ -1105,11 +1111,11 @@ class AdminDailyEntryTest(unittest.TestCase):
 
     def add(self, day, admin=None, user_id="u1", reason="esqueceu de marcar"):
         payload = main.AdminDailyEntryCreateRequest(user_id=user_id, date=day.isoformat(), reason=reason)
-        return asyncio.run(main.admin_create_daily_entry_endpoint(payload, admin or self.admin))
+        return _call(main.admin_create_daily_entry_endpoint(payload, admin or self.admin))
 
     def delete(self, entry_id, admin=None, reason="marcou por engano"):
         payload = main.AdminDailyEntryDeleteRequest(reason=reason)
-        return asyncio.run(main.admin_delete_daily_entry_endpoint(entry_id, payload, admin or self.admin))
+        return _call(main.admin_delete_daily_entry_endpoint(entry_id, payload, admin or self.admin))
 
     def status_of(self, call, *args, **kwargs):
         with self.assertRaises(main.HTTPException) as ctx:
@@ -1311,7 +1317,7 @@ class AdminDailyModeUpdateTest(unittest.TestCase):
             name="Pessoa", email="p@x.com", role=role, job_title="Aux. Geral",
             daily_hours=8.0, cpf="", **extra,
         )
-        asyncio.run(main.update_user_admin_endpoint("u1", payload, self.admin))
+        _call(main.update_user_admin_endpoint("u1", payload, self.admin))
         return self.db.store["users"]["u1"]
 
     def test_daily_mode_is_saved(self):
@@ -1414,11 +1420,11 @@ class CpfAccessTest(unittest.TestCase):
 
     def create(self, admin=None, **fields):
         payload = main.AdminUserCreateRequest(**{"name": "Pessoa Nova", "cpf": "529.982.247-25", **fields})
-        return asyncio.run(main.create_user_admin_endpoint(payload, admin or self.admin))
+        return _call(main.create_user_admin_endpoint(payload, admin or self.admin))
 
     def login(self, cpf, password, ip="1.2.3.4"):
         request = types.SimpleNamespace(headers={"x-real-ip": ip}, client=None)
-        return asyncio.run(main.cpf_login_endpoint(main.CpfLoginRequest(cpf=cpf, password=password), request))
+        return _call(main.cpf_login_endpoint(main.CpfLoginRequest(cpf=cpf, password=password), request))
 
     def status_of(self, call, *args, **kwargs):
         with self.assertRaises(main.HTTPException) as ctx:
@@ -1475,7 +1481,7 @@ class CpfAccessTest(unittest.TestCase):
 
     def change(self, user, password):
         payload = main.OwnPasswordChangeRequest(new_password=password)
-        return asyncio.run(main.change_own_password_endpoint(payload, user))
+        return _call(main.change_own_password_endpoint(payload, user))
 
     def test_first_access_password_change(self):
         uid = self.create()["id"]
@@ -1493,7 +1499,7 @@ class CpfAccessTest(unittest.TestCase):
             "daily_hours": 8.0, "cpf": "529.982.247-25",
         }
         values.update(fields)
-        asyncio.run(main.update_user_admin_endpoint(uid, main.AdminUserUpdateRequest(**values), self.admin))
+        _call(main.update_user_admin_endpoint(uid, main.AdminUserUpdateRequest(**values), self.admin))
         return self.db.store["users"][uid]
 
     def test_admin_reset_password_forces_change(self):

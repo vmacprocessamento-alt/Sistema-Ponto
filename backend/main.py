@@ -1221,6 +1221,52 @@ def decode_firestore_value(value: dict):
         ]
     return None
 
+# Um cliente HTTP so, reaproveitado: criar um httpx.AsyncClient carrega os
+# certificados de novo (~200 ms) e cada um abria conexao TLS nova com o
+# Google. Eram dois por requisicao autenticada. Um por event loop: o cliente
+# nao pode ser usado num loop diferente do que o criou (os testes rodam cada
+# chamada num asyncio.run proprio).
+_http_clients: Dict[int, httpx.AsyncClient] = {}
+
+def _http_client() -> httpx.AsyncClient:
+    loop_id = id(asyncio.get_running_loop())
+    client = _http_clients.get(loop_id)
+    if client is None or client.is_closed:
+        _http_clients.clear()
+        client = _http_clients[loop_id] = httpx.AsyncClient(timeout=20.0)
+    return client
+
+# Token ja conferido no Google vale por alguns minutos sem nova consulta: o
+# app manda o mesmo token (dura 1h) em todas as chamadas. Conta desativada
+# perde o acesso em ate _TOKEN_CACHE_TTL.
+_TOKEN_CACHE_TTL = timedelta(minutes=5)
+_TOKEN_CACHE_MAX = 2000
+_verified_tokens: Dict[str, tuple] = {}
+
+def _token_key(id_token: str) -> str:
+    return hashlib.sha256(id_token.encode("utf-8")).hexdigest()
+
+def _cached_token_uid(id_token: str) -> Optional[str]:
+    hit = _verified_tokens.get(_token_key(id_token))
+    if hit and hit[1] > datetime.utcnow():
+        return hit[0]
+    return None
+
+def _remember_token(id_token: str, user_uid: str) -> None:
+    now = datetime.utcnow()
+    if len(_verified_tokens) >= _TOKEN_CACHE_MAX:
+        for key in [k for k, (_, exp) in _verified_tokens.items() if exp <= now]:
+            del _verified_tokens[key]
+        if len(_verified_tokens) >= _TOKEN_CACHE_MAX:
+            _verified_tokens.clear()
+    _verified_tokens[_token_key(id_token)] = (user_uid, now + _TOKEN_CACHE_TTL)
+
+@app.on_event("shutdown")
+async def _close_http_clients() -> None:
+    for client in list(_http_clients.values()):
+        await client.aclose()
+    _http_clients.clear()
+
 async def get_firestore_document_with_user_token(
     collection_name: str,
     document_id: str,
@@ -1234,11 +1280,10 @@ async def get_firestore_document_with_user_token(
         f"https://firestore.googleapis.com/v1/projects/{project_id}"
         f"/databases/(default)/documents/{collection_name}/{document_id}"
     )
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {id_token}"},
-        )
+    response = await _http_client().get(
+        url,
+        headers={"Authorization": f"Bearer {id_token}"},
+    )
     if response.status_code == 404:
         return None
     if response.status_code == 429:
@@ -1268,26 +1313,29 @@ async def get_firestore_document_with_user_token(
     return {key: decode_firestore_value(value) for key, value in fields.items()}
 
 async def verify_firebase_user_token(id_token: str) -> str:
+    cached_uid = _cached_token_uid(id_token)
+    if cached_uid:
+        return cached_uid
     if FIREBASE_WEB_API_KEY:
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
-                    "https://identitytoolkit.googleapis.com/v1/accounts:lookup",
-                    params={"key": FIREBASE_WEB_API_KEY},
-                    json={"idToken": id_token},
-                )
+            response = await _http_client().post(
+                "https://identitytoolkit.googleapis.com/v1/accounts:lookup",
+                params={"key": FIREBASE_WEB_API_KEY},
+                json={"idToken": id_token},
+            )
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail="Falha ao validar a sessao Firebase.") from exc
 
         users = response.json().get("users", []) if response.is_success else []
         user_uid = users[0].get("localId") if users else None
         if user_uid:
+            _remember_token(id_token, user_uid)
             return user_uid
         raise HTTPException(status_code=401, detail="Token invalido ou expirado.")
 
     init_firebase_admin()
     try:
-        decoded = firebase_auth.verify_id_token(id_token)
+        decoded = await asyncio.to_thread(firebase_auth.verify_id_token, id_token)
         user_uid = decoded.get("uid")
     except Exception as exc:
         logger.warning("Firebase token validation failed: %s: %s", type(exc).__name__, exc)
@@ -1295,6 +1343,7 @@ async def verify_firebase_user_token(id_token: str) -> str:
 
     if not user_uid:
         raise HTTPException(status_code=401, detail="Usuario nao autenticado.")
+    _remember_token(id_token, user_uid)
     return user_uid
 
 async def require_authenticated_user(token: HTTPAuthorizationCredentials = Depends(security)):
@@ -1840,7 +1889,7 @@ async def email_backup_endpoint(admin=Depends(require_admin_user)):
     return {"status": "ok", "sent_to": _BACKUP_EMAIL}
 
 @app.get("/admin/backup/list")
-async def list_backups_endpoint(admin=Depends(require_admin_user)):
+def list_backups_endpoint(admin=Depends(require_admin_user)):
     out = []
     for name in sorted(_local_backups(), reverse=True):
         path = os.path.join(_BACKUP_DIR, name)
@@ -2509,7 +2558,7 @@ function showTab(id){{
     return tmp.name
 
 @app.post("/export-excel")
-async def export_excel(
+def export_excel(
     data: ExportData,
     user=Depends(require_authenticated_user),
 ):
@@ -2520,7 +2569,7 @@ async def export_excel(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch")
-async def export_batch(
+def export_batch(
     data_list: List[ExportData],
     user=Depends(require_authenticated_user),
 ):
@@ -2537,7 +2586,7 @@ async def export_batch(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/export-batch-html")
-async def export_batch_html(
+def export_batch_html(
     data_list: List[ExportData],
     user=Depends(require_authenticated_user),
 ):
@@ -2695,7 +2744,7 @@ async def create_signature_document(
     return document
 
 @app.get("/signature-notifications")
-async def list_signature_notifications(user=Depends(require_authenticated_user)):
+def list_signature_notifications(user=Depends(require_authenticated_user)):
     with signature_db_connection() as connection:
         rows = connection.execute(
             """
@@ -2710,7 +2759,7 @@ async def list_signature_notifications(user=Depends(require_authenticated_user))
     return [dict(row) for row in rows]
 
 @app.post("/signature-notifications/read")
-async def mark_signature_notifications_read(user=Depends(require_authenticated_user)):
+def mark_signature_notifications_read(user=Depends(require_authenticated_user)):
     with signature_db_connection() as connection:
         connection.execute(
             "UPDATE signature_notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
@@ -2719,7 +2768,7 @@ async def mark_signature_notifications_read(user=Depends(require_authenticated_u
     return {"status": "success"}
 
 @app.get("/signature-documents")
-async def list_my_signature_documents(user=Depends(require_authenticated_user)):
+def list_my_signature_documents(user=Depends(require_authenticated_user)):
     with signature_db_connection() as connection:
         rows = connection.execute(
             f"""
@@ -2733,7 +2782,7 @@ async def list_my_signature_documents(user=Depends(require_authenticated_user)):
     return [dict(row) for row in rows]
 
 @app.get("/admin/signature-documents")
-async def list_all_signature_documents(admin=Depends(require_admin_user)):
+def list_all_signature_documents(admin=Depends(require_admin_user)):
     with signature_db_connection() as connection:
         rows = connection.execute(
             f"""
@@ -2774,7 +2823,7 @@ async def refresh_signature_document(
     return updated_document
 
 @app.delete("/admin/signature-documents/{document_id}")
-async def delete_signature_document(
+def delete_signature_document(
     document_id: str,
     admin=Depends(require_admin_user),
 ):
@@ -2848,7 +2897,7 @@ def _parse_shift_day(value: Optional[str], today: date) -> Optional[date]:
     return None
 
 @app.get("/work-schedule/effective")
-async def get_effective_work_schedule_endpoint(
+def get_effective_work_schedule_endpoint(
     shift_day: Optional[str] = None,
     user=Depends(require_authenticated_user),
 ):
@@ -2886,13 +2935,13 @@ async def get_effective_work_schedule_endpoint(
     }
 
 @app.get("/admin/work-schedule/settings")
-async def get_global_work_schedule_endpoint(admin=Depends(require_admin_user)):
+def get_global_work_schedule_endpoint(admin=Depends(require_admin_user)):
     db = get_firestore_admin()
     settings_doc = db.collection("work_schedule_settings").document("intern_default").get()
     return _validate_work_schedule(settings_doc.to_dict() if settings_doc.exists else None)
 
 @app.put("/admin/work-schedule/settings")
-async def update_global_work_schedule_endpoint(
+def update_global_work_schedule_endpoint(
     payload: WorkScheduleConfigRequest,
     admin=Depends(require_admin_user),
 ):
@@ -2924,7 +2973,7 @@ _OFFLINE_MAX_AHEAD = timedelta(minutes=15)
 _OFFLINE_MAX_DELAY = timedelta(days=7)
 
 @app.post("/work-schedule/punch")
-async def schedule_controlled_punch_endpoint(
+def schedule_controlled_punch_endpoint(
     payload: SchedulePunchRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3062,7 +3111,7 @@ async def schedule_controlled_punch_endpoint(
     return {"status": "created", "id": record_ref.id, **record}
 
 @app.post("/work-schedule/approval-requests")
-async def create_schedule_approval_request_endpoint(
+def create_schedule_approval_request_endpoint(
     payload: ScheduleApprovalCreateRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3214,7 +3263,7 @@ async def create_schedule_approval_request_endpoint(
     return {"status": "created", "request": {"id": request_ref.id, **request_data}}
 
 @app.get("/admin/work-schedule/approval-requests")
-async def list_schedule_approval_requests_endpoint(
+def list_schedule_approval_requests_endpoint(
     status: Optional[str] = None,
     admin=Depends(require_admin_user),
 ):
@@ -3232,7 +3281,7 @@ async def list_schedule_approval_requests_endpoint(
     return requests
 
 @app.get("/notifications")
-async def list_user_notifications_endpoint(user=Depends(require_authenticated_user)):
+def list_user_notifications_endpoint(user=Depends(require_authenticated_user)):
     db = get_firestore_admin()
     # So as nao lidas: e o unico que o sininho exibe, e a colecao so cresce.
     # Ler o historico inteiro a cada 30s por aba aberta era leitura jogada fora.
@@ -3250,7 +3299,7 @@ async def list_user_notifications_endpoint(user=Depends(require_authenticated_us
     return notifications[:100]
 
 @app.post("/notifications/read")
-async def mark_user_notifications_read_endpoint(user=Depends(require_authenticated_user)):
+def mark_user_notifications_read_endpoint(user=Depends(require_authenticated_user)):
     db = get_firestore_admin()
     # Le so o que precisa mudar, em vez da caixa inteira do usuario.
     minhas = db.collection("user_notifications").where("user_id", "==", user["id"])
@@ -3272,7 +3321,7 @@ async def mark_user_notifications_read_endpoint(user=Depends(require_authenticat
     return {"status": "success", "updated": count}
 
 @app.post("/admin/work-schedule/approval-requests/{request_id}/approve")
-async def approve_schedule_request_endpoint(
+def approve_schedule_request_endpoint(
     request_id: str,
     payload: ScheduleApprovalDecisionRequest,
     admin=Depends(require_admin_user),
@@ -3363,7 +3412,7 @@ async def approve_schedule_request_endpoint(
     return {"status": "approved", "linked_time_record_id": linked_record_id}
 
 @app.post("/admin/work-schedule/approval-requests/{request_id}/reject")
-async def reject_schedule_request_endpoint(
+def reject_schedule_request_endpoint(
     request_id: str,
     payload: ScheduleApprovalDecisionRequest,
     admin=Depends(require_admin_user),
@@ -3450,7 +3499,7 @@ def _parse_day_param(value: str, name: str) -> date:
         raise HTTPException(status_code=400, detail=f"Data invalida em {name}.") from exc
 
 @app.post("/daily-entries")
-async def create_daily_entry_endpoint(
+def create_daily_entry_endpoint(
     payload: DailyEntryRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3480,7 +3529,7 @@ async def create_daily_entry_endpoint(
     return {"status": "created", "id": ref.id, **entry}
 
 @app.get("/daily-entries")
-async def list_daily_entries_endpoint(
+def list_daily_entries_endpoint(
     start: str,
     end: str,
     user_id: Optional[str] = None,
@@ -3524,7 +3573,7 @@ def _daily_entry_audit(db, action: str, admin: dict, entry: dict, reason: str) -
     })
 
 @app.post("/admin/daily-entries")
-async def admin_create_daily_entry_endpoint(
+def admin_create_daily_entry_endpoint(
     payload: AdminDailyEntryCreateRequest,
     admin=Depends(require_admin_user),
 ):
@@ -3561,7 +3610,7 @@ async def admin_create_daily_entry_endpoint(
     return {"status": "created", "id": ref.id, **entry}
 
 @app.delete("/admin/daily-entries/{entry_id}")
-async def admin_delete_daily_entry_endpoint(
+def admin_delete_daily_entry_endpoint(
     entry_id: str,
     payload: AdminDailyEntryDeleteRequest,
     admin=Depends(require_admin_user),
@@ -3662,12 +3711,11 @@ async def _check_firebase_password(email: str, password: str) -> str:
             detail="Login por CPF indisponivel: configure FIREBASE_WEB_API_KEY no backend.",
         )
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword",
-                params={"key": FIREBASE_WEB_API_KEY},
-                json={"email": email, "password": password, "returnSecureToken": False},
-            )
+        response = await _http_client().post(
+            "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword",
+            params={"key": FIREBASE_WEB_API_KEY},
+            json={"email": email, "password": password, "returnSecureToken": False},
+        )
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail="Falha ao validar o acesso. Tente novamente.") from exc
     if response.is_success:
@@ -3702,14 +3750,14 @@ async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
         raise invalid
 
     db = get_firestore_admin()
-    matches = _users_with_cpf(db, digits)
+    matches = await asyncio.to_thread(_users_with_cpf, db, digits)
     if len(matches) > 1:
         raise HTTPException(status_code=409, detail="Mais de um cadastro com este CPF. Procure o administrador.")
     if not matches:
         _register_login_failure(keys, now)
         raise invalid
     try:
-        email = firebase_auth.get_user(matches[0].id).email
+        email = (await asyncio.to_thread(firebase_auth.get_user, matches[0].id)).email
     except firebase_auth.UserNotFoundError:
         email = None
     if not email:
@@ -3737,7 +3785,7 @@ class AdminUserCreateRequest(BaseModel):
     daily_mode: bool = False
 
 @app.post("/admin/users")
-async def create_user_admin_endpoint(
+def create_user_admin_endpoint(
     payload: AdminUserCreateRequest,
     admin=Depends(require_admin_user),
 ):
@@ -3813,7 +3861,7 @@ class OwnPasswordChangeRequest(BaseModel):
     new_password: str
 
 @app.post("/me/password")
-async def change_own_password_endpoint(
+def change_own_password_endpoint(
     payload: OwnPasswordChangeRequest,
     user=Depends(require_authenticated_user),
 ):
@@ -3846,7 +3894,7 @@ async def change_own_password_endpoint(
     return {"status": "success"}
 
 @app.put("/admin/users/{user_id}")
-async def update_user_admin_endpoint(
+def update_user_admin_endpoint(
     user_id: str,
     payload: AdminUserUpdateRequest,
     admin=Depends(require_admin_user),
@@ -3945,7 +3993,7 @@ async def update_user_admin_endpoint(
     return {"status": "success", "id": target_id}
 
 @app.patch("/admin/time-records/{record_id}")
-async def update_time_record_admin_endpoint(
+def update_time_record_admin_endpoint(
     record_id: str,
     payload: AdminTimeRecordUpdateRequest,
     admin=Depends(require_admin_user),
@@ -3999,7 +4047,7 @@ async def update_time_record_admin_endpoint(
     return {"status": "success", "id": record_id}
 
 @app.delete("/admin/users/{user_id}")
-async def delete_user_admin_endpoint(
+def delete_user_admin_endpoint(
     user_id: str,
     admin=Depends(require_admin_user),
 ):
