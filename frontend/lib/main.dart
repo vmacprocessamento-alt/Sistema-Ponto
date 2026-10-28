@@ -43,6 +43,12 @@ class _AppBootstrapState extends State<AppBootstrap> {
       options: DefaultFirebaseOptions.currentPlatform,
     ).timeout(const Duration(seconds: 20));
     _configureFirestoreCache();
+    if (DefaultFirebaseOptions.useEmulator) {
+      // Depois do _configureFirestoreCache: trocar settings depois apagaria o
+      // endereco do emulador.
+      await FirebaseAuth.instance.useAuthEmulator('127.0.0.1', 9099);
+      FirebaseFirestore.instance.useFirestoreEmulator('127.0.0.1', 8085);
+    }
     await initializeDateFormatting('pt_BR', null);
 
     if (!kIsWeb) {

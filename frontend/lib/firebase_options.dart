@@ -3,7 +3,22 @@ import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
 
 class DefaultFirebaseOptions {
+  /// Build de teste contra o emulador local do Firebase:
+  /// flutter build web --dart-define=USE_FIREBASE_EMULATOR=true
+  /// Projeto "demo-": o SDK nao consegue falar com nenhum Firebase real.
+  static const bool useEmulator = bool.fromEnvironment('USE_FIREBASE_EMULATOR');
+
+  static const FirebaseOptions emulator = FirebaseOptions(
+    apiKey: 'demo-key',
+    appId: '1:000000000000:web:0000000000000000000000',
+    messagingSenderId: '000000000000',
+    projectId: 'demo-ponto',
+    // Sem bucket o FirebaseStorage.instance do ApiService quebra a abertura.
+    storageBucket: 'demo-ponto.appspot.com',
+  );
+
   static FirebaseOptions get currentPlatform {
+    if (useEmulator) return emulator;
     if (kIsWeb) {
       return web;
     }
