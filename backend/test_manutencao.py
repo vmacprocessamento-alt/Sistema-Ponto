@@ -28,6 +28,24 @@ class CredencialAusenteTest(unittest.TestCase):
 
 
 @needs_main
+class EmuladorTest(unittest.TestCase):
+    """Com as variaveis do emulador, o backend fala com ele sozinho (testes de ponta a ponta)."""
+
+    def test_urls_do_google_ou_do_emulador(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for var in ("FIRESTORE_EMULATOR_HOST", "FIREBASE_AUTH_EMULATOR_HOST"):
+                os.environ.pop(var, None)
+            self.assertEqual(main._google_api("identitytoolkit.googleapis.com", "v1/accounts:lookup"),
+                             "https://identitytoolkit.googleapis.com/v1/accounts:lookup")
+        with mock.patch.dict(os.environ, {"FIRESTORE_EMULATOR_HOST": "127.0.0.1:8085",
+                                          "FIREBASE_AUTH_EMULATOR_HOST": "127.0.0.1:9099"}):
+            self.assertEqual(main._google_api("firestore.googleapis.com", "v1/projects/p"),
+                             "http://127.0.0.1:8085/v1/projects/p")
+            self.assertEqual(main._google_api("identitytoolkit.googleapis.com", "v1/accounts:lookup"),
+                             "http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:lookup")
+
+
+@needs_main
 class TokenEsquecidoTest(unittest.TestCase):
     def setUp(self):
         main._verified_tokens.clear()

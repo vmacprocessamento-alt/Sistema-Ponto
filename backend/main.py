@@ -700,8 +700,28 @@ def init_firebase_admin():
     elif service_account_path:
         cred = credentials.Certificate(service_account_path)
         firebase_admin.initialize_app(cred, options=options)
+    elif os.getenv("FIRESTORE_EMULATOR_HOST"):
+        # Emulador local (testes): nao ha credencial; sem esta anonima o SDK
+        # procuraria a padrao do Google e travaria.
+        firebase_admin.initialize_app(_EmulatorCredential(), options=options)
     else:
         firebase_admin.initialize_app(options=options)
+
+if credentials is not None:
+    class _EmulatorCredential(credentials.Base):
+        def get_credential(self):
+            from google.auth.credentials import AnonymousCredentials
+            return AnonymousCredentials()
+
+def _google_api(host: str, path: str) -> str:
+    """URL de uma API do Google, ou do emulador quando ligado (testes):
+    FIRESTORE_EMULATOR_HOST e FIREBASE_AUTH_EMULATOR_HOST, as mesmas variaveis
+    que o Admin SDK usa."""
+    if host == "firestore.googleapis.com" and os.getenv("FIRESTORE_EMULATOR_HOST"):
+        return f"http://{os.environ['FIRESTORE_EMULATOR_HOST']}/{path}"
+    if host == "identitytoolkit.googleapis.com" and os.getenv("FIREBASE_AUTH_EMULATOR_HOST"):
+        return f"http://{os.environ['FIREBASE_AUTH_EMULATOR_HOST']}/identitytoolkit.googleapis.com/{path}"
+    return f"https://{host}/{path}"
 
 def get_firestore_admin():
     init_firebase_admin()
@@ -1316,9 +1336,9 @@ async def get_firestore_document_with_user_token(
     if not project_id:
         raise HTTPException(status_code=503, detail="FIREBASE_PROJECT_ID nao configurado.")
 
-    url = (
-        f"https://firestore.googleapis.com/v1/projects/{project_id}"
-        f"/databases/(default)/documents/{collection_name}/{document_id}"
+    url = _google_api(
+        "firestore.googleapis.com",
+        f"v1/projects/{project_id}/databases/(default)/documents/{collection_name}/{document_id}",
     )
     response = await _http_client().get(
         url,
@@ -1359,7 +1379,7 @@ async def verify_firebase_user_token(id_token: str) -> str:
     if FIREBASE_WEB_API_KEY:
         try:
             response = await _http_client().post(
-                "https://identitytoolkit.googleapis.com/v1/accounts:lookup",
+                _google_api("identitytoolkit.googleapis.com", "v1/accounts:lookup"),
                 params={"key": FIREBASE_WEB_API_KEY},
                 json={"idToken": id_token},
             )
@@ -4090,7 +4110,7 @@ async def _check_firebase_password(email: str, password: str) -> str:
         )
     try:
         response = await _http_client().post(
-            "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword",
+            _google_api("identitytoolkit.googleapis.com", "v1/accounts:signInWithPassword"),
             params={"key": FIREBASE_WEB_API_KEY},
             json={"email": email, "password": password, "returnSecureToken": False},
         )
