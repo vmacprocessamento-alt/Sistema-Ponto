@@ -168,6 +168,7 @@ class _UsersListTabState extends State<_UsersListTab> {
       builder: (context) => AccessMessageDialog(
         name: created['name']?.toString() ?? '',
         cpf: created['cpf']?.toString() ?? '',
+        password: created['password']?.toString() ?? '',
       ),
     );
   }
@@ -1524,6 +1525,8 @@ class _UserEditDialogState extends State<UserEditDialog> {
   // Modo diaria: so para Funcionario.
   bool _dailyMode = false;
   bool _obscurePassword = true;
+  // "Gerar senha temporaria": o backend gera ao salvar e a tela mostra uma vez.
+  bool _resetPassword = false;
   final _apiService = ApiService();
   bool _isSaving = false;
   bool _isDeleting = false;
@@ -1636,6 +1639,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
             TextFormField(
               controller: _passwordController,
               obscureText: _obscurePassword,
+              enabled: !_resetPassword,
               decoration: InputDecoration(
                 labelText: 'Nova senha',
                 helperText: 'Deixe vazio para manter. Com senha nova, a pessoa '
@@ -1654,12 +1658,14 @@ class _UserEditDialogState extends State<UserEditDialog> {
               alignment: Alignment.centerLeft,
               child: TextButton.icon(
                 onPressed: () => setState(() {
-                  _passwordController.text = ApiService.defaultUserPassword;
-                  _obscurePassword = false;
+                  _resetPassword = !_resetPassword;
+                  if (_resetPassword) _passwordController.clear();
                 }),
-                icon: const Icon(Icons.lock_reset, size: 18),
-                label: const Text(
-                    'Voltar para a senha padrão (${ApiService.defaultUserPassword})'),
+                icon: Icon(_resetPassword ? Icons.check_box : Icons.lock_reset,
+                    size: 18),
+                label: Text(_resetPassword
+                    ? 'Senha temporária será gerada ao salvar'
+                    : 'Gerar senha temporária'),
               ),
             ),
             SwitchListTile.adaptive(
@@ -1816,7 +1822,7 @@ class _UserEditDialogState extends State<UserEditDialog> {
 
     setState(() => _isSaving = true);
     try {
-      await _apiService.updateUserAdmin(
+      final result = await _apiService.updateUserAdmin(
         widget.user['id'],
         name: name,
         email: email,
@@ -1827,7 +1833,8 @@ class _UserEditDialogState extends State<UserEditDialog> {
         dailyHours: double.tryParse(_hoursController.text) ?? 8.0,
         cpf: _cpfController.text.trim(),
         disabled: _disabled,
-        newPassword: password.isEmpty ? null : password,
+        newPassword: password.isEmpty || _resetPassword ? null : password,
+        resetPassword: _resetPassword,
         workScheduleOverrideEnabled: _scheduleOverrideEnabled,
         workScheduleOverride: _scheduleOverrideEnabled
             ? {
@@ -1839,6 +1846,18 @@ class _UserEditDialogState extends State<UserEditDialog> {
         dailyMode: _selectedRole == 'employee' && _dailyMode,
       );
       widget.onSave();
+      final temporary = result['temporary_password']?.toString();
+      if (temporary != null && temporary.isNotEmpty && mounted) {
+        await showDialog(
+          context: context,
+          builder: (context) => AccessMessageDialog(
+            name: name,
+            cpf: _cpfController.text.trim(),
+            password: temporary,
+            title: 'Senha temporária gerada',
+          ),
+        );
+      }
       if (mounted) Navigator.pop(context);
     } catch (e) {
       if (mounted) {
@@ -1942,7 +1961,8 @@ class _UserEditDialogState extends State<UserEditDialog> {
 }
 
 /// Cadastro de uma pessoa pelo admin (nao ha mais cadastro pelo app). Ela
-/// entra com o CPF e a senha padrao e cria a propria no primeiro acesso.
+/// entra com o CPF e a senha temporaria gerada pelo backend e cria a propria
+/// no primeiro acesso.
 /// Devolve {'name', 'cpf'} da conta criada, ou null.
 class UserCreateDialog extends StatefulWidget {
   const UserCreateDialog({super.key});
@@ -2013,6 +2033,10 @@ class _UserCreateDialogState extends State<UserCreateDialog> {
       Navigator.pop(context, {
         'name': name,
         'cpf': created['cpf']?.toString() ?? formatCpf(_cpfController.text),
+        'password': (created['temporary_password'] ??
+                created['default_password'] ??
+                '')
+            .toString(),
       });
     } catch (e) {
       if (!mounted) return;
@@ -2043,9 +2067,9 @@ class _UserCreateDialogState extends State<UserCreateDialog> {
                   borderRadius: BorderRadius.circular(10),
                 ),
                 child: const Text(
-                  'A pessoa entra com o CPF e a senha padrão '
-                  '${ApiService.defaultUserPassword}. No primeiro acesso, o app '
-                  'pede para ela criar a própria senha.',
+                  'O sistema gera uma senha temporária para o primeiro '
+                  'acesso, mostrada uma vez depois de salvar. No primeiro '
+                  'acesso, o app pede para a pessoa criar a própria senha.',
                   style: TextStyle(fontSize: 13),
                 ),
               ),
@@ -2152,10 +2176,20 @@ class _UserCreateDialogState extends State<UserCreateDialog> {
 /// Depois do cadastro: a mensagem com o acesso para mandar a pessoa
 /// (copiar ou abrir no WhatsApp).
 class AccessMessageDialog extends StatelessWidget {
-  const AccessMessageDialog({super.key, required this.name, required this.cpf});
+  const AccessMessageDialog({
+    super.key,
+    required this.name,
+    required this.cpf,
+    required this.password,
+    this.title = 'Usuário cadastrado',
+  });
 
   final String name;
   final String cpf;
+
+  /// Senha temporaria gerada pelo backend: so aparece aqui, uma vez.
+  final String password;
+  final String title;
 
   static const Color wineColor = Color(0xFF8B0000);
 
@@ -2166,7 +2200,7 @@ class AccessMessageDialog extends StatelessWidget {
       // No navegador, o endereco que o admin esta usando e o do app.
       if (kIsWeb) 'Endereço: ${Uri.base.origin}',
       'Login (CPF): $cpf',
-      'Senha: ${ApiService.defaultUserPassword}',
+      'Senha temporária: $password',
       'No primeiro acesso o app pede para você criar uma senha nova.',
     ].join('\n');
   }
@@ -2195,12 +2229,13 @@ class AccessMessageDialog extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Usuário cadastrado'),
+      title: Text(title),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Mande o acesso para a pessoa:'),
+          const Text('Mande o acesso para a pessoa. A senha temporária '
+              'aparece só agora: copie ou envie antes de fechar.'),
           const SizedBox(height: 12),
           Container(
             width: double.infinity,

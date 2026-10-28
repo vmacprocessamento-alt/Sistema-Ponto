@@ -43,7 +43,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   String? _validatePassword(String? value) {
     final password = value ?? '';
     if (password.length < 6) return 'Use pelo menos 6 caracteres.';
-    if (password == ApiService.defaultUserPassword) {
+    if (password == ApiService.legacyDefaultPassword) {
       return 'Escolha uma senha diferente da senha padrão.';
     }
     final cpf = cpfDigits(widget.cpf);
@@ -128,7 +128,8 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                       const SizedBox(height: 16),
                       Text(
                         widget.forced
-                            ? 'Você entrou com a senha padrão. Para continuar, '
+                            ? 'Você entrou com a senha que o administrador '
+                                'passou. Para continuar, '
                                 'crie uma senha só sua: é com ela e o seu CPF '
                                 'que você vai entrar daqui para frente.'
                             : 'Digite a nova senha duas vezes.',
