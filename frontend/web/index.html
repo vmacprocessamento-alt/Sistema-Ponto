@@ -107,6 +107,62 @@
   </div>
 
   <script>
+    // Recarga feita pela atualizacao automatica: a tela de abertura explica.
+    try {
+      if (sessionStorage.getItem('vmac-updating')) {
+        sessionStorage.removeItem('vmac-updating');
+        document.getElementById('vmac-splash-text').textContent = 'Atualizando o VMac Ponto...';
+      }
+    } catch (e) {}
+
+    // ATUALIZACAO AUTOMATICA (ver pwa_service_worker.js e
+    // lib/services/update_service.dart). Quando o service worker de uma
+    // versao nova termina de baixar tudo e assume esta pagina, o navegador
+    // dispara 'controllerchange' e marcamos vmacUpdateReady; o app recarrega
+    // sozinho quando ninguem estiver usando a tela. Na primeira visita o
+    // service worker tambem assume a pagina, mas ai nao ha versao anterior:
+    // por isso so conta quando ja havia um controlando.
+    window.vmacUpdateReady = false;
+    window.vmacCheckForUpdate = function () { return Promise.resolve(); };
+    window.vmacApplyUpdate = function (force) {
+      // Trava contra recarga em loop: no automatico, no maximo uma a cada 2
+      // min. O toque em ATUALIZAR (force) sempre recarrega.
+      var KEY = 'vmac-auto-update-at';
+      try {
+        var last = parseInt(localStorage.getItem(KEY) || '0', 10);
+        if (!force && last && Date.now() - last < 120000) return false;
+        localStorage.setItem(KEY, String(Date.now()));
+        sessionStorage.setItem('vmac-updating', '1');
+      } catch (e) {}
+      location.reload();
+      return true;
+    };
+    if ('serviceWorker' in navigator) {
+      var vmacHadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        if (vmacHadController) window.vmacUpdateReady = true;
+        vmacHadController = true;
+      });
+      var vmacLastCheck = 0;
+      window.vmacCheckForUpdate = function () {
+        vmacLastCheck = Date.now();
+        return navigator.serviceWorker.getRegistration()
+          .then(function (reg) { return reg && reg.update(); })
+          .catch(function () {});
+      };
+      // Ao voltar para o app (celular tirado do bolso) e a cada 10 min com a
+      // tela aberta. O navegador sozinho so confere quando a pagina recarrega,
+      // e no celular o app instalado fica dias sem recarregar.
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible' && Date.now() - vmacLastCheck > 60000) {
+          window.vmacCheckForUpdate();
+        }
+      });
+      setInterval(function () {
+        if (document.visibilityState === 'visible') window.vmacCheckForUpdate();
+      }, 10 * 60 * 1000);
+    }
+
     // Registra o service worker que guarda o app para uso offline
     // (frontend/web/pwa_service_worker.js).
     if ('serviceWorker' in navigator) {

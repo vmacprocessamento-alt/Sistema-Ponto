@@ -71,26 +71,57 @@ function isVendorUrl(href) {
 // Caminhos do proprio dominio que nunca passam pelo cache.
 const BYPASS_PREFIXES = ['/api/', '/access/', '/access-check', '/openapi.json'];
 
+// Sem estes tres o app nao abre. Numa atualizacao, se algum nao vier, a
+// instalacao falha e o navegador tenta de novo na proxima checagem; a
+// versao atual segue funcionando ate la.
+const CRITICAL_URLS = ['/index.html', '/flutter_bootstrap.js', '/main.dart.js'];
+
+// ATUALIZACAO AUTOMATICA. O deploy (deploy/atualizar.sh) carimba a ultima
+// linha deste arquivo com a versao do build. Arquivo diferente = service
+// worker novo: o navegador o instala em segundo plano (index.html chama
+// registration.update() ao voltar para o app e a cada 10 min). A instalacao
+// baixa a versao nova inteira para o cache; ao ativar, ele assume a pagina
+// aberta (clients.claim), a pagina recebe 'controllerchange' e marca
+// window.vmacUpdateReady. O app (lib/services/update_service.dart) recarrega
+// no primeiro momento em que ninguem estiver usando a tela.
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches
-      .open(SHELL_CACHE)
-      .then((cache) =>
-        Promise.all(
-          SHELL_URLS.map((url) =>
-            fetch(new Request(url, { cache: 'no-cache', credentials: 'same-origin' }))
-              .then((response) => {
-                if (isCacheableSameOrigin(response)) return cache.put(url, response);
-              })
-              // Um arquivo que nao veio (ex.: sem sinal na instalacao) nao
-              // impede o service worker de subir; ele entra na proxima visita.
-              .catch(() => undefined),
-          ),
-        ),
-      )
-      .then(() => self.skipWaiting()),
-  );
+  // Ja existe um service worker ativo: e uma atualizacao.
+  const isUpdate = !!self.registration.active;
+  event.waitUntil(refreshShell(isUpdate).then(() => self.skipWaiting()));
 });
+
+// Baixa de novo os arquivos do app: os essenciais (SHELL_URLS) e tudo que ja
+// estava guardado (canvaskit, fontes, imagens). So grava depois de baixar
+// tudo, para a copia guardada nunca misturar a versao velha com a nova (um
+// main.dart.js novo com um canvaskit velho nao abre).
+// [strict]: numa atualizacao, falha se um essencial nao vier. Na primeira
+// visita tolera: um arquivo que nao veio entra na proxima visita.
+async function refreshShell(strict) {
+  const cache = await caches.open(SHELL_CACHE);
+  const cached = (await cache.keys()).map((request) => new URL(request.url).pathname);
+  const urls = Array.from(new Set([...SHELL_URLS, ...cached]));
+  const results = await Promise.all(
+    urls.map(async (url) => {
+      try {
+        const response = await fetch(
+          new Request(url, { cache: 'no-cache', credentials: 'same-origin' }),
+        );
+        return isCacheableSameOrigin(response) ? { url, response } : { url };
+      } catch (_) {
+        return { url };
+      }
+    }),
+  );
+  const missing = results.filter((item) => !item.response).map((item) => item.url);
+  if (strict && missing.some((url) => CRITICAL_URLS.includes(url))) {
+    throw new Error(`Versao nova incompleta: ${missing.join(', ')}`);
+  }
+  await Promise.all(
+    results
+      .filter((item) => item.response)
+      .map((item) => cache.put(item.url, item.response)),
+  );
+}
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(

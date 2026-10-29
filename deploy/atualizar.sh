@@ -50,6 +50,14 @@ if ! docker run --rm -v "$DIR/frontend:/app" -w /app "$FLUTTER_IMAGE" \
 fi
 test -f "$WEB_NEW/index.html"
 
+# Carimba a versao no service worker: arquivo diferente faz o navegador de
+# cada celular baixar a versao nova em segundo plano e o app recarregar
+# sozinho quando ninguem estiver usando a tela (atualizacao automatica,
+# docs/OFFLINE.md). Sem o carimbo os aparelhos so atualizam ao recarregar.
+BUILD_ID="$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
+printf '\n// build: %s\n' "$BUILD_ID" >> "$WEB_NEW/pwa_service_worker.js"
+log "Versao do site: $BUILD_ID"
+
 log "Reiniciando backend"
 if ! docker compose up -d --build backend; then
   # Backend novo nao subiu: o site novo nao fica no ar falando com o backend velho.

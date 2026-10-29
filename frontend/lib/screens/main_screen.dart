@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'home_screen.dart';
 import 'change_password_screen.dart';
@@ -34,6 +36,13 @@ class _MainScreenState extends State<MainScreen> {
   // ainda traz a marca e nao pode reabrir a tela.
   bool _passwordChanged = false;
   String? _cpf;
+  // Algum perfil (do aparelho ou do servidor) ja foi aplicado.
+  bool _hasProfile = false;
+  // Perfil que nao veio (servidor lento ou fora, sem copia no aparelho):
+  // tenta de novo sozinho. Antes a aba Gestao do admin sumia ate a pessoa
+  // recarregar a pagina, porque o perfil era lido uma vez so.
+  Timer? _profileRetryTimer;
+  int _profileRetryAttempt = 0;
 
   @override
   void initState() {
@@ -42,26 +51,48 @@ class _MainScreenState extends State<MainScreen> {
     _loadUser();
   }
 
+  @override
+  void dispose() {
+    _profileRetryTimer?.cancel();
+    super.dispose();
+  }
+
   Future<void> _loadUser() async {
     // Copia local primeiro (na hora, com ou sem internet); depois o perfil
     // do servidor, que traz a mudanca de modo feita pelo admin.
-    try {
-      final cached = await _apiService.getCachedCurrentUser();
-      if (cached != null) _applyUser(cached);
-    } catch (e) {
-      debugPrint('Perfil local indisponível: $e');
+    if (!_hasProfile) {
+      try {
+        final cached = await _apiService.getCachedCurrentUser();
+        if (cached != null) _applyUser(cached);
+      } catch (e) {
+        debugPrint('Perfil local indisponível: $e');
+      }
     }
     try {
       _applyUser(await _apiService.getCurrentUser());
+      _profileRetryAttempt = 0;
     } catch (e) {
       debugPrint('Erro ao carregar usuário: $e');
+      if (!_hasProfile) _scheduleProfileRetry();
     } finally {
       if (mounted && !_profileReady) setState(() => _profileReady = true);
     }
   }
 
+  /// 3 s, 6 s, 12 s, 24 s e depois a cada 30 s, ate o perfil vir.
+  void _scheduleProfileRetry() {
+    if (!mounted) return;
+    final seconds = (3 << _profileRetryAttempt.clamp(0, 3)).clamp(3, 30);
+    _profileRetryAttempt++;
+    _profileRetryTimer?.cancel();
+    _profileRetryTimer = Timer(Duration(seconds: seconds), () {
+      if (mounted && !_hasProfile) _loadUser();
+    });
+  }
+
   void _applyUser(Map<String, dynamic> user) {
     if (!mounted) return;
+    _hasProfile = true;
     setState(() {
       _isAdmin = user['role'] == 'admin' || user['role'] == 'manager';
       _dailyMode = user['daily_mode'] == true;

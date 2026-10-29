@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -10,12 +11,22 @@ import 'firebase_options.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'screens/login_screen.dart';
 import 'screens/main_screen.dart';
+import 'services/api_service.dart';
 import 'services/session_service.dart';
 import 'services/theme_service.dart';
+import 'services/update_service.dart';
 import 'widgets/startup_loading.dart';
+import 'widgets/update_banner.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  if (kIsWeb) {
+    // Atualizacao automatica: recarrega na versao nova quando ninguem esta
+    // usando a tela. A fila offline subindo nao pode ser cortada no meio.
+    UpdateService.instance
+      ..addBusyCheck(() => ApiService.offlineSyncRunning)
+      ..start();
+  }
   runApp(const AppBootstrap());
 }
 
@@ -173,6 +184,11 @@ class MyApp extends StatelessWidget {
         ),
       ),
       themeMode: themeService.isDarkMode ? ThemeMode.dark : ThemeMode.light,
+      // Atualizacao automatica: sabe quando ha dialogo ou tela por cima e
+      // mostra a barra "Nova versao do app" quando nao da para recarregar.
+      navigatorObservers: [UpdateService.instance.navigatorObserver],
+      builder: (context, child) =>
+          UpdateBanner(child: child ?? const SizedBox.shrink()),
       home: const AuthGate(),
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,

@@ -32,20 +32,43 @@ aparelho e sobem sozinhos quando o sinal volta.
   ainda nao subiu. Antes de limpar, confira na tela inicial se ha
   "registro(s) aguardando internet".
 
-## Atualizacoes do app
+## Atualizacoes do app (automaticas)
 
-- Online, o service worker busca sempre a versao publicada (rede primeiro) e
-  atualiza a copia local. Nao ha lista de versao para manter.
-- O nginx manda `Cache-Control: no-cache` para js/wasm/json: o navegador pode
-  guardar, mas revalida com ETag. Arquivo que nao mudou custa um 304.
-- Para forcar uma limpeza geral do cache (raro), mude `CACHE_VERSION` em
-  `pwa_service_worker.js`; a proxima abertura online descarta o cache antigo.
+Depois de um deploy, cada celular atualiza sozinho, sem ninguem fechar o app
+nem dar F5:
+
+1. O `deploy/atualizar.sh` carimba a versao na ultima linha do
+   `pwa_service_worker.js` (`// build: <commit>-<data>`).
+2. O app confere se o service worker mudou ao voltar para a tela (celular
+   tirado do bolso) e a cada 10 min com a tela aberta (`index.html`,
+   `vmacCheckForUpdate`).
+3. Mudou: o service worker novo baixa a versao nova inteira em segundo plano
+   (`index.html`, `main.dart.js`, canvaskit, fontes). Se algum arquivo
+   essencial nao vier, a instalacao falha e tenta de novo depois; a versao
+   atual segue funcionando e nunca fica meio velha, meio nova.
+4. Baixou: ele assume a pagina e marca `vmacUpdateReady`. O app
+   (`lib/services/update_service.dart`) recarrega no primeiro momento seguro:
+   10 s sem toque na tela, nenhum dialogo ou tela por cima, nenhum campo de
+   texto com cursor e nenhuma batida, diaria ou sincronizacao em andamento.
+   A tela de abertura mostra "Atualizando o VMac Ponto...".
+5. Se o momento seguro nao chega em 20 s (ex.: chat aberto), aparece no topo
+   a barra **"Nova versão do app disponível. ATUALIZAR"**.
+
+Trava contra loop: no automatico, no maximo uma recarga a cada 2 min.
+
+O nginx manda `Cache-Control: no-cache` para js/wasm/json: o navegador pode
+guardar, mas revalida com ETag. Arquivo que nao mudou custa um 304. Para forcar
+uma limpeza geral do cache (raro), mude `CACHE_VERSION` em
+`pwa_service_worker.js`.
 
 ## Deploy
 
-Nada novo: `flutter build web --release` copia `web/pwa_service_worker.js` e
-`web/index.html` para `build/web`, e o `docker compose up -d` publica. Confira
-que o `nginx.conf` em producao e o do repositorio (cabecalhos `no-cache`).
+Pelo `deploy/atualizar.sh` no VPS (docs/VPS.md), que ja carimba a versao. Um
+build feito a mao precisa do carimbo para os celulares atualizarem sozinhos:
+
+```bash
+printf '\n// build: %s\n' "$(date +%Y%m%d%H%M%S)" >> frontend/build/web/pwa_service_worker.js
+```
 
 ## Teste rapido
 

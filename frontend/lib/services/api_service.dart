@@ -932,6 +932,9 @@ class ApiService {
         .whenComplete(() => _offlineSyncInFlight = null);
   }
 
+  /// Ha fila offline subindo agora (a atualizacao automatica espera).
+  static bool get offlineSyncRunning => _offlineSyncInFlight != null;
+
   /// Espera a sincronizacao em andamento, se houver, terminar.
   static Future<void> waitForOfflineSync() async {
     try {

@@ -5,6 +5,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import '../services/api_service.dart';
 import '../services/notification_service.dart';
+import '../services/update_service.dart';
 import '../utils/shift_records.dart';
 import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
@@ -100,10 +101,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // Cores da Empresa
   static const Color wineColor = Color(0xFF8B0000);
 
+  // A atualizacao automatica nao recarrega com uma batida em andamento.
+  bool _busyCheck() => _punchInFlight;
+
+  // Perfil que nao veio (servidor lento ou fora, sem copia no aparelho):
+  // tenta de novo sozinho, com espera crescente. Antes a tela ficava em
+  // "Carregando..." ate a pessoa recarregar a pagina.
+  Timer? _profileRetryTimer;
+  int _profileRetryAttempt = 0;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    UpdateService.instance.addBusyCheck(_busyCheck);
     _updateTime();
     _timer =
         Timer.periodic(const Duration(seconds: 1), (timer) => _updateTime());
@@ -119,6 +130,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    UpdateService.instance.removeBusyCheck(_busyCheck);
+    _profileRetryTimer?.cancel();
     _timer?.cancel();
     _connectivitySubscription?.cancel();
     super.dispose();
@@ -126,7 +139,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed || _user == null) return;
+    if (state != AppLifecycleState.resumed) return;
+    // Voltou para o app sem o perfil carregado: tenta ja, sem esperar a
+    // proxima tentativa programada.
+    if (_user == null) {
+      unawaited(_refreshFromServer());
+      return;
+    }
     // O app volta do segundo plano mostrando o estado de quando saiu (a
     // saida pode ter sido batida no PC nesse meio tempo). Recarrega se a
     // ultima leitura ja tem mais de 2 minutos.
@@ -383,17 +402,36 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     // 2) Atualiza com o servidor em segundo plano.
+    await _refreshFromServer();
+  }
+
+  Future<void> _refreshFromServer() async {
+    _profileRetryTimer?.cancel();
     try {
       final user = await _apiService.getCurrentUser();
       _user = user;
+      _profileRetryAttempt = 0;
+      if (mounted) setState(() {});
       await _refreshWorkSchedule();
       await _trySyncOfflineRecords();
       await _loadTodayRecords();
     } catch (e) {
       debugPrint('Erro init: $e');
+      if (_user == null) _scheduleProfileRetry();
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  /// 3 s, 6 s, 12 s, 24 s e depois a cada 30 s, ate o perfil vir.
+  void _scheduleProfileRetry() {
+    if (!mounted) return;
+    final seconds = (3 << _profileRetryAttempt.clamp(0, 3)).clamp(3, 30);
+    _profileRetryAttempt++;
+    _profileRetryTimer?.cancel();
+    _profileRetryTimer = Timer(Duration(seconds: seconds), () {
+      if (mounted && _user == null) unawaited(_refreshFromServer());
+    });
   }
 
   Future<void> _refreshWorkSchedule({bool refreshRecords = false}) async {

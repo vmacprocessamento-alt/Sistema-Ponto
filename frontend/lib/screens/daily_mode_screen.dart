@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../services/api_service.dart';
+import '../services/update_service.dart';
 import '../utils/daily_entries.dart';
 import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
@@ -40,10 +41,14 @@ class _DailyModeScreenState extends State<DailyModeScreen>
   DateTime? _lastServerLoad;
   DateTime? _lastSyncAttempt;
 
+  // A atualizacao automatica nao recarrega com a diaria sendo registrada.
+  bool _busyCheck() => _adding;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    UpdateService.instance.addBusyCheck(_busyCheck);
     _timer = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
     _connectivitySubscription =
         Connectivity().onConnectivityChanged.listen((results) {
@@ -57,6 +62,7 @@ class _DailyModeScreenState extends State<DailyModeScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    UpdateService.instance.removeBusyCheck(_busyCheck);
     _timer?.cancel();
     _connectivitySubscription?.cancel();
     super.dispose();

@@ -23,7 +23,9 @@ bash /opt/ponto/deploy/atualizar.sh
 ```
 
 Puxa a `main`, gera o build do Flutter num container (`ghcr.io/cirruslabs/flutter`),
-recria backend e frontend. O build sai em `frontend/build/web-new`, com o site
+recria backend e frontend. Carimba a versao no service worker: os celulares
+baixam a versao nova sozinhos e recarregam quando ninguem estiver usando a
+tela (docs/OFFLINE.md, "Atualizacoes do app"). O build sai em `frontend/build/web-new`, com o site
 atual no ar o tempo todo; so no fim a pasta e trocada (a anterior fica em
 `frontend/build/web-old`). Se o build ou o backend falhar, nada e trocado.
 
