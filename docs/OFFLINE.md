@@ -58,11 +58,14 @@ nem dar F5:
 
 Trava contra loop: no automatico, no maximo uma recarga a cada 2 min.
 
-**Versao do app.** O Perfil e a tela de login mostram "Versão do app:
-29/10/2026 14:32 (b27c4cb)": data e hora do deploy e o commit
-(`--dart-define=APP_BUILD`, o mesmo carimbo do service worker). No suporte,
-compare com a linha "Versao do site" que o `atualizar.sh` imprime. Sem essa
-linha no Perfil, o celular esta com um app de antes de 29/10/2026.
+**Versao do app.** O Perfil e a tela de login mostram "Versão 0.3". O numero
+sobe sozinho a cada deploy que da certo (0.1, 0.2, 0.3...): o `atualizar.sh`
+guarda a ultima em `backend/data/versao-app.txt` no VPS e a passa ao build
+(`--dart-define=APP_VERSION`). No fim do deploy ele imprime
+`ATUALIZADO-OK - Versao 0.3`. No suporte, compare com o Perfil da pessoa.
+Sem a linha de versao no Perfil, o celular esta com um app de antes de
+29/10/2026. Para mudar a numeracao (ex.: passar para 1.0), grave `1.0` nesse
+arquivo: o proximo deploy sai `1.1`.
 
 **Apps de antes da atualizacao automatica.** O service worker novo, ao
 ativar, pergunta a cada pagina aberta se ela sabe se atualizar sozinha. A
@@ -77,8 +80,9 @@ uma limpeza geral do cache (raro), mude `CACHE_VERSION` em
 
 ## Deploy
 
-Pelo `deploy/atualizar.sh` no VPS (docs/VPS.md), que ja carimba a versao. Um
-build feito a mao precisa do carimbo para os celulares atualizarem sozinhos:
+Pelo `deploy/atualizar.sh` no VPS (docs/VPS.md), que ja numera e carimba a
+versao. Um build feito a mao aparece como "Versão de teste" e precisa do
+carimbo para os celulares atualizarem sozinhos:
 
 ```bash
 printf '\n// build: %s\n' "$(date +%Y%m%d%H%M%S)" >> frontend/build/web/pwa_service_worker.js

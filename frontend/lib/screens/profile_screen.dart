@@ -262,7 +262,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
               // atualizou (compare com a do ultimo deploy).
               Center(
                 child: Text(
-                  'Versão do app: ${appVersionLabel()}',
+                  appVersionLabel(),
                   style: const TextStyle(color: Colors.grey, fontSize: 12),
                 ),
               ),

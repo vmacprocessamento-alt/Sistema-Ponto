@@ -295,7 +295,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   // No suporte, mostra se o aparelho ja atualizou mesmo
                   // sem conseguir entrar.
                   Text(
-                    'Versão do app: ${appVersionLabel()}',
+                    appVersionLabel(),
                     textAlign: TextAlign.center,
                     style: const TextStyle(color: Colors.grey, fontSize: 11),
                   ),

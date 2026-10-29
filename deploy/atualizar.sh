@@ -40,14 +40,24 @@ git checkout -- frontend/pubspec.lock 2>/dev/null || true
 git checkout -- frontend/linux frontend/macos frontend/windows 2>/dev/null || true
 git pull --ff-only
 
-# Versao deste deploy: vai no app (Perfil e login mostram "Versao do app") e
-# no service worker (arquivo diferente = os celulares atualizam sozinhos).
-BUILD_ID="$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
+# Versao do app: sobe sozinha a cada deploy que da certo (0.1, 0.2, 0.3...).
+# A ultima fica em backend/data/versao-app.txt (fora do Git, junto com o
+# banco e os backups). Para mudar a numeracao (ex.: passar para 1.0), grave
+# a nova base nesse arquivo: o proximo deploy sai 1.1.
+VERSION_FILE=backend/data/versao-app.txt
+LAST_VERSION=""
+if [ -f "$VERSION_FILE" ]; then LAST_VERSION="$(tr -d ' \r\n' < "$VERSION_FILE")"; fi
+# Sem arquivo (primeiro deploy) ou conteudo que nao e numero.numero: 0.1.
+[[ "$LAST_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || LAST_VERSION="0.0"
+APP_VERSION="${LAST_VERSION%.*}.$(( ${LAST_VERSION##*.} + 1 ))"
+# Carimbo unico do deploy (o service worker muda e os celulares atualizam).
+BUILD_ID="$APP_VERSION $(git rev-parse --short HEAD) $(date +%Y-%m-%d_%H:%M)"
+log "Versao do app neste deploy: $APP_VERSION"
 
 log "Build do Flutter ($FLUTTER_IMAGE) em $WEB_NEW (o site atual continua no ar)"
 rm -rf "$WEB_NEW"
 if ! docker run --rm -v "$DIR/frontend:/app" -w /app "$FLUTTER_IMAGE" \
-    sh -c "git config --global --add safe.directory '*'; flutter pub get && flutter build web --release --no-wasm-dry-run --dart-define=APP_BUILD=$BUILD_ID --output build/web-new"; then
+    sh -c "git config --global --add safe.directory '*'; flutter pub get && flutter build web --release --no-wasm-dry-run --dart-define=APP_VERSION=$APP_VERSION --output build/web-new"; then
   rm -rf "$WEB_NEW"
   echo "Build do site falhou; nada foi trocado, o site anterior segue no ar."
   exit 1
@@ -59,7 +69,6 @@ test -f "$WEB_NEW/index.html"
 # sozinho quando ninguem estiver usando a tela (atualizacao automatica,
 # docs/OFFLINE.md). Sem o carimbo os aparelhos so atualizam ao recarregar.
 printf '\n// build: %s\n' "$BUILD_ID" >> "$WEB_NEW/pwa_service_worker.js"
-log "Versao do site: $BUILD_ID (aparece no Perfil de cada um como \"Versao do app\")"
 
 log "Reiniciando backend"
 if ! docker compose up -d --build backend; then
@@ -78,4 +87,7 @@ if ! docker compose up -d --force-recreate frontend; then
   exit 1
 fi
 docker compose ps
-log "ATUALIZADO-OK (build anterior guardado em $WEB_OLD)"
+# So agora a versao conta como usada: deploy que falhou nao pula numero.
+mkdir -p "$(dirname "$VERSION_FILE")"
+echo "$APP_VERSION" > "$VERSION_FILE"
+log "ATUALIZADO-OK - Versao $APP_VERSION (aparece no Perfil de cada um; build anterior em $WEB_OLD)"

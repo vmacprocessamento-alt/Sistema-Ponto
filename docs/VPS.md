@@ -13,7 +13,8 @@ Ficam só no VPS (vieram do PC na migração):
 
 - `backend/.env` (palavra-chave, chaves, senha de e-mail)
 - `backend/service-account.json`
-- `backend/data/` (SQLite das assinaturas e backups diários)
+- `backend/data/` (SQLite das assinaturas, backups diários e `versao-app.txt`,
+  a última versão do app publicada: 0.1, 0.2...)
 - `/opt/ponto/.env` com `COMPOSE_FILE=docker-compose.yml:deploy/docker-compose.vps.yml`
 
 ## Atualizar
