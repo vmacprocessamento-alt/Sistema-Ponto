@@ -175,7 +175,10 @@
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', function () {
         navigator.serviceWorker
-          .register('pwa_service_worker.js', { scope: '/' })
+          // updateViaCache 'none': a conferencia de versao nova sempre vai ao
+          // servidor. A Cloudflare manda o service worker com 4 h de cache e o
+          // Safari antigo respeitava isso, atrasando a atualizacao.
+          .register('pwa_service_worker.js', { scope: '/', updateViaCache: 'none' })
           .catch(function (err) { console.warn('Service worker nao registrado:', err); });
 
         // Aquecimento do cache: manda ao service worker a lista do que esta

@@ -74,7 +74,17 @@ ja na versao nova. O navegador busca o service worker novo quando o app
 antigo recarrega ou, com ele aberto, ate 24 h depois da ultima conferencia.
 
 O nginx manda `Cache-Control: no-cache` para js/wasm/json: o navegador pode
-guardar, mas revalida com ETag. Arquivo que nao mudou custa um 304. Para forcar
+guardar, mas revalida com ETag. Arquivo que nao mudou custa um 304.
+**Atencao:** a Cloudflare troca esse cabecalho por `max-age=14400` (4 h) nos
+`.js` (main.dart.js, flutter_bootstrap.js, pwa_service_worker.js), por causa
+do "Browser Cache TTL" da zona. Em 29/10/2026 isso fez o Chrome e o iPhone
+rodarem um main.dart.js velho com o index.html novo ("Carregando..." no nome e
+a aba Gestao sumindo ao reabrir a versao 0.1; janela anonima funcionava). Por
+isso o service worker busca tudo com `cache: 'no-cache'` e o index.html
+registra o service worker com `updateViaCache: 'none'`. Para conferir:
+`curl -sI https://ponto.vmacengenharia.com/main.dart.js | grep -i cache-control`
+deve mostrar `no-cache` depois de ajustar a Cloudflare (Caching >
+Configuration > Browser Cache TTL > "Respect Existing Headers"). Para forcar
 uma limpeza geral do cache (raro), mude `CACHE_VERSION` em
 `pwa_service_worker.js`.
 

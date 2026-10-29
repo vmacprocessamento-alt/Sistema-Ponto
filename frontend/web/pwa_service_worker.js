@@ -9,8 +9,10 @@
  *
  *  - Arquivos do proprio site (index.html, main.dart.js, canvaskit, assets):
  *    REDE PRIMEIRO, cache como reserva. Online o usuario sempre recebe a
- *    versao publicada (o nginx manda Cache-Control: no-cache, entao a
- *    revalidacao custa um 304). Offline, ou se a rede travar, vem do cache.
+ *    versao publicada: todo pedido sai com cache 'no-cache' (revalidacao
+ *    custa um 304), porque a Cloudflare poe 4 h de validade nos .js e o
+ *    navegador nem perguntaria ao servidor. Offline, ou se a rede travar,
+ *    vem do cache.
  *    Toda resposta boa da rede atualiza o cache.
  *
  *  - SDK JS do Firebase (www.gstatic.com/firebasejs/<versao>/...) e fontes
@@ -276,7 +278,12 @@ async function networkFirst(request, cacheName, fallbackUrl) {
     timer = setTimeout(() => resolve(undefined), NETWORK_TIMEOUT_MS);
   });
 
-  const network = fetch(request)
+  // Sempre revalida com o servidor (um 304 se nao mudou). A Cloudflare troca
+  // o "no-cache" do nginx por "max-age=14400" nos .js; sem isto o navegador
+  // entregava um main.dart.js de ate 4 h atras, de outra versao, junto com o
+  // index.html novo. Foi o "Carregando..." e a Gestao sumindo da versao 0.1
+  // no Chrome e no iPhone (29/10/2026).
+  const network = fetch(revalidating(request))
     .then((response) => {
       if (isCacheableSameOrigin(response)) {
         // Nao aguardamos o put: a resposta vai para a tela ja.
@@ -303,6 +310,17 @@ async function networkFirst(request, cacheName, fallbackUrl) {
     status: 503,
     headers: { 'Content-Type': 'text/plain; charset=utf-8' },
   });
+}
+
+// Mesmo pedido, mas ignorando a validade guardada no cache HTTP do navegador.
+// A navegacao (index.html) vai como veio: ja chega com "no-cache".
+function revalidating(request) {
+  if (request.mode === 'navigate') return request;
+  try {
+    return new Request(request, { cache: 'no-cache' });
+  } catch (_) {
+    return request;
+  }
 }
 
 function cacheKeyFor(request) {
