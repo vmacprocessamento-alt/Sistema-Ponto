@@ -3100,11 +3100,33 @@ class ApiService {
     return records;
   }
 
+  /// Admin apaga uma batida errada (botao apertado sem querer, toque duplo),
+  /// pelo backend: a copia do registro fica na auditoria com o motivo.
+  Future<void> deleteTimeRecordAdmin(
+      {required String recordId, required String reason}) async {
+    final response = await http
+        .delete(
+          Uri.parse(
+              '$backendUrl/admin/time-records/${Uri.encodeComponent(recordId)}'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'reason': reason}),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+  }
+
   Future<void> updateTimeRecordAdmin({
     required String recordId,
     required String newTimestamp,
     required String reason,
     String? notes,
+    // Botao errado (ex.: "pausa" no lugar de "saida"): troca o tipo.
+    String? newRecordType,
   }) async {
     final admin = await getCurrentUser();
     if (admin['role'] != 'admin') {
@@ -3122,9 +3144,13 @@ class ApiService {
       final oldData = snapshot.data() as Map<String, dynamic>;
       final oldTimestamp = oldData['timestamp']?.toString();
       final oldNotes = oldData['notes']?.toString();
+      final oldType = oldData['record_type']?.toString();
+      final recordType =
+          (newRecordType != null && newRecordType.isNotEmpty) ? newRecordType : oldType;
 
       transaction.update(recordRef, {
         'timestamp': newTimestamp,
+        'record_type': recordType,
         'notes': notes ?? '',
         'updated_at': FieldValue.serverTimestamp(),
         'edited_by_admin': true,
@@ -3136,9 +3162,12 @@ class ApiService {
       });
 
       transaction.set(auditRef, {
+        'action': 'edit',
         'record_id': recordId,
         'record_user_id': oldData['user_id'],
-        'record_type': oldData['record_type'],
+        'record_type': oldType,
+        'old_record_type': oldType,
+        'new_record_type': recordType,
         'old_timestamp': oldTimestamp,
         'new_timestamp': newTimestamp,
         'old_notes': oldNotes,

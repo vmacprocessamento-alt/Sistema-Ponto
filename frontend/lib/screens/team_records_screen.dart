@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import 'package:intl/intl.dart';
+import '../utils/record_types.dart';
 import '../widgets/export_dialog.dart';
 import 'daily_entries_admin_screen.dart';
 import '../widgets/content_width.dart';
@@ -130,8 +131,105 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
     );
   }
 
+  void _showSnack(String message, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      backgroundColor: error ? Colors.red : wineColor,
+    ));
+  }
+
+  /// Pede o motivo (obrigatorio) da acao; null se cancelou.
+  Future<String?> _askReason({
+    required String title,
+    required String message,
+    required String confirmLabel,
+    Color confirmColor = wineColor,
+  }) async {
+    final controller = TextEditingController();
+    String? errorText;
+    final reason = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(title),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(message),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  maxLines: 3,
+                  maxLength: 500,
+                  textCapitalization: TextCapitalization.sentences,
+                  decoration: InputDecoration(
+                    labelText: 'Motivo (obrigatório)',
+                    border: const OutlineInputBorder(),
+                    errorText: errorText,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancelar'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final text = controller.text.trim();
+                if (text.isEmpty) {
+                  setDialogState(() => errorText = 'Informe o motivo.');
+                  return;
+                }
+                Navigator.pop(dialogContext, text);
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: confirmColor),
+              child: Text(confirmLabel,
+                  style: const TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      ),
+    );
+    controller.dispose();
+    return reason;
+  }
+
+  /// Apaga uma batida errada (botao apertado sem querer, toque duplo). O
+  /// backend guarda a copia na auditoria com o motivo.
+  Future<void> _confirmDeleteRecord(Map<String, dynamic> record) async {
+    final time = DateTime.parse(record['timestamp']).toLocal();
+    final reason = await _askReason(
+      title: 'Apagar ponto',
+      message: 'Apagar a batida "${recordTypeLabel(record['record_type']?.toString())}" '
+          'de ${_recordUserName(record)} em '
+          '${DateFormat('dd/MM/yyyy HH:mm:ss').format(time)}? '
+          'Ela sai da folha e do app da pessoa; a cópia fica na auditoria.',
+      confirmLabel: 'Apagar',
+      confirmColor: Colors.red,
+    );
+    if (reason == null || !mounted) return;
+
+    try {
+      await _apiService.deleteTimeRecordAdmin(
+          recordId: record['id'].toString(), reason: reason);
+      await _fetchRecords();
+      _showSnack('Ponto apagado.');
+    } catch (e) {
+      _showSnack('Erro ao apagar ponto: $e', error: true);
+    }
+  }
+
   Future<void> _showEditRecordDialog(Map<String, dynamic> record) async {
     DateTime selectedDateTime = DateTime.parse(record['timestamp']).toLocal();
+    final originalType = record['record_type']?.toString() ?? '';
+    String selectedType = originalType;
     final notesController =
         TextEditingController(text: record['notes']?.toString() ?? '');
     final reasonController = TextEditingController();
@@ -187,12 +285,25 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Text(
-                      record['record_type']
-                          .toString()
-                          .replaceAll('_', ' ')
-                          .toUpperCase(),
-                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    // Botao errado (ex.: "pausa" no lugar de "saida"): o
+                    // admin troca o tipo em vez de apagar e lancar de novo.
+                    DropdownButtonFormField<String>(
+                      initialValue:
+                          punchTypes.contains(selectedType) ? selectedType : null,
+                      decoration: const InputDecoration(
+                        labelText: 'Tipo da batida',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                      items: [
+                        for (final type in punchTypes)
+                          DropdownMenuItem(
+                              value: type, child: Text(recordTypeLabel(type))),
+                      ],
+                      onChanged: (value) {
+                        if (value == null) return;
+                        setDialogState(() => selectedType = value);
+                      },
                     ),
                     const SizedBox(height: 16),
                     OutlinedButton.icon(
@@ -270,6 +381,7 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
         newTimestamp: selectedDateTime.toIso8601String(),
         notes: notes,
         reason: reason,
+        newRecordType: selectedType != originalType ? selectedType : null,
       );
       notesController.dispose();
       reasonController.dispose();
@@ -510,10 +622,7 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
             title: Row(
               children: [
                 Text(
-                  r['record_type']
-                      .toString()
-                      .replaceAll('_', ' ')
-                      .toUpperCase(),
+                  recordTypeLabel(r['record_type']?.toString()),
                   style: const TextStyle(
                       fontSize: 12, fontWeight: FontWeight.bold),
                 ),
@@ -563,12 +672,19 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
                 Text(DateFormat('dd/MM/yyyy').format(time),
                     style: const TextStyle(color: Colors.grey, fontSize: 11)),
                 if (widget.canEdit) ...[
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 4),
                   IconButton(
                     tooltip: 'Editar ponto',
+                    visualDensity: VisualDensity.compact,
                     icon: const Icon(Icons.edit, color: wineColor, size: 20),
-                    onPressed: () =>
-                        _showEditRecordDialog(Map<String, dynamic>.from(r)),
+                    onPressed: () => _showEditRecordDialog(record),
+                  ),
+                  IconButton(
+                    tooltip: 'Apagar ponto',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.delete_outline,
+                        color: Colors.red, size: 20),
+                    onPressed: () => _confirmDeleteRecord(record),
                   ),
                 ],
               ],

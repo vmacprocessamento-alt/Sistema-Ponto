@@ -32,6 +32,12 @@ voltar_web() {
 
 cd "$DIR"
 log "Puxando codigo"
+# O "flutter pub get" dentro do container reescreve o pubspec.lock (versao do
+# Flutter da imagem difere da do PC) e arquivos gerados de plataforma. Sao
+# artefatos, nao mudancas de ninguem; sem descartar, o pull recusa com
+# "local changes would be overwritten" (aconteceu em 28/10/2026).
+git checkout -- frontend/pubspec.lock 2>/dev/null || true
+git checkout -- frontend/linux frontend/macos frontend/windows 2>/dev/null || true
 git pull --ff-only
 
 log "Build do Flutter ($FLUTTER_IMAGE) em $WEB_NEW (o site atual continua no ar)"

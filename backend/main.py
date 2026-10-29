@@ -668,6 +668,11 @@ class AdminTimeRecordUpdateRequest(BaseModel):
     new_timestamp: str
     reason: str
     notes: Optional[str] = None
+    # Botao errado (ex.: "pausa" no lugar de "saida"): troca o tipo da batida.
+    new_record_type: Optional[str] = None
+
+class AdminTimeRecordDeleteRequest(BaseModel):
+    reason: str
 
 def init_firebase_admin():
     if firebase_admin is None:
@@ -4547,6 +4552,9 @@ def update_time_record_admin_endpoint(
     if not (payload.new_timestamp or "").strip():
         raise HTTPException(status_code=400, detail="Informe o novo horario.")
     new_timestamp = _local_iso(_parse_schedule_datetime(payload.new_timestamp.strip(), _LOCAL_TZ))
+    new_record_type = (payload.new_record_type or "").strip() or None
+    if new_record_type is not None and new_record_type not in _PUNCH_TYPES:
+        raise HTTPException(status_code=400, detail="Tipo de batida invalido.")
 
     db = get_firestore_admin()
     record_ref = db.collection("time_records").document(record_id)
@@ -4561,8 +4569,10 @@ def update_time_record_admin_endpoint(
             raise HTTPException(status_code=404, detail="Registro de ponto nao encontrado.")
 
         old_data = snapshot.to_dict() or {}
+        record_type = new_record_type or old_data.get("record_type")
         transaction.update(record_ref, {
             "timestamp": new_timestamp,
+            "record_type": record_type,
             "notes": payload.notes or "",
             "updated_at": firestore.SERVER_TIMESTAMP,
             "edited_by_admin": True,
@@ -4573,9 +4583,12 @@ def update_time_record_admin_endpoint(
             "last_admin_edit_at": firestore.SERVER_TIMESTAMP,
         })
         transaction.set(audit_ref, {
+            "action": "edit",
             "record_id": record_id,
             "record_user_id": old_data.get("user_id"),
             "record_type": old_data.get("record_type"),
+            "old_record_type": old_data.get("record_type"),
+            "new_record_type": record_type,
             "old_timestamp": old_data.get("timestamp"),
             "new_timestamp": new_timestamp,
             "old_notes": old_data.get("notes"),
@@ -4590,6 +4603,42 @@ def update_time_record_admin_endpoint(
 
     update_in_transaction(transaction)
     return {"status": "success", "id": record_id}
+
+@app.delete("/admin/time-records/{record_id}")
+def delete_time_record_admin_endpoint(
+    record_id: str,
+    payload: AdminTimeRecordDeleteRequest,
+    admin=Depends(require_admin_user),
+):
+    """Admin apaga uma batida errada (botao apertado sem querer, toque
+    duplo). A copia inteira do registro fica em time_record_audits, com o
+    motivo e quem apagou; a folha e o app da pessoa deixam de ver o ponto."""
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode apagar registros de ponto.")
+    reason = _require_reason(payload.reason)
+
+    db = get_firestore_admin()
+    record_ref = db.collection("time_records").document(record_id)
+    snapshot = record_ref.get()
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="Registro de ponto nao encontrado.")
+    record = serialize_firestore_document(snapshot)
+    record_ref.delete()
+    db.collection("time_record_audits").document().set({
+        "action": "delete",
+        "record_id": record_id,
+        "record_user_id": record.get("user_id"),
+        "record_type": record.get("record_type"),
+        "old_timestamp": record.get("timestamp"),
+        "deleted_record": record,
+        "reason": reason,
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "admin_email": admin.get("email", ""),
+        "deleted_at": firestore.SERVER_TIMESTAMP,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "deleted", "id": record_id}
 
 @app.delete("/admin/users/{user_id}")
 def delete_user_admin_endpoint(

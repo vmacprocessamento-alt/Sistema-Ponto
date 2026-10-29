@@ -489,7 +489,7 @@ class _FakeDocument:
         self._collection = collection
         self.id = doc_id
 
-    def get(self):
+    def get(self, transaction=None):
         return _FakeSnapshot(self._store, self._collection, self.id)
 
     def set(self, data):
@@ -540,12 +540,32 @@ class _FakeQuery:
         return _FakeDocument(self._store, self._collection, doc_id or f"auto{next(self._ids)}")
 
 
+class _FakeTransaction:
+    """Transacao de mentira: aplica na hora (os testes nao disputam escrita).
+    Junto com firestore.transactional = lambda f: f no mock."""
+
+    def get(self, ref):
+        return ref.get()
+
+    def update(self, ref, data):
+        ref.update(data)
+
+    def set(self, ref, data):
+        ref.set(data)
+
+    def delete(self, ref):
+        ref.delete()
+
+
 class _FakeDb:
     def __init__(self):
         self.store = {}
 
     def collection(self, name):
         return _FakeQuery(self.store, name)
+
+    def transaction(self):
+        return _FakeTransaction()
 
 
 @needs_main
@@ -1404,6 +1424,89 @@ class TemporaryPasswordTest(unittest.TestCase):
 
     def test_senha_padrao(self):
         self.assertEqual(main._temporary_password(), "123456")
+
+
+@needs_main
+class AdminTimeRecordTest(unittest.TestCase):
+    """Admin corrige (horario, tipo) e apaga batidas erradas, com motivo e
+    copia na auditoria (time_record_audits)."""
+
+    admin = {"id": "a1", "role": "admin", "name": "Admin", "email": "a@x"}
+    manager = {"id": "g1", "role": "manager", "name": "Gestor"}
+    record = {
+        "user_id": "u1", "record_type": "break_start",
+        "timestamp": "2026-10-28T21:57:23.000000", "notes": "", "location": "App",
+    }
+
+    def setUp(self):
+        self.db = _FakeDb()
+        self.db.store["time_records"] = {"r1": dict(self.record)}
+        patches = [
+            mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+            mock.patch.object(
+                main, "firestore",
+                types.SimpleNamespace(SERVER_TIMESTAMP="ts", transactional=lambda f: f),
+            ),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def edit(self, record_id="r1", admin=None, **fields):
+        values = {"new_timestamp": "2026-10-28T21:57:23", "reason": "botao errado"}
+        values.update(fields)
+        payload = main.AdminTimeRecordUpdateRequest(**values)
+        return _call(main.update_time_record_admin_endpoint(record_id, payload, admin or self.admin))
+
+    def delete(self, record_id="r1", admin=None, reason="toque duplo"):
+        payload = main.AdminTimeRecordDeleteRequest(reason=reason)
+        return _call(main.delete_time_record_admin_endpoint(record_id, payload, admin or self.admin))
+
+    def status_of(self, call, *args, **kwargs):
+        with self.assertRaises(main.HTTPException) as ctx:
+            call(*args, **kwargs)
+        return ctx.exception.status_code
+
+    def audits(self):
+        return list(self.db.store.get("time_record_audits", {}).values())
+
+    def test_edit_changes_type_and_time_with_audit(self):
+        self.assertEqual(self.edit(new_record_type="check_out", new_timestamp="2026-10-28T22:10")["status"], "success")
+        stored = self.db.store["time_records"]["r1"]
+        self.assertEqual((stored["record_type"], stored["timestamp"]), ("check_out", "2026-10-28T22:10:00"))
+        self.assertTrue(stored["edited_by_admin"])
+        audit = self.audits()[0]
+        self.assertEqual(
+            (audit["action"], audit["old_record_type"], audit["new_record_type"], audit["old_timestamp"]),
+            ("edit", "break_start", "check_out", "2026-10-28T21:57:23.000000"),
+        )
+        # Sem tipo novo, o tipo fica.
+        self.edit(new_timestamp="2026-10-28T22:15")
+        self.assertEqual(self.db.store["time_records"]["r1"]["record_type"], "check_out")
+
+    def test_edit_refuses_bad_input(self):
+        self.assertEqual(self.status_of(self.edit, new_record_type="almoco"), 400)
+        self.assertEqual(self.status_of(self.edit, reason="  "), 400)
+        self.assertEqual(self.status_of(self.edit, record_id="nao-existe"), 404)
+        self.assertEqual(self.status_of(self.edit, admin=self.manager), 403)
+        self.assertEqual(self.db.store["time_records"]["r1"], self.record)
+        self.assertEqual(self.audits(), [])
+
+    def test_delete_keeps_copy_in_audit(self):
+        self.assertEqual(self.delete(), {"status": "deleted", "id": "r1"})
+        self.assertNotIn("r1", self.db.store["time_records"])
+        audit = self.audits()[0]
+        self.assertEqual((audit["action"], audit["record_id"], audit["record_user_id"], audit["reason"]),
+                         ("delete", "r1", "u1", "toque duplo"))
+        self.assertEqual(audit["deleted_record"], {"id": "r1", **self.record})
+        self.assertEqual((audit["admin_id"], audit["admin_name"]), ("a1", "Admin"))
+
+    def test_delete_refuses_bad_input(self):
+        self.assertEqual(self.status_of(self.delete, reason=""), 400)
+        self.assertEqual(self.status_of(self.delete, record_id="nao-existe"), 404)
+        self.assertEqual(self.status_of(self.delete, admin=self.manager), 403)
+        self.assertIn("r1", self.db.store["time_records"])
+        self.assertEqual(self.audits(), [])
 
 
 @needs_main
