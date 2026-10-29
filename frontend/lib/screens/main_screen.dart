@@ -9,6 +9,8 @@ import 'history_screen.dart';
 import 'admin_screen.dart';
 import 'profile_screen.dart';
 import '../services/api_service.dart';
+import '../services/app_version.dart';
+import '../services/device_info.dart';
 import '../services/notification_service.dart';
 import '../services/update_service.dart';
 import '../widgets/content_width.dart';
@@ -49,7 +51,20 @@ class _MainScreenState extends State<MainScreen> {
   void initState() {
     super.initState();
     NotificationService.registerCurrentDevice();
-    _loadUser();
+    unawaited(_loadUser().whenComplete(_reportAppVersion));
+  }
+
+  /// Versao e aparelho para a Gestao e o suporte. Depois do perfil, para nao
+  /// disputar a internet com a abertura; falha nao atrapalha nada.
+  Future<void> _reportAppVersion() async {
+    try {
+      await _apiService.reportAppVersion(
+        version: reportedAppVersion,
+        device: currentDeviceLabel(),
+      );
+    } catch (e) {
+      debugPrint('Versao do app nao informada: $e');
+    }
   }
 
   @override

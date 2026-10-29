@@ -5,6 +5,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'dart:async';
 import '../services/api_service.dart';
+import '../services/app_version.dart';
 import '../utils/batch_entry.dart';
 import '../utils/cpf.dart';
 import '../utils/shift_records.dart';
@@ -174,12 +175,72 @@ class _UsersListTabState extends State<_UsersListTab> {
     );
   }
 
+  /// "App 0.4 · iPhone · app instalado · aberto 29/10 08:12", gravado pelo app
+  /// ao abrir (POST /me/app-version). Sem registro: app de antes da 0.4 ou a
+  /// pessoa nao abriu o app desde entao.
+  String _appVersionLine(dynamic user) {
+    final version = (user['app_version'] ?? '').toString().trim();
+    if (version.isEmpty) return 'App: sem registro (versão antiga)';
+    final parts = <String>[
+      version == 'teste' ? 'App de teste' : 'App $version',
+    ];
+    final device = (user['app_device'] ?? '').toString().trim();
+    if (device.isNotEmpty) parts.add(device);
+    final openedAt = user['app_opened_at'];
+    if (openedAt is Timestamp) {
+      parts.add(
+          'aberto ${DateFormat('dd/MM HH:mm').format(openedAt.toDate())}');
+    }
+    if (isOutdatedAppVersion(version)) parts.add('desatualizado');
+    return parts.join(' · ');
+  }
+
+  /// Topo da lista: quantas pessoas ativas estao com o app desatualizado.
+  /// Some num build de teste (sem numero de versao para comparar).
+  Widget? _appVersionSummary() {
+    if (!hasNumberedAppVersion()) return null;
+    final active = _users.where((u) => u['disabled'] != true).toList();
+    if (active.isEmpty) return null;
+    final outdated = active
+        .where((u) => isOutdatedAppVersion(u['app_version']?.toString()))
+        .length;
+    final ok = outdated == 0;
+    final color = ok ? Colors.green.shade700 : Colors.orange.shade800;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        children: [
+          Icon(ok ? Icons.verified : Icons.system_update,
+              color: color, size: 22),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              ok
+                  ? 'Todos com o app na versão atual ($appVersion).'
+                  : '$outdated de ${active.length} '
+                      '${outdated == 1 ? 'pessoa está' : 'pessoas estão'} '
+                      'com o app desatualizado (versão atual $appVersion). '
+                      'Peça para fechar o app e abrir de novo com internet.',
+              style: TextStyle(color: color, fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
       return const Center(child: CircularProgressIndicator(color: wineColor));
     }
 
+    final versionSummary = _appVersionSummary();
     return Scaffold(
       floatingActionButton: _isAdmin
           ? FloatingActionButton.extended(
@@ -197,10 +258,16 @@ class _UsersListTabState extends State<_UsersListTab> {
         color: wineColor,
         child: ListView.separated(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
-          itemCount: _users.length,
+          itemCount: _users.length + (versionSummary == null ? 0 : 1),
           separatorBuilder: (_, __) => const SizedBox(height: 12),
           itemBuilder: (context, index) {
+            if (versionSummary != null) {
+              if (index == 0) return versionSummary;
+              index -= 1;
+            }
             final user = _users[index];
+            final appOutdated = isOutdatedAppVersion(
+                user['app_version']?.toString());
             String role = user['role'] ?? '-';
             if (role == 'intern') role = 'Estagiário';
             if (role == 'employee') role = 'Funcionário';
@@ -225,11 +292,28 @@ class _UsersListTabState extends State<_UsersListTab> {
                 ),
                 title: Text(user['name'],
                     style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text(
-                    '$role • $jobTitle • ${user['daily_hours']}h/dia$dailyTag'
-                    '\nCPF: ${cpf.length == 11 ? formatCpf(cpf) : 'não informado'}'
-                    '$firstAccess',
-                    style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                subtitle: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                        '$role • $jobTitle • ${user['daily_hours']}h/dia$dailyTag'
+                        '\nCPF: ${cpf.length == 11 ? formatCpf(cpf) : 'não informado'}'
+                        '$firstAccess',
+                        style:
+                            const TextStyle(color: Colors.grey, fontSize: 12)),
+                    const SizedBox(height: 2),
+                    Text(
+                      _appVersionLine(user),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: appOutdated
+                            ? Colors.orange.shade800
+                            : Colors.grey,
+                        fontWeight: appOutdated ? FontWeight.w600 : null,
+                      ),
+                    ),
+                  ],
+                ),
                 trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [

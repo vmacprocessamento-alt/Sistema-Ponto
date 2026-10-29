@@ -4426,6 +4426,39 @@ async def change_own_password_endpoint(
     })
     return {"status": "success"}
 
+class AppVersionReport(BaseModel):
+    version: str
+    device: Optional[str] = None
+
+
+# "0.3", "1.12" ou "teste" (build feito a mao, sem numero).
+_APP_VERSION_RE = re.compile(r"^(\d{1,4}\.\d{1,4}|teste)$")
+
+
+@app.post("/me/app-version")
+async def report_app_version_endpoint(
+    payload: AppVersionReport,
+    user=Depends(require_user_pending_password_change),
+):
+    """O app informa a versao que esta rodando e o aparelho, ao abrir (no maximo
+    1x por dia ou quando a versao muda). A Gestao mostra quem ficou numa versao
+    antiga e o suporte ve na hora com que versao e aparelho a pessoa abriu o
+    app. Pelo backend porque as regras do Firestore so deixam a pessoa mexer no
+    fcm_tokens do proprio cadastro. Vale tambem com a troca de senha pendente:
+    so grava a versao da propria pessoa."""
+    version = (payload.version or "").strip()
+    if not _APP_VERSION_RE.match(version):
+        raise HTTPException(status_code=400, detail="Versao invalida.")
+    device = " ".join((payload.device or "").split())[:60]
+    db = get_firestore_admin()
+    await asyncio.to_thread(db.collection("users").document(user["id"]).update, {
+        "app_version": version,
+        "app_device": device,
+        "app_opened_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "success"}
+
+
 @app.put("/admin/users/{user_id}")
 def update_user_admin_endpoint(
     user_id: str,

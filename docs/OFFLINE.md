@@ -64,7 +64,15 @@ guarda a ultima em `backend/data/versao-app.txt` no VPS e a passa ao build
 (`--dart-define=APP_VERSION`). No fim do deploy ele imprime
 `ATUALIZADO-OK - Versao 0.3`. No suporte, compare com o Perfil da pessoa.
 Sem a linha de versao no Perfil, o celular esta com um app de antes de
-29/10/2026. Para mudar a numeracao (ex.: passar para 1.0), grave `1.0` nesse
+29/10/2026.
+
+**Quem ficou para tras (Gestao).** Ao abrir, o app informa a versao e o
+aparelho ao backend (`POST /me/app-version`, no maximo 1x por dia ou quando a
+versao muda), que grava `app_version`, `app_device` e `app_opened_at` no
+cadastro. A lista de pessoas da Gestao mostra em cada uma "App 0.4 · iPhone ·
+app instalado · aberto 29/10 08:12" (em laranja quando desatualizado) e, no
+topo, quantas pessoas ativas estao com versao menor que a do gestor. "Sem
+registro" = app de antes da 0.4 ou a pessoa nao abriu desde entao. Para mudar a numeracao (ex.: passar para 1.0), grave `1.0` nesse
 arquivo: o proximo deploy sai `1.1`.
 
 **Apps de antes da atualizacao automatica.** O service worker novo, ao

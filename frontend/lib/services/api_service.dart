@@ -375,6 +375,33 @@ class ApiService {
     }
   }
 
+  static const String _reportedAppVersionKey = 'app_version_reported';
+
+  /// Informa ao servidor a versao do app e o aparelho (a Gestao mostra quem
+  /// ficou numa versao antiga). No maximo 1x por dia, ou quando a versao ou o
+  /// aparelho mudam: quase nenhuma gravacao a mais no Firestore.
+  Future<void> reportAppVersion(
+      {required String version, required String device}) async {
+    final prefs = await SharedPreferences.getInstance();
+    final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    final mark = '$version|$device|$today';
+    if (prefs.getString(_reportedAppVersionKey) == mark) return;
+    final response = await http
+        .post(
+          Uri.parse('$backendUrl/me/app-version'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'version': version, 'device': device}),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    await prefs.setString(_reportedAppVersionKey, mark);
+  }
+
   Future<bool> hasCachedSession() async {
     return await getCachedCurrentUser() != null;
   }
