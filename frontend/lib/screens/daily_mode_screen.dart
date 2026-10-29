@@ -199,6 +199,8 @@ class _DailyModeScreenState extends State<DailyModeScreen>
         _showSuccess('A diária de hoje já estava registrada.');
       } else {
         _showSuccess('Diária registrada!');
+        // Registrou: confere se ha versao nova (no maximo 1x a cada 5 min).
+        UpdateService.instance.checkForUpdate();
       }
     } catch (e) {
       if (mounted) _showError('Erro ao registrar a diária: $e');

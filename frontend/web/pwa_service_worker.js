@@ -134,9 +134,47 @@ self.addEventListener('activate', (event) => {
             .map((key) => caches.delete(key)),
         ),
       )
-      .then(() => self.clients.claim()),
+      .then(() => self.clients.claim())
+      .then(() => reloadOutdatedPages()),
   );
 });
+
+// Paginas abertas com o app de antes da atualizacao automatica nao sabem se
+// recarregar sozinhas (e no celular o app instalado fica dias aberto). Ao
+// ativar, perguntamos a cada pagina; a que responde (index.html desta
+// versao em diante) cuida da propria recarga no momento seguro. A que nao
+// responde em 2 s e recarregada aqui, uma unica vez, ja com a versao nova
+// guardada no cache.
+async function reloadOutdatedPages() {
+  const pages = await self.clients.matchAll({ type: 'window' });
+  await Promise.all(pages.map(async (page) => {
+    if (await answersPing(page)) return;
+    if (!('navigate' in page)) return;
+    // Sem await: a recarga passa por este service worker, que so atende
+    // depois de terminar de ativar. Esperar a recarga aqui dentro travava
+    // as duas coisas (uma esperando a outra).
+    page.navigate(page.url).catch(() => {
+      // Navegador sem suporte: a pagina pega a versao nova ao recarregar.
+    });
+  }));
+}
+
+function answersPing(page) {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => resolve(false), 2000);
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timer);
+      resolve(!!(event.data && event.data.type === 'VMAC_PONG'));
+    };
+    try {
+      page.postMessage({ type: 'VMAC_PING' }, [channel.port2]);
+    } catch (_) {
+      clearTimeout(timer);
+      resolve(false);
+    }
+  });
+}
 
 self.addEventListener('fetch', (event) => {
   const request = event.request;

@@ -3,3 +3,5 @@
 bool isAppUpdateReady() => false;
 
 bool applyAppUpdate({required bool force}) => false;
+
+void requestAppUpdateCheck() {}

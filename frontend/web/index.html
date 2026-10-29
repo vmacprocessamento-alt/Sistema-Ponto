@@ -143,24 +143,31 @@
         if (vmacHadController) window.vmacUpdateReady = true;
         vmacHadController = true;
       });
+      // O service worker novo pergunta, ao ativar, se esta pagina ja sabe se
+      // atualizar sozinha; a que nao responde (app de antes desta versao) e
+      // recarregada por ele. Esta responde e cuida da propria recarga.
+      navigator.serviceWorker.addEventListener('message', function (event) {
+        if (event.data && event.data.type === 'VMAC_PING' && event.ports && event.ports[0]) {
+          event.ports[0].postMessage({ type: 'VMAC_PONG' });
+        }
+      });
+      navigator.serviceWorker.startMessages();
+      // Confere so quando a pessoa usa o app: ao abrir (voltar para a tela),
+      // trocar de aba ou registrar ponto (lib/services/update_service.dart),
+      // e no maximo uma vez a cada 5 min. Cada conferencia e um pedido
+      // pequeno do pwa_service_worker.js; sem mudanca o servidor responde
+      // "nao mudou". Nada de conferir com o app parado.
       var vmacLastCheck = 0;
       window.vmacCheckForUpdate = function () {
+        if (Date.now() - vmacLastCheck < 5 * 60 * 1000) return Promise.resolve();
         vmacLastCheck = Date.now();
         return navigator.serviceWorker.getRegistration()
           .then(function (reg) { return reg && reg.update(); })
           .catch(function () {});
       };
-      // Ao voltar para o app (celular tirado do bolso) e a cada 10 min com a
-      // tela aberta. O navegador sozinho so confere quando a pagina recarrega,
-      // e no celular o app instalado fica dias sem recarregar.
       document.addEventListener('visibilitychange', function () {
-        if (document.visibilityState === 'visible' && Date.now() - vmacLastCheck > 60000) {
-          window.vmacCheckForUpdate();
-        }
-      });
-      setInterval(function () {
         if (document.visibilityState === 'visible') window.vmacCheckForUpdate();
-      }, 10 * 60 * 1000);
+      });
     }
 
     // Registra o service worker que guarda o app para uso offline

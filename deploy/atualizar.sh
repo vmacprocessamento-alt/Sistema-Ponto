@@ -40,10 +40,14 @@ git checkout -- frontend/pubspec.lock 2>/dev/null || true
 git checkout -- frontend/linux frontend/macos frontend/windows 2>/dev/null || true
 git pull --ff-only
 
+# Versao deste deploy: vai no app (Perfil e login mostram "Versao do app") e
+# no service worker (arquivo diferente = os celulares atualizam sozinhos).
+BUILD_ID="$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
+
 log "Build do Flutter ($FLUTTER_IMAGE) em $WEB_NEW (o site atual continua no ar)"
 rm -rf "$WEB_NEW"
 if ! docker run --rm -v "$DIR/frontend:/app" -w /app "$FLUTTER_IMAGE" \
-    sh -c "git config --global --add safe.directory '*'; flutter pub get && flutter build web --release --no-wasm-dry-run --output build/web-new"; then
+    sh -c "git config --global --add safe.directory '*'; flutter pub get && flutter build web --release --no-wasm-dry-run --dart-define=APP_BUILD=$BUILD_ID --output build/web-new"; then
   rm -rf "$WEB_NEW"
   echo "Build do site falhou; nada foi trocado, o site anterior segue no ar."
   exit 1
@@ -54,9 +58,8 @@ test -f "$WEB_NEW/index.html"
 # cada celular baixar a versao nova em segundo plano e o app recarregar
 # sozinho quando ninguem estiver usando a tela (atualizacao automatica,
 # docs/OFFLINE.md). Sem o carimbo os aparelhos so atualizam ao recarregar.
-BUILD_ID="$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
 printf '\n// build: %s\n' "$BUILD_ID" >> "$WEB_NEW/pwa_service_worker.js"
-log "Versao do site: $BUILD_ID"
+log "Versao do site: $BUILD_ID (aparece no Perfil de cada um como \"Versao do app\")"
 
 log "Reiniciando backend"
 if ! docker compose up -d --build backend; then

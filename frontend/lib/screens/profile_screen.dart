@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/api_service.dart';
+import '../services/app_version.dart';
 import '../services/theme_service.dart';
 import '../utils/cpf.dart';
 import '../widgets/export_dialog.dart';
@@ -256,6 +257,16 @@ class _ProfileScreenState extends State<ProfileScreen> {
               ),
 
               const SizedBox(height: 24),
+
+              // Versao do app neste aparelho: no suporte, mostra se ja
+              // atualizou (compare com a do ultimo deploy).
+              Center(
+                child: Text(
+                  'Versão do app: ${appVersionLabel()}',
+                  style: const TextStyle(color: Colors.grey, fontSize: 12),
+                ),
+              ),
+              const SizedBox(height: 12),
 
               // Sair
               SizedBox(

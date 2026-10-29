@@ -129,6 +129,18 @@ void main() {
     service.removeBusyCheck(check);
   });
 
+  test('conferir versao nova so repassa o pedido (o limite fica no index.html)',
+      () {
+    var checks = 0;
+    service.requestCheck = () => checks++;
+    service.checkForUpdate();
+    service.checkForUpdate();
+    expect(checks, 2);
+    // Falha na conferencia nunca atrapalha a acao da pessoa.
+    service.requestCheck = () => throw Exception('sem service worker');
+    service.checkForUpdate();
+  });
+
   testWidgets('toque na barra atualiza na hora', (tester) async {
     await tester.pumpWidget(app());
     service.showBanner.value = true;

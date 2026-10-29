@@ -8,9 +8,15 @@ import 'app_update.dart';
 
 /// Atualizacao automatica do app web, sem a equipe precisar fazer nada.
 ///
-/// A cada deploy o service worker novo baixa a versao nova em segundo plano
-/// e avisa a pagina (web/index.html marca `vmacUpdateReady`). Daqui o app
-/// recarrega sozinho no primeiro momento seguro:
+/// Quando conferir: so quando a pessoa usa o app (abre o app, troca de aba,
+/// registra um ponto ou diaria), no maximo uma vez a cada 5 min
+/// ([checkForUpdate]; o limite fica no web/index.html). Cada conferencia e
+/// um pedido pequeno do pwa_service_worker.js (sem mudanca, o servidor
+/// responde "nao mudou"); nao le o banco de dados.
+///
+/// Havendo versao nova, o service worker a baixa em segundo plano e avisa a
+/// pagina (web/index.html marca `vmacUpdateReady`). Daqui o app recarrega
+/// sozinho no primeiro momento seguro:
 ///  - ninguem tocou na tela nos ultimos [idleBeforeReload];
 ///  - nenhum dialogo, menu ou tela por cima da tela principal;
 ///  - nenhum campo de texto com o cursor (login, chat, motivo...);
@@ -53,6 +59,19 @@ class UpdateService with WidgetsBindingObserver {
   bool Function() updateReady = isAppUpdateReady;
   @visibleForTesting
   bool Function({required bool force}) apply = applyAppUpdate;
+  @visibleForTesting
+  void Function() requestCheck = requestAppUpdateCheck;
+
+  /// A pessoa mexeu no app (trocou de aba, registrou ponto ou diaria): bom
+  /// momento para conferir se ha versao nova. Pode chamar a vontade; o
+  /// index.html confere no maximo uma vez a cada 5 min.
+  void checkForUpdate() {
+    try {
+      requestCheck();
+    } catch (_) {
+      // Conferencia e so um extra: nunca atrapalha a acao da pessoa.
+    }
+  }
 
   /// Liga a vigilancia (so no web, chamado em main.dart).
   void start() {
@@ -87,6 +106,7 @@ class UpdateService with WidgetsBindingObserver {
     clock = DateTime.now;
     updateReady = isAppUpdateReady;
     apply = applyAppUpdate;
+    requestCheck = requestAppUpdateCheck;
     _lastInteraction = clock();
   }
 

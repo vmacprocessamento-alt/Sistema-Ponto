@@ -10,6 +10,7 @@ import 'admin_screen.dart';
 import 'profile_screen.dart';
 import '../services/api_service.dart';
 import '../services/notification_service.dart';
+import '../services/update_service.dart';
 import '../widgets/content_width.dart';
 import '../widgets/startup_loading.dart';
 
@@ -153,10 +154,14 @@ class _MainScreenState extends State<MainScreen> {
   ];
 
   /// Troca de aba pelo menu de baixo (celular) ou da lateral (computador).
-  void _selectTab(int index) => setState(() {
-        _selectedIndex = index;
-        _openedTabs.add(_tabIds[index]);
-      });
+  void _selectTab(int index) {
+    setState(() {
+      _selectedIndex = index;
+      _openedTabs.add(_tabIds[index]);
+    });
+    // Mexeu no app: confere se ha versao nova (no maximo 1x a cada 5 min).
+    UpdateService.instance.checkForUpdate();
+  }
 
   /// A partir desta largura (tablet deitado, computador) o menu vai para a
   /// lateral e a tela ganha espaco na vertical.

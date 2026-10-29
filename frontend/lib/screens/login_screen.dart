@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
+import '../services/app_version.dart';
 import '../utils/cpf.dart';
 import 'main_screen.dart';
 
@@ -289,6 +290,14 @@ class _LoginScreenState extends State<LoginScreen> {
                     onPressed: _toggleEmail,
                     child: Text(_useEmail ? 'Entrar com CPF' : 'Entrar com e-mail',
                         style: const TextStyle(fontSize: 12)),
+                  ),
+                  const SizedBox(height: 8),
+                  // No suporte, mostra se o aparelho ja atualizou mesmo
+                  // sem conseguir entrar.
+                  Text(
+                    'Versão do app: ${appVersionLabel()}',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.grey, fontSize: 11),
                   ),
                 ],
               ),

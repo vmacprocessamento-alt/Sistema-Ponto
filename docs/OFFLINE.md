@@ -39,9 +39,11 @@ nem dar F5:
 
 1. O `deploy/atualizar.sh` carimba a versao na ultima linha do
    `pwa_service_worker.js` (`// build: <commit>-<data>`).
-2. O app confere se o service worker mudou ao voltar para a tela (celular
-   tirado do bolso) e a cada 10 min com a tela aberta (`index.html`,
-   `vmacCheckForUpdate`).
+2. O app confere se o service worker mudou so quando a pessoa usa o app: ao
+   abrir (voltar para a tela), trocar de aba e registrar ponto ou diaria. No
+   maximo uma vez a cada 5 min (`index.html`, `vmacCheckForUpdate`). Cada
+   conferencia e um pedido pequeno do `pwa_service_worker.js`; sem mudanca o
+   servidor responde "nao mudou" (304). Nao le o banco de dados.
 3. Mudou: o service worker novo baixa a versao nova inteira em segundo plano
    (`index.html`, `main.dart.js`, canvaskit, fontes). Se algum arquivo
    essencial nao vier, a instalacao falha e tenta de novo depois; a versao
@@ -55,6 +57,18 @@ nem dar F5:
    a barra **"Nova versão do app disponível. ATUALIZAR"**.
 
 Trava contra loop: no automatico, no maximo uma recarga a cada 2 min.
+
+**Versao do app.** O Perfil e a tela de login mostram "Versão do app:
+29/10/2026 14:32 (b27c4cb)": data e hora do deploy e o commit
+(`--dart-define=APP_BUILD`, o mesmo carimbo do service worker). No suporte,
+compare com a linha "Versao do site" que o `atualizar.sh` imprime. Sem essa
+linha no Perfil, o celular esta com um app de antes de 29/10/2026.
+
+**Apps de antes da atualizacao automatica.** O service worker novo, ao
+ativar, pergunta a cada pagina aberta se ela sabe se atualizar sozinha. A
+que nao responde em 2 s (app antigo) e recarregada por ele, uma unica vez,
+ja na versao nova. O navegador busca o service worker novo quando o app
+antigo recarrega ou, com ele aberto, ate 24 h depois da ultima conferencia.
 
 O nginx manda `Cache-Control: no-cache` para js/wasm/json: o navegador pode
 guardar, mas revalida com ETag. Arquivo que nao mudou custa um 304. Para forcar

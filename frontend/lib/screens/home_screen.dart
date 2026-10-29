@@ -1020,6 +1020,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       } else {
         _showSuccess('Registro de ${_getRecordLabel(type)} salvo com sucesso!');
         unawaited(_trySyncOfflineRecords());
+        // Registrou ponto: confere se ha versao nova (no maximo 1x a cada
+        // 5 min). Ela baixa por tras e entra quando a pessoa parar de mexer.
+        UpdateService.instance.checkForUpdate();
       }
     } catch (e) {
       _showError('Erro ao registrar: $e');
