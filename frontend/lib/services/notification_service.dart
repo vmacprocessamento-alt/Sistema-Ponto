@@ -31,10 +31,16 @@ class NotificationService {
     Future<void> saveToken(String? token) async {
       final user = FirebaseAuth.instance.currentUser;
       if (user == null || token == null || token.isEmpty) return;
-      await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+      // update (e nao set com merge): o cache do Firestore e so de memoria e,
+      // ao reabrir o app, o perfil ainda nao foi lido. O set com merge criava
+      // no aparelho um users/{uid} so com estes dois campos; com o Firestore
+      // demorando a conectar (iPhone ao reabrir), a leitura do perfil devolvia
+      // essa copia: "Carregando..." no nome e a aba Gestao sumia (29/10/2026).
+      // O cadastro sempre existe (sem ele o login nao entra).
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).update({
         'fcm_tokens': FieldValue.arrayUnion([token]),
         'fcm_token_updated_at': DateTime.now().toIso8601String(),
-      }, SetOptions(merge: true));
+      });
     }
 
     try {

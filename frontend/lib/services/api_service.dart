@@ -321,7 +321,18 @@ class ApiService {
     }
   }
 
+  /// Perfil de verdade: tem ao menos nome, e-mail, cargo ou CPF. Um mapa so
+  /// com id e campos tecnicos (como o fcm_tokens) nao serve para a tela nem
+  /// para a copia do aparelho.
+  static bool isCompleteProfile(Map<String, dynamic>? user) {
+    if (user == null) return false;
+    return const ['name', 'email', 'role', 'cpf']
+        .any((key) => (user[key] ?? '').toString().trim().isNotEmpty);
+  }
+
   Future<void> _cacheCurrentUser(Map<String, dynamic> user) async {
+    // Nunca troca a copia boa por uma incompleta.
+    if (!isCompleteProfile(user)) return;
     final prefs = await SharedPreferences.getInstance();
     final cachedUser = <String, dynamic>{
       for (final key in const [
@@ -353,7 +364,10 @@ class ApiService {
     if (rawUser == null || rawUser.isEmpty) return null;
 
     try {
-      return Map<String, dynamic>.from(jsonDecode(rawUser) as Map);
+      final user = Map<String, dynamic>.from(jsonDecode(rawUser) as Map);
+      // Copia gravada pelo bug de 29/10/2026 (so o id): vale como sem copia,
+      // e a proxima leitura do servidor grava a certa.
+      return isCompleteProfile(user) ? user : null;
     } catch (e) {
       debugPrint('Erro ao ler perfil offline: $e');
       await prefs.remove(_cachedUserKey);
@@ -767,9 +781,19 @@ class ApiService {
   Future<Map<String, dynamic>> _getCurrentUserOnline() async {
     User? user = _auth.currentUser;
     if (user == null) throw Exception('Nenhum usuário logado');
-    DocumentSnapshot doc = await _db.collection('users').doc(user.uid).get();
+    // So do servidor: sem conexao o Firestore devolveria a copia da memoria,
+    // que pode ter so os campos de uma gravacao ainda pendente (ex.: o token
+    // de notificacao). Sem servidor, getCurrentUser usa a copia do aparelho.
+    DocumentSnapshot doc = await _db
+        .collection('users')
+        .doc(user.uid)
+        .get(const GetOptions(source: Source.server));
     if (doc.exists) {
-      return {'id': user.uid, ...doc.data() as Map<String, dynamic>};
+      final profile = {'id': user.uid, ...doc.data() as Map<String, dynamic>};
+      if (!isCompleteProfile(profile)) {
+        throw Exception('Perfil do usuário incompleto');
+      }
+      return profile;
     }
     throw Exception('Perfil do usuário não encontrado');
   }
