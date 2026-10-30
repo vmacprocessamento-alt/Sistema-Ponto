@@ -4688,30 +4688,45 @@ def delete_time_record_admin_endpoint(
     })
     return {"status": "deleted", "id": record_id}
 
-@app.post("/admin/time-records/day")
-def admin_set_day_time_records_endpoint(
-    payload: AdminSetDayRequest,
-    admin=Depends(require_admin_user),
-):
-    """Corrige o dia inteiro de uma pessoa de uma vez (para quem bateu errado
-    ou esqueceu): apaga as batidas que existirem naquele dia e grava as
-    informadas, como o lote do gestor (created_by_admin + batch_real_dates:
-    valem pela hora, igual a batida do app). A copia de cada batida apagada
-    fica em time_record_audits (com o motivo e quem corrigiu), entao da para
-    desfazer. So admin, sempre com motivo; dia futuro nao."""
-    if admin.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Apenas admin pode corrigir o dia.")
-    reason = _require_reason(payload.reason)
-    day = _parse_day_param(payload.date, "date")
+def _resolve_user_ref(db, user_id: Optional[str], nome: Optional[str]):
+    """Acha a pessoa pelo id (se vier) ou pelo nome (o que contem o texto, sem
+    diferenciar maiusculas). Erra 404 se nada bate e 409 se o nome bate em mais
+    de um (peca o nome completo). Deixa o servidor resolver o nome, para quem
+    chama (o VDRod) nao precisar da lista de usuarios nem da chave do app."""
+    uid = (user_id or "").strip()
+    if uid:
+        snap = db.collection("users").document(uid).get()
+        if not snap.exists:
+            raise HTTPException(status_code=404, detail="Usuario nao encontrado.")
+        return snap
+    alvo = (nome or "").strip().lower()
+    if not alvo:
+        raise HTTPException(status_code=400, detail="Informe user_id ou nome.")
+    achados = [d for d in db.collection("users").stream()
+               if alvo in str((d.to_dict() or {}).get("name", "")).lower()]
+    if not achados:
+        raise HTTPException(status_code=404, detail=f"Ninguem com nome contendo {nome!r}.")
+    if len(achados) > 1:
+        nomes = ", ".join(sorted(str((d.to_dict() or {}).get("name", "")) for d in achados))
+        raise HTTPException(status_code=409, detail=f"Mais de um bate com {nome!r}: {nomes}. Use o nome completo.")
+    return achados[0]
+
+
+def _set_day_core(db, actor: dict, target, date_str: str, reason_raw: str, punches: list) -> dict:
+    """Miolo da correcao do dia (compartilhado pelo endpoint do gestor e pelo
+    interno do VDRod): apaga as batidas do dia (copia na auditoria) e grava as
+    informadas como lote do gestor. `actor` = {id, name, email} de quem corrige."""
+    reason = _require_reason(reason_raw)
+    day = _parse_day_param(date_str, "date")
     if day > _local_now().date():
         raise HTTPException(status_code=400, detail="Nao da para corrigir dia futuro.")
-    if not payload.punches:
+    if not punches:
         raise HTTPException(status_code=400, detail="Informe ao menos uma batida (ou use apagar).")
 
     # Valida e normaliza as batidas: tipo conhecido, hora do proprio dia, mesma
     # hora local ingenua dos outros pontos; ordena em ordem crescente.
     parsed: List[tuple] = []
-    for punch in payload.punches:
+    for punch in punches:
         record_type = (punch.record_type or "").strip()
         if record_type not in _PUNCH_TYPES:
             raise HTTPException(status_code=400, detail=f"Tipo de batida invalido: {punch.record_type!r}.")
@@ -4721,11 +4736,10 @@ def admin_set_day_time_records_endpoint(
         parsed.append((record_type, _local_iso(moment)))
     parsed.sort(key=lambda item: item[1])
 
-    db = get_firestore_admin()
-    target = db.collection("users").document(payload.user_id.strip()).get()
-    if not target.exists:
-        raise HTTPException(status_code=404, detail="Usuario nao encontrado.")
     user_name = (target.to_dict() or {}).get("name", "")
+    actor_id = actor.get("id", "")
+    actor_name = actor.get("name") or actor.get("email") or "Admin"
+    actor_email = actor.get("email", "")
 
     # Batidas do dia: consulta por usuario e recorta o dia (timestamp e hora
     # local ingenua). Uma inequacao so, coberta pelo indice user_id+timestamp.
@@ -4739,7 +4753,6 @@ def admin_set_day_time_records_endpoint(
         snapshots = list(collection.stream())
     existing = [doc for doc in snapshots if day_start <= str((doc.to_dict() or {}).get("timestamp") or "") <= day_end]
 
-    admin_name = admin.get("name") or admin.get("email") or "Admin"
     batch = db.batch()
     removed = []
     for doc in existing:
@@ -4754,9 +4767,9 @@ def admin_set_day_time_records_endpoint(
             "deleted_record": record,
             "reason": reason,
             "replaced_by_set_day": True,
-            "admin_id": admin["id"],
-            "admin_name": admin.get("name", ""),
-            "admin_email": admin.get("email", ""),
+            "admin_id": actor_id,
+            "admin_name": actor_name,
+            "admin_email": actor_email,
             "deleted_at": firestore.SERVER_TIMESTAMP,
             "created_at": firestore.SERVER_TIMESTAMP,
         })
@@ -4774,8 +4787,8 @@ def admin_set_day_time_records_endpoint(
             "created_by_admin": True,
             "batch_real_dates": True,
             "admin_reason": reason,
-            "set_day_by_id": admin["id"],
-            "set_day_by_name": admin_name,
+            "set_day_by_id": actor_id,
+            "set_day_by_name": actor_name,
             "created_at": firestore.SERVER_TIMESTAMP,
         })
         created.append({"id": ref.id, "record_type": record_type, "timestamp": timestamp})
@@ -4788,9 +4801,9 @@ def admin_set_day_time_records_endpoint(
         "removed_count": len(removed),
         "created": created,
         "reason": reason,
-        "admin_id": admin["id"],
-        "admin_name": admin.get("name", ""),
-        "admin_email": admin.get("email", ""),
+        "admin_id": actor_id,
+        "admin_name": actor_name,
+        "admin_email": actor_email,
         "created_at": firestore.SERVER_TIMESTAMP,
     })
     batch.commit()
@@ -4802,6 +4815,66 @@ def admin_set_day_time_records_endpoint(
         "removed": len(removed),
         "created": created,
     }
+
+
+@app.post("/admin/time-records/day")
+def admin_set_day_time_records_endpoint(
+    payload: AdminSetDayRequest,
+    admin=Depends(require_admin_user),
+):
+    """Corrige o dia inteiro de uma pessoa de uma vez (para quem bateu errado
+    ou esqueceu): apaga as batidas que existirem naquele dia e grava as
+    informadas, como o lote do gestor (created_by_admin + batch_real_dates:
+    valem pela hora, igual a batida do app). A copia de cada batida apagada
+    fica em time_record_audits (com o motivo e quem corrigiu), entao da para
+    desfazer. So admin, sempre com motivo; dia futuro nao."""
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode corrigir o dia.")
+    db = get_firestore_admin()
+    target = _resolve_user_ref(db, payload.user_id, None)
+    return _set_day_core(
+        db,
+        {"id": admin["id"], "name": admin.get("name", ""), "email": admin.get("email", "")},
+        target, payload.date, payload.reason, payload.punches,
+    )
+
+
+# Integracao interna (VDRod): a estacao nao tem a chave do app nem token de
+# pessoa, entao chama por HTTPS com um segredo de servico (INTERNAL_API_SECRET,
+# so no backend/.env). Sem o segredo configurado, a rota fica desligada.
+INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET", "").strip()
+
+
+def _require_internal_secret(request: Request) -> None:
+    if not INTERNAL_API_SECRET:
+        raise HTTPException(status_code=503, detail="Integracao interna desligada (defina INTERNAL_API_SECRET no backend).")
+    enviado = (request.headers.get("x-internal-secret") or "").strip()
+    if not hmac.compare_digest(enviado, INTERNAL_API_SECRET):
+        raise HTTPException(status_code=401, detail="Segredo interno invalido.")
+
+
+class InternalSetDayRequest(BaseModel):
+    # O VDRod manda o nome (o servidor resolve o id) ou o proprio user_id.
+    user_id: Optional[str] = None
+    nome: Optional[str] = None
+    date: str
+    reason: str
+    punches: List[AdminSetDayPunch]
+
+
+@app.post("/internal/time-records/day")
+def internal_set_day_time_records_endpoint(payload: InternalSetDayRequest, request: Request):
+    """Mesma correcao do dia, mas chamada pelo VDRod (segredo de servico, nao
+    token de pessoa; resolve a pessoa pelo nome). Atribui a "Assistente VDRod"."""
+    _require_internal_secret(request)
+    db = get_firestore_admin()
+    target = _resolve_user_ref(db, payload.user_id, payload.nome)
+    return _set_day_core(
+        db,
+        {"id": "vdrod-assistente", "name": "Assistente VDRod", "email": ""},
+        target, payload.date, payload.reason, payload.punches,
+    )
+
 
 @app.delete("/admin/users/{user_id}")
 def delete_user_admin_endpoint(
