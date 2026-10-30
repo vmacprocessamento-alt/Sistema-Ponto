@@ -674,6 +674,21 @@ class AdminTimeRecordUpdateRequest(BaseModel):
 class AdminTimeRecordDeleteRequest(BaseModel):
     reason: str
 
+class AdminSetDayPunch(BaseModel):
+    # Uma batida do dia: tipo (check_in/check_out/break_start/break_end/
+    # entry_3/exit_3) e a hora local "HH:MM".
+    record_type: str
+    time: str
+
+class AdminSetDayRequest(BaseModel):
+    # Corrige o dia inteiro de uma pessoa de uma vez: apaga as batidas que
+    # existirem naquele dia (copia vai para time_record_audits, da para
+    # desfazer) e grava as informadas, como o lote do gestor. Sempre com motivo.
+    user_id: str
+    date: str
+    reason: str
+    punches: List[AdminSetDayPunch]
+
 def init_firebase_admin():
     if firebase_admin is None:
         raise HTTPException(
@@ -4672,6 +4687,121 @@ def delete_time_record_admin_endpoint(
         "created_at": firestore.SERVER_TIMESTAMP,
     })
     return {"status": "deleted", "id": record_id}
+
+@app.post("/admin/time-records/day")
+def admin_set_day_time_records_endpoint(
+    payload: AdminSetDayRequest,
+    admin=Depends(require_admin_user),
+):
+    """Corrige o dia inteiro de uma pessoa de uma vez (para quem bateu errado
+    ou esqueceu): apaga as batidas que existirem naquele dia e grava as
+    informadas, como o lote do gestor (created_by_admin + batch_real_dates:
+    valem pela hora, igual a batida do app). A copia de cada batida apagada
+    fica em time_record_audits (com o motivo e quem corrigiu), entao da para
+    desfazer. So admin, sempre com motivo; dia futuro nao."""
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode corrigir o dia.")
+    reason = _require_reason(payload.reason)
+    day = _parse_day_param(payload.date, "date")
+    if day > _local_now().date():
+        raise HTTPException(status_code=400, detail="Nao da para corrigir dia futuro.")
+    if not payload.punches:
+        raise HTTPException(status_code=400, detail="Informe ao menos uma batida (ou use apagar).")
+
+    # Valida e normaliza as batidas: tipo conhecido, hora do proprio dia, mesma
+    # hora local ingenua dos outros pontos; ordena em ordem crescente.
+    parsed: List[tuple] = []
+    for punch in payload.punches:
+        record_type = (punch.record_type or "").strip()
+        if record_type not in _PUNCH_TYPES:
+            raise HTTPException(status_code=400, detail=f"Tipo de batida invalido: {punch.record_type!r}.")
+        moment = _parse_schedule_datetime(f"{day.isoformat()}T{(punch.time or '').strip()}", _LOCAL_TZ)
+        if moment.date() != day:
+            raise HTTPException(status_code=400, detail="A hora da batida precisa ser do dia informado.")
+        parsed.append((record_type, _local_iso(moment)))
+    parsed.sort(key=lambda item: item[1])
+
+    db = get_firestore_admin()
+    target = db.collection("users").document(payload.user_id.strip()).get()
+    if not target.exists:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado.")
+    user_name = (target.to_dict() or {}).get("name", "")
+
+    # Batidas do dia: consulta por usuario e recorta o dia (timestamp e hora
+    # local ingenua). Uma inequacao so, coberta pelo indice user_id+timestamp.
+    day_start = day.isoformat() + "T00:00:00"
+    day_end = day.isoformat() + "T23:59:59.999999"
+    collection = db.collection("time_records").where("user_id", "==", target.id)
+    try:
+        snapshots = list(collection.where("timestamp", ">=", day_start).stream())
+    except Exception as exc:  # indice ausente: le tudo do usuario e filtra
+        print(f"[set-day] consulta por data indisponivel, lendo tudo: {exc}")
+        snapshots = list(collection.stream())
+    existing = [doc for doc in snapshots if day_start <= str((doc.to_dict() or {}).get("timestamp") or "") <= day_end]
+
+    admin_name = admin.get("name") or admin.get("email") or "Admin"
+    batch = db.batch()
+    removed = []
+    for doc in existing:
+        record = serialize_firestore_document(doc)
+        removed.append(record)
+        batch.set(db.collection("time_record_audits").document(), {
+            "action": "delete",
+            "record_id": doc.id,
+            "record_user_id": record.get("user_id"),
+            "record_type": record.get("record_type"),
+            "old_timestamp": record.get("timestamp"),
+            "deleted_record": record,
+            "reason": reason,
+            "replaced_by_set_day": True,
+            "admin_id": admin["id"],
+            "admin_name": admin.get("name", ""),
+            "admin_email": admin.get("email", ""),
+            "deleted_at": firestore.SERVER_TIMESTAMP,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+        batch.delete(doc.reference)
+
+    created = []
+    for record_type, timestamp in parsed:
+        ref = db.collection("time_records").document()
+        batch.set(ref, {
+            "user_id": target.id,
+            "record_type": record_type,
+            "timestamp": timestamp,
+            "location": "Gestor (correcao do dia)",
+            "notes": "",
+            "created_by_admin": True,
+            "batch_real_dates": True,
+            "admin_reason": reason,
+            "set_day_by_id": admin["id"],
+            "set_day_by_name": admin_name,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+        created.append({"id": ref.id, "record_type": record_type, "timestamp": timestamp})
+
+    batch.set(db.collection("time_record_audits").document(), {
+        "action": "set_day",
+        "record_user_id": target.id,
+        "user_name": user_name,
+        "date": day.isoformat(),
+        "removed_count": len(removed),
+        "created": created,
+        "reason": reason,
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "admin_email": admin.get("email", ""),
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    batch.commit()
+    return {
+        "status": "ok",
+        "user_id": target.id,
+        "user_name": user_name,
+        "date": day.isoformat(),
+        "removed": len(removed),
+        "created": created,
+    }
 
 @app.delete("/admin/users/{user_id}")
 def delete_user_admin_endpoint(
