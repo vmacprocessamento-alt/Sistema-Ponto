@@ -14,7 +14,7 @@ import hmac
 import secrets
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, time, date
+from datetime import datetime, timedelta, time, date, timezone as dt_timezone
 from calendar import monthrange
 from typing import Optional, List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -651,6 +651,10 @@ class SchedulePunchRequest(BaseModel):
     client_record_id: Optional[str] = None
     # Batida feita sem internet e sincronizada depois (hora do aparelho).
     offline: bool = False
+    # Fuso do celular (03/11/2026): minutos a leste de UTC (UTC-4 = -240) e o
+    # nome (America/Cuiaba). Sem eles (app antigo): Brasilia.
+    utc_offset_minutes: Optional[int] = None
+    time_zone: Optional[str] = None
 
 class ScheduleApprovalCreateRequest(BaseModel):
     request_type: str
@@ -660,6 +664,10 @@ class ScheduleApprovalCreateRequest(BaseModel):
     notes: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Fuso do celular (03/11/2026): minutos a leste de UTC (UTC-4 = -240) e o
+    # nome (America/Cuiaba). Sem eles (app antigo): Brasilia.
+    utc_offset_minutes: Optional[int] = None
+    time_zone: Optional[str] = None
 
 class ScheduleApprovalDecisionRequest(BaseModel):
     reason: Optional[str] = None
@@ -774,16 +782,64 @@ def _resolve_effective_work_schedule(db, user_data: dict) -> dict:
     return _validate_work_schedule(settings)
 
 def _parse_schedule_datetime(value: Optional[str], timezone_name: str) -> datetime:
+    return _parse_in_zone(value, ZoneInfo(timezone_name))
+
+def _parse_in_zone(value: Optional[str], zone) -> datetime:
+    """Data/hora do app no fuso [zone]: sem offset no texto (o app manda a hora
+    de parede do celular), vale [zone]; com offset, converte para [zone]."""
     if not value:
-        return datetime.now(ZoneInfo(timezone_name))
+        return datetime.now(zone)
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Data/hora invalida.") from exc
-    timezone = ZoneInfo(timezone_name)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone)
-    return parsed.astimezone(timezone)
+        return parsed.replace(tzinfo=zone)
+    return parsed.astimezone(zone)
+
+# FUSO DO CELULAR (03/11/2026). O app manda a hora de parede do celular sem
+# offset; o servidor a lia como de Brasilia. Em Mato Grosso (UTC-4) a batida das
+# 07:30 chegava como 07:30 de Brasilia, uma hora antes do relogio do servidor,
+# e era recusada ("muito distante do relogio do servidor"). Agora o app manda
+# tambem o fuso (utc_offset_minutes, minutos a leste de UTC como o Dart: UTC-4 =
+# -240, e o nome, America/Cuiaba). O ponto de quem nao e estagiario grava a hora
+# local de onde foi batido (07:30 em MT), com o fuso no proprio registro; o do
+# estagiario segue o fuso do horario dele. Sem o campo (app antigo): Brasilia.
+# So fusos do Brasil: de UTC-5 (Acre) a UTC-2 (Fernando de Noronha).
+_BRAZIL_UTC_OFFSETS = range(-300, -119)
+_TIME_ZONE_NAME_RE = re.compile(r"[A-Za-z0-9_+\-/]{1,64}")
+
+def _device_zone(offset_minutes: Optional[int]):
+    """Fuso do celular na batida; sem o campo (app antigo), Brasilia."""
+    if offset_minutes is None:
+        return ZoneInfo(_LOCAL_TZ)
+    if offset_minutes not in _BRAZIL_UTC_OFFSETS:
+        raise HTTPException(
+            status_code=400,
+            detail="O fuso horario do celular esta fora do Brasil. Ajuste o fuso do celular e tente de novo.",
+        )
+    return dt_timezone(timedelta(minutes=offset_minutes))
+
+def _zone_fields(moment: datetime, zone_name: Optional[str]) -> dict:
+    """Fuso da hora gravada em `timestamp` (a hora de parede de [moment])."""
+    offset = moment.utcoffset() or timedelta(0)
+    fields = {"utc_offset_minutes": int(offset.total_seconds() // 60)}
+    if zone_name and _TIME_ZONE_NAME_RE.fullmatch(zone_name):
+        fields["time_zone"] = zone_name
+    return fields
+
+def _record_wall_now(record: dict, default: datetime) -> datetime:
+    """Agora na hora de parede do fuso gravado no ponto (para medir uma pausa
+    aberta no fuso em que foi batida); ponto sem fuso: [default]."""
+    offset = record.get("utc_offset_minutes")
+    if isinstance(offset, bool) or not isinstance(offset, (int, float)):
+        return default
+    if int(offset) not in _BRAZIL_UTC_OFFSETS:
+        return default
+    return datetime.now(dt_timezone(timedelta(minutes=int(offset)))).replace(tzinfo=None)
+
+def _copy_zone_fields(record: dict) -> dict:
+    return {key: record[key] for key in ("utc_offset_minutes", "time_zone") if key in record}
 
 def _local_iso(dt: datetime) -> str:
     """Hora de parede local, sem offset, para gravar em time_records.
@@ -1714,7 +1770,9 @@ def _run_auto_close_breaks(window: timedelta = _AUTO_CLOSE_WINDOW) -> bool:
         start = _to_local_naive(last.get("timestamp"))
         if start is None:
             continue
-        age = now - start
+        # Pausa batida em outro fuso (MT, uma hora antes de Brasilia): a idade
+        # se mede no fuso dela, senao fechava com 2h em vez de 3h.
+        age = _record_wall_now(last, now) - start
         if age < _AUTO_CLOSE_AFTER or age > _AUTO_CLOSE_MAX_AGE:
             continue
 
@@ -1730,6 +1788,7 @@ def _run_auto_close_breaks(window: timedelta = _AUTO_CLOSE_WINDOW) -> bool:
                 "location": "Sistema (Auto)",
                 "notes": "Retorno automatico (pausa excedeu 3h; ajustado para 1h) [servidor]",
                 "auto_closed": True,
+                **_copy_zone_fields(last),
                 "created_at": firestore.SERVER_TIMESTAMP,
             })
             _create_user_notification(
@@ -3196,7 +3255,13 @@ def schedule_controlled_punch_endpoint(
 
     schedule = _resolve_effective_work_schedule(db, user)
     timezone_name = schedule["timezone"]
-    attempted = _parse_schedule_datetime(payload.timestamp, timezone_name)
+    # A hora vem no fuso do celular (em MT, uma hora antes de Brasilia) e e
+    # gravada no fuso do horario do estagiario, o das regras de entrada e saida.
+    device_zone = (
+        ZoneInfo(timezone_name) if payload.utc_offset_minutes is None
+        else _device_zone(payload.utc_offset_minutes)
+    )
+    attempted = _parse_in_zone(payload.timestamp, device_zone).astimezone(ZoneInfo(timezone_name))
     punched_at = attempted
     server_now = datetime.now(ZoneInfo(timezone_name))
     if payload.close_at_scheduled_end:
@@ -3295,6 +3360,8 @@ def schedule_controlled_punch_endpoint(
         "schedule_snapshot": schedule if _is_intern_profile(user) else None,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
+    if payload.utc_offset_minutes is not None:
+        record.update(_zone_fields(attempted, timezone_name))
     if payload.offline:
         record["synced_from_offline"] = True
         record["offline_delay_minutes"] = max(
@@ -3322,6 +3389,10 @@ class TimeRecordPunchRequest(BaseModel):
     # nao do aparelho. ref_record_id: a entrada (ou a pausa) que a batida fecha.
     kind: Optional[str] = None
     ref_record_id: Optional[str] = None
+    # Fuso do celular (03/11/2026): minutos a leste de UTC (UTC-4 = -240) e o
+    # nome (America/Cuiaba). Sem eles (app antigo): Brasilia.
+    utc_offset_minutes: Optional[int] = None
+    time_zone: Optional[str] = None
 
 _PUNCH_TYPES = {"check_in", "check_out", "break_start", "break_end", "entry_3", "exit_3"}
 _BREAK_CLOSE_TYPE = {"break_start": "break_end", "entry_3": "exit_3"}
@@ -3378,8 +3449,19 @@ def time_record_punch_endpoint(
     if already:
         return already
 
+    # Fuso da hora gravada: quem nao e estagiario grava a hora local de onde
+    # bateu (a do celular; 07:30 em MT, nao 08:30 de Brasilia). O estagiario
+    # segue o fuso do horario dele, o mesmo da entrada e da saida.
+    device_zone = _device_zone(payload.utc_offset_minutes)
+    if _is_intern_profile(user):
+        zone_name = _resolve_effective_work_schedule(db, user)["timezone"]
+        store_zone = ZoneInfo(zone_name)
+    else:
+        zone_name = payload.time_zone
+        store_zone = device_zone
+
     records = _user_records_sorted(db, user_id)
-    server_now = datetime.now(ZoneInfo(_LOCAL_TZ))
+    server_now = datetime.now(store_zone)
 
     if payload.kind == "auto_break_close":
         break_id = (payload.ref_record_id or "").strip()
@@ -3389,7 +3471,9 @@ def time_record_punch_endpoint(
         if last.get("record_type") not in _BREAK_CLOSE_TYPE:
             raise HTTPException(status_code=409, detail="A pausa ja foi encerrada.")
         started = _to_local_naive(str(last.get("timestamp")))
-        if started is None or server_now.replace(tzinfo=None) - started < _AUTO_CLOSE_AFTER:
+        # A pausa se mede no fuso em que foi batida.
+        wall_now = _record_wall_now(last, server_now.replace(tzinfo=None))
+        if started is None or wall_now - started < _AUTO_CLOSE_AFTER:
             raise HTTPException(status_code=409, detail="A pausa ainda nao passou de 3 horas.")
         doc_id = f"autoclose_{break_id}"
         # Mesmo id do job do backend que fecha pausas: os dois gravam o mesmo ponto.
@@ -3400,6 +3484,7 @@ def time_record_punch_endpoint(
             "location": "Sistema (Auto)",
             "notes": "Retorno automatico (pausa excedeu 3h; ajustado para 1h)",
             "auto_closed": True,
+            **_copy_zone_fields(last),
             "created_at": firestore.SERVER_TIMESTAMP,
         })
 
@@ -3418,7 +3503,7 @@ def time_record_punch_endpoint(
         doc_id, record = _forgotten_exit(user_id, open_shift, payload.location, payload.notes)
         return existing_or_none(doc_id) or _save_punch(db, doc_id, record)
 
-    attempted = _parse_schedule_datetime(payload.timestamp, _LOCAL_TZ)
+    attempted = _parse_in_zone(payload.timestamp, device_zone).astimezone(store_zone)
     punched_at = attempted
     if payload.offline:
         # Sem internet vale a hora do aparelho no momento da batida, como no
@@ -3461,6 +3546,8 @@ def time_record_punch_endpoint(
         "longitude": payload.longitude,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
+    if payload.utc_offset_minutes is not None:
+        record.update(_zone_fields(attempted, zone_name))
     if payload.offline:
         record["synced_from_offline"] = True
         record["offline_delay_minutes"] = max(0, int((server_now - punched_at).total_seconds() // 60))
@@ -3496,7 +3583,11 @@ def create_schedule_approval_request_endpoint(
     db = get_firestore_admin()
     schedule = _resolve_effective_work_schedule(db, user)
     timezone_name = schedule["timezone"]
-    attempted = _parse_schedule_datetime(payload.attempted_at, timezone_name)
+    device_zone = (
+        ZoneInfo(timezone_name) if payload.utc_offset_minutes is None
+        else _device_zone(payload.utc_offset_minutes)
+    )
+    attempted = _parse_in_zone(payload.attempted_at, device_zone).astimezone(ZoneInfo(timezone_name))
     server_now = datetime.now(ZoneInfo(timezone_name))
     if abs((server_now - attempted).total_seconds()) > 15 * 60:
         raise HTTPException(
@@ -3819,6 +3910,10 @@ class DailyEntryRequest(BaseModel):
     # no momento do toque (timestamp), na mesma janela da batida offline.
     timestamp: Optional[str] = None
     offline: bool = False
+    # Fuso do celular (03/11/2026): minutos a leste de UTC (UTC-4 = -240) e o
+    # nome (America/Cuiaba). Sem eles (app antigo): Brasilia.
+    utc_offset_minutes: Optional[int] = None
+    time_zone: Optional[str] = None
 
 # Periodo maximo de uma consulta de diarias (um ano e folga).
 _DAILY_ENTRIES_MAX_RANGE = timedelta(days=400)
@@ -3826,14 +3921,15 @@ _DAILY_ENTRIES_MAX_RANGE = timedelta(days=400)
 def _daily_entry_id(user_id: str, day: date) -> str:
     return f"{user_id}_{day.isoformat()}"
 
-def _daily_entry_moment(payload: DailyEntryRequest, now: datetime) -> datetime:
+def _daily_entry_moment(payload: DailyEntryRequest, now: datetime, zone=None) -> datetime:
     """Hora local da diaria: agora, pelo relogio do servidor; a marcada
-    offline vale a hora do toque, de ate 7 dias atras e nao do futuro."""
+    offline vale a hora do toque, de ate 7 dias atras e nao do futuro. [now]
+    e a hora de parede do fuso [zone] (o do celular; sem ele, Brasilia)."""
     if not payload.offline:
         return now
-    attempted = _to_local_naive(payload.timestamp)
-    if attempted is None:
+    if not payload.timestamp:
         raise HTTPException(status_code=400, detail="Informe a hora da diaria offline.")
+    attempted = _parse_in_zone(payload.timestamp, zone or ZoneInfo(_LOCAL_TZ)).replace(tzinfo=None)
     delay = now - attempted
     if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
         raise HTTPException(status_code=400, detail="A diaria offline esta fora do periodo aceito.")
@@ -3867,8 +3963,11 @@ def create_daily_entry_endpoint(
 ):
     if user.get("daily_mode") is not True:
         raise HTTPException(status_code=403, detail="Seu cadastro nao esta no modo diaria.")
-    now = _local_now()
-    moment = _daily_entry_moment(payload, now)
+    # O dia da diaria e o do lugar onde a pessoa esta: em MT, 23:30 de segunda
+    # ja e terca em Brasilia, e a diaria caia no dia seguinte.
+    zone = _device_zone(payload.utc_offset_minutes)
+    now = datetime.now(zone).replace(tzinfo=None)
+    moment = _daily_entry_moment(payload, now, zone)
     day = moment.date()
 
     db = get_firestore_admin()
@@ -3880,6 +3979,8 @@ def create_daily_entry_endpoint(
         "registered_at": moment.isoformat(),
         "created_by_id": user["id"],
     }
+    if payload.utc_offset_minutes is not None:
+        entry.update(_zone_fields(datetime.now(zone), payload.time_zone))
     if payload.offline:
         entry["synced_from_offline"] = True
     try:

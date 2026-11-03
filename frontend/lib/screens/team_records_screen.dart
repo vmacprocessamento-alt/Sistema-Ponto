@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import 'package:intl/intl.dart';
 import '../utils/record_types.dart';
+import '../utils/time_zone.dart';
 import '../widgets/export_dialog.dart';
 import 'daily_entries_admin_screen.dart';
 import '../widgets/content_width.dart';
@@ -616,6 +617,9 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
         final notes =
             r['notes']?.toString().replaceAll('Editado pelo admin', '').trim();
         final editReason = r['last_admin_edit_reason']?.toString().trim();
+        // Batida fora do fuso de Brasilia: a hora e a local de onde a pessoa
+        // estava (07:30 em MT e 08:30 em Brasilia).
+        final zoneLabel = timeZoneLabel(r['utc_offset_minutes'], r['time_zone']);
         return Card(
           margin: const EdgeInsets.only(bottom: 8),
           child: ListTile(
@@ -643,7 +647,9 @@ class _TeamRecordsScreenState extends State<TeamRecordsScreen> {
             subtitle: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(DateFormat('HH:mm:ss').format(time)),
+                Text(zoneLabel == null
+                    ? DateFormat('HH:mm:ss').format(time)
+                    : '${DateFormat('HH:mm:ss').format(time)} · hora local, fuso $zoneLabel'),
                 if (notes != null && notes.isNotEmpty) ...[
                   const SizedBox(height: 4),
                   Text(notes,

@@ -18,6 +18,7 @@ import '../utils/cpf.dart';
 import '../utils/daily_entries.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
+import '../utils/time_zone.dart';
 
 class AdjustmentRequestResult {
   final String id;
@@ -1158,6 +1159,7 @@ class ApiService {
             // "Bloquear tela apos" igual ao fim do horario, ela pedia
             // liberacao e ficava parada.
             closeAtScheduledEnd: record['close_at_scheduled_end'] == true,
+            timeZoneFields: storedTimeZoneFields(record),
           );
           if (result['status'] == 'approval_required') {
             // A saida depois do limite passa com a liberacao da hora extra. A
@@ -1277,6 +1279,9 @@ class ApiService {
       'longitude': longitude,
       if (punchKind != null) 'punch_kind': punchKind,
       if (refRecordId != null) 'ref_record_id': refRecordId,
+      // Fuso do celular no momento da batida: a fila offline o guarda e o
+      // reenvia igual, mesmo sincronizando de outro fuso (lib/utils/time_zone.dart).
+      ...deviceTimeZoneFields(now),
     };
     if (currentUser != null && await _hasNetworkConnection()) {
       try {
@@ -1338,6 +1343,9 @@ class ApiService {
             'longitude': (punch['longitude'] as num?)?.toDouble(),
             if (kind != null) 'kind': kind,
             if (ref != null) 'ref_record_id': ref,
+            // Batida da fila de antes do fuso existir vai sem: o servidor
+            // usa Brasilia, como antes.
+            ...storedTimeZoneFields(punch),
           }),
         )
         .timeout(const Duration(seconds: 30));
@@ -1397,6 +1405,7 @@ class ApiService {
       'latitude': latitude,
       'longitude': longitude,
       if (closeAtScheduledEnd) 'close_at_scheduled_end': true,
+      ...deviceTimeZoneFields(now),
       'offline': true,
       'sync_status': 'pending',
       'created_at_local': now.toIso8601String(),
@@ -1824,7 +1833,8 @@ class ApiService {
       isNetworkFailure(error) ||
       (error is _DailyEntryHttpException && error.temporary);
 
-  Future<Map<String, dynamic>> _postDailyEntry({DateTime? offlineAt}) async {
+  Future<Map<String, dynamic>> _postDailyEntry(
+      {DateTime? offlineAt, Map<String, dynamic>? timeZoneFields}) async {
     final response = await http
         .post(
           Uri.parse('$backendUrl/daily-entries'),
@@ -1835,6 +1845,8 @@ class ApiService {
           body: jsonEncode({
             if (offlineAt != null) 'offline': true,
             if (offlineAt != null) 'timestamp': offlineAt.toIso8601String(),
+            // O dia da diaria e o do lugar onde a pessoa esta.
+            ...(timeZoneFields ?? deviceTimeZoneFields(offlineAt)),
           }),
         )
         .timeout(const Duration(seconds: 20));
@@ -1891,6 +1903,7 @@ class ApiService {
       'user_id': uid,
       'date': dailyDayKey(at),
       'registered_at': at.toIso8601String(),
+      ...deviceTimeZoneFields(at),
     };
     final queued = await _readJsonList(_pendingDailyEntriesKey);
     // Uma por dia tambem na fila: outro toque sem internet nao vira outra.
@@ -1936,7 +1949,10 @@ class ApiService {
         if (at == null) {
           throw const _DailyEntryHttpException(400, 'Diária sem horário.');
         }
-        await _cacheDailyEntries([await _postDailyEntry(offlineAt: at)]);
+        await _cacheDailyEntries([
+          await _postDailyEntry(
+              offlineAt: at, timeZoneFields: storedTimeZoneFields(pending))
+        ]);
       } catch (e) {
         if (_isTemporaryDailyFailure(e)) break;
         if (e is! _DailyEntryHttpException) {
@@ -2414,6 +2430,9 @@ class ApiService {
     bool closeAtScheduledEnd = false,
     String? clientRecordId,
     bool offline = false,
+    // Fuso da batida. Null: o do celular agora (batida na hora). A fila
+    // passa o que guardou (vazio para batida de antes do campo existir).
+    Map<String, dynamic>? timeZoneFields,
   }) async {
     // clientRecordId vira o id do ponto e torna o reenvio idempotente;
     // offline = batida feita sem internet e enviada agora (vale a hora dela).
@@ -2434,6 +2453,7 @@ class ApiService {
             'close_at_scheduled_end': closeAtScheduledEnd,
             if (clientRecordId != null) 'client_record_id': clientRecordId,
             'offline': offline,
+            ...(timeZoneFields ?? deviceTimeZoneFields()),
           }),
         )
         .timeout(const Duration(seconds: 30));
@@ -2512,6 +2532,7 @@ class ApiService {
             'notes': observation,
             'latitude': latitude,
             'longitude': longitude,
+            ...deviceTimeZoneFields(),
           }),
         )
         .timeout(const Duration(seconds: 30));

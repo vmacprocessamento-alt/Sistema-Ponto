@@ -75,6 +75,16 @@ de `firestore.rules`.
    saída 1 s depois da entrada) e pausa vencida (`kind: auto_break_close`,
    pausa aberta há 3 h fecha com 1 h). O job do backend também fecha pausas
    vencidas a cada 15 min, com o mesmo id (`autoclose_<pausa>`).
+5. **Fuso do celular** (03/11/2026): toda batida, pedido de liberação e
+   diária manda `utc_offset_minutes` (minutos a leste de UTC: Mato Grosso =
+   -240) e `time_zone` (`America/Cuiaba`); a fila offline guarda os dois e os
+   reenvia iguais. O servidor compara o momento real com o relógio dele (antes
+   a hora de MT parecia uma hora atrasada e era recusada) e grava a **hora
+   local de onde a pessoa bateu**, com o fuso no próprio ponto. O estagiário
+   segue o fuso do horário dele. Só fusos do Brasil, de UTC-5 a UTC-2. Sem os
+   campos (app antigo), vale Brasília. O fechamento automático de pausa mede a
+   pausa no fuso dela, e a Gestão mostra o fuso das batidas feitas fora de
+   Brasília.
 
 ### Autenticação no backend
 Toda rota autenticada recebe o token do Firebase (`Authorization: Bearer`).

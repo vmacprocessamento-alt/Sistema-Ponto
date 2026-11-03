@@ -5,7 +5,7 @@ import os
 import sys
 import types
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -1424,6 +1424,130 @@ class TemporaryPasswordTest(unittest.TestCase):
 
     def test_senha_padrao(self):
         self.assertEqual(main._temporary_password(), "123456")
+
+
+@needs_main
+class DeviceTimeZoneTest(unittest.TestCase):
+    """Celular fora do fuso de Brasilia (03/11/2026). Em Mato Grosso (UTC-4) a
+    batida das 07:30 chegava como 07:30 de Brasilia, uma hora antes do relogio
+    do servidor, e era recusada. Com o fuso do celular, passa e grava a hora
+    local de onde foi batida."""
+
+    MT = timezone(timedelta(hours=-4))
+    employee = {"id": "u1", "role": "employee", "name": "Guilherme"}
+    intern = {"id": "u2", "role": "intern", "name": "Estagiario"}
+
+    def setUp(self):
+        self.db = _FakeDb()
+        patches = [
+            mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+            mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")),
+            mock.patch.object(main, "_create_user_notification", lambda *args, **kwargs: None),
+            mock.patch.object(main, "_send_user_push", lambda *args, **kwargs: None),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ids = itertools.count(1)
+
+    def mt_now(self):
+        return datetime.now(self.MT).replace(tzinfo=None)
+
+    def sp_now(self):
+        return datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
+
+    def punch(self, user=None, **fields):
+        values = {"record_type": "check_in", "client_record_id": f"punch{next(self.ids):04d}"}
+        values.update(fields)
+        return _call(main.time_record_punch_endpoint(main.TimeRecordPunchRequest(**values), user or self.employee))
+
+    def stored(self, doc_id):
+        return self.db.store["time_records"][doc_id]
+
+    def assert_near(self, value, expected, tolerance=timedelta(minutes=2)):
+        moment = datetime.fromisoformat(value)
+        self.assertLess(abs(moment - expected), tolerance, f"{value} longe de {expected}")
+
+    def test_mt_online_punch_is_accepted_with_local_time(self):
+        result = self.punch(timestamp=self.mt_now().isoformat(), utc_offset_minutes=-240, time_zone="America/Cuiaba")
+        record = self.stored(result["id"])
+        # Hora de parede de MT (07:30), nao a de Brasilia (08:30).
+        self.assert_near(record["timestamp"], self.mt_now())
+        self.assertEqual((record["utc_offset_minutes"], record["time_zone"]), (-240, "America/Cuiaba"))
+        self.assertNotIn("device_timestamp", record)
+
+    def test_old_app_without_time_zone_is_still_read_as_brasilia(self):
+        # App de antes da correcao: sem o fuso, a hora de MT parece uma hora atrasada.
+        with self.assertRaises(main.HTTPException) as ctx:
+            self.punch(timestamp=self.mt_now().isoformat())
+        self.assertEqual(ctx.exception.status_code, 400)
+        # Em Brasilia nada muda, e o ponto nao ganha campos de fuso.
+        result = self.punch(timestamp=self.sp_now().isoformat())
+        record = self.stored(result["id"])
+        self.assert_near(record["timestamp"], self.sp_now())
+        self.assertNotIn("utc_offset_minutes", record)
+
+    def test_offline_mt_punch_keeps_the_local_time_of_the_tap(self):
+        tapped = self.mt_now() - timedelta(hours=2)
+        result = self.punch(timestamp=tapped.isoformat(), offline=True, utc_offset_minutes=-240)
+        record = self.stored(result["id"])
+        self.assertEqual(record["timestamp"], tapped.isoformat())
+        self.assertTrue(record["synced_from_offline"])
+        self.assertIn(record["offline_delay_minutes"], range(119, 122))
+
+    def test_time_zone_outside_brazil_is_refused(self):
+        for offset in (60, -360, 0):
+            with self.assertRaises(main.HTTPException) as ctx:
+                self.punch(timestamp=self.sp_now().isoformat(), utc_offset_minutes=offset)
+            self.assertEqual(ctx.exception.status_code, 400)
+        self.assertNotIn("time_records", {k: v for k, v in self.db.store.items() if v})
+
+    def test_intern_entry_from_mt_is_stored_in_the_schedule_time_zone(self):
+        with mock.patch.object(main, "_is_start_within_schedule", return_value=True):
+            payload = main.SchedulePunchRequest(
+                record_type="check_in", timestamp=self.mt_now().isoformat(),
+                client_record_id="interno0001", utc_offset_minutes=-240, time_zone="America/Cuiaba",
+            )
+            result = _call(main.schedule_controlled_punch_endpoint(payload, self.intern))
+        self.assertEqual(result["status"], "created")
+        record = self.stored("interno0001")
+        # As regras de horario do estagiario sao no fuso do horario dele (Brasilia).
+        self.assert_near(record["timestamp"], self.sp_now())
+        self.assertEqual((record["utc_offset_minutes"], record["time_zone"]), (-180, "America/Sao_Paulo"))
+
+    def add_break(self, doc_id, started, **zone):
+        self.db.store.setdefault("time_records", {})[doc_id] = {
+            "user_id": "u1", "record_type": "break_start", "timestamp": started.isoformat(), **zone,
+        }
+
+    def test_auto_close_measures_the_break_in_its_own_time_zone(self):
+        # Pausa de MT aberta ha 2h30: em Brasilia pareceria 3h30 e fecharia cedo.
+        self.add_break("pausa1", self.mt_now() - timedelta(hours=2, minutes=30), utc_offset_minutes=-240)
+        self.assertTrue(main._run_auto_close_breaks())
+        self.assertNotIn("autoclose_pausa1", self.db.store["time_records"])
+
+        # Aberta ha 3h10 no fuso dela: fecha, e o retorno fica no mesmo fuso.
+        started = self.mt_now() - timedelta(hours=3, minutes=10)
+        self.add_break("pausa1", started, utc_offset_minutes=-240, time_zone="America/Cuiaba")
+        self.assertTrue(main._run_auto_close_breaks())
+        closed = self.stored("autoclose_pausa1")
+        self.assertEqual(closed["timestamp"], (started + timedelta(hours=1)).isoformat())
+        self.assertEqual((closed["utc_offset_minutes"], closed["time_zone"]), (-240, "America/Cuiaba"))
+
+    def test_daily_entry_uses_the_local_day_and_time(self):
+        user = {"id": "u3", "role": "employee", "name": "Diarista", "daily_mode": True}
+        entry = _call(main.create_daily_entry_endpoint(
+            main.DailyEntryRequest(utc_offset_minutes=-240, time_zone="America/Cuiaba"), user,
+        ))
+        self.assert_near(entry["registered_at"], self.mt_now())
+        self.assertEqual(entry["date"], self.mt_now().date().isoformat())
+        self.assertEqual(entry["utc_offset_minutes"], -240)
+        # Offline: vale a hora do toque no fuso do celular.
+        tapped = self.mt_now() - timedelta(days=1)
+        offline = _call(main.create_daily_entry_endpoint(
+            main.DailyEntryRequest(offline=True, timestamp=tapped.isoformat(), utc_offset_minutes=-240), user,
+        ))
+        self.assertEqual(offline["date"], tapped.date().isoformat())
 
 
 @needs_main
