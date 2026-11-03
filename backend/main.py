@@ -265,7 +265,36 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Server-Time"],
 )
+
+def _utc_now_iso() -> str:
+    return datetime.now(dt_timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+class _ServerTimeHeader:
+    """Hora do servidor (UTC) em toda resposta, no cabecalho X-Server-Time
+    (03/11/2026). O app guarda a do ultimo contato junto com a hora do celular
+    naquele momento e as manda com a batida offline: o servidor ve se o relogio
+    do celular foi mexido depois (_offline_punch_moment)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_time(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-server-time", _utc_now_iso().encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_time)
+
+app.add_middleware(_ServerTimeHeader)
 
 # --- AUXILIARES DE CÁLCULO (Lógica Ponto.py) ---
 
@@ -655,6 +684,12 @@ class SchedulePunchRequest(BaseModel):
     # nome (America/Cuiaba). Sem eles (app antigo): Brasilia.
     utc_offset_minutes: Optional[int] = None
     time_zone: Optional[str] = None
+    # Relogio da batida offline (03/11/2026): hora do servidor (UTC) no ultimo
+    # contato antes da batida, a do celular naquele momento e, se o app nao
+    # foi fechado desde entao, quantos ms passaram ate a batida.
+    server_anchor: Optional[str] = None
+    device_anchor: Optional[str] = None
+    anchor_elapsed_ms: Optional[int] = None
 
 class ScheduleApprovalCreateRequest(BaseModel):
     request_type: str
@@ -681,6 +716,10 @@ class AdminTimeRecordUpdateRequest(BaseModel):
 
 class AdminTimeRecordDeleteRequest(BaseModel):
     reason: str
+
+class AdminTimeRecordReviewRequest(BaseModel):
+    # Batidas que o gestor conferiu na aba Conferencia (saem da lista).
+    record_ids: List[str]
 
 class AdminSetDayPunch(BaseModel):
     # Uma batida do dia: tipo (check_in/check_out/break_start/break_end/
@@ -840,6 +879,20 @@ def _record_wall_now(record: dict, default: datetime) -> datetime:
 
 def _copy_zone_fields(record: dict) -> dict:
     return {key: record[key] for key in ("utc_offset_minutes", "time_zone") if key in record}
+
+def _shift_zone(check_in: dict) -> tuple:
+    """(fuso, nome) gravados na entrada do turno; entrada sem fuso: Brasilia.
+
+    FUSO PRESO AO TURNO (03/11/2026). A entrada define o fuso e as pausas e a
+    saida do mesmo turno seguem nele, qualquer que seja o fuso do celular na
+    hora. Antes, entrar em UTC-4 e trocar o fuso do celular para UTC-3 antes da
+    saida gravava a saida uma hora "mais tarde" e o turno pagava uma hora a mais.
+    """
+    offset = check_in.get("utc_offset_minutes")
+    if not isinstance(offset, bool) and isinstance(offset, (int, float)) and int(offset) in _BRAZIL_UTC_OFFSETS:
+        name = check_in.get("time_zone")
+        return dt_timezone(timedelta(minutes=int(offset))), name if isinstance(name, str) else None
+    return ZoneInfo(_LOCAL_TZ), _LOCAL_TZ
 
 def _local_iso(dt: datetime) -> str:
     """Hora de parede local, sem offset, para gravar em time_records.
@@ -3224,7 +3277,158 @@ def update_global_work_schedule_endpoint(
 # Id de documento aceito do app: so caracteres seguros para o Firestore.
 _CLIENT_RECORD_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 _OFFLINE_MAX_AHEAD = timedelta(minutes=15)
-_OFFLINE_MAX_DELAY = timedelta(days=7)
+# Batida offline vale ate 48 horas depois (03/11/2026; eram 7 dias): quanto
+# maior a janela, mais tempo para "acertar" o relogio do celular e bater.
+_OFFLINE_MAX_DELAY = timedelta(hours=48)
+# Folga do relogio na conferencia da batida offline (rede, arredondamento).
+_CLOCK_TOLERANCE = timedelta(minutes=2)
+_MAX_ANCHOR_ELAPSED = timedelta(days=30)
+
+def _parse_utc(value: Optional[str]) -> Optional[datetime]:
+    """Data/hora com fuso (as ancoras do app vem em UTC). Sem fuso ou
+    invalida: None (a batida segue como de app antigo, sem ancora)."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt_timezone.utc)
+
+def _log_punch_rejection(db, user: dict, payload, source: str, reason: str, detail: str) -> None:
+    """Guarda a batida recusada em punch_rejections, para a aba Conferencia
+    da Gestao. Falha ao gravar nao muda a resposta (a recusa vale do mesmo jeito)."""
+    try:
+        client_id = getattr(payload, "client_record_id", None)
+        entry = {
+            "user_id": user.get("id"),
+            "user_name": user.get("name", ""),
+            "source": source,
+            "reason": reason,
+            "detail": detail,
+            "record_type": getattr(payload, "record_type", None),
+            "device_timestamp": getattr(payload, "timestamp", None),
+            "utc_offset_minutes": getattr(payload, "utc_offset_minutes", None),
+            "offline": bool(getattr(payload, "offline", False)),
+            "latitude": getattr(payload, "latitude", None),
+            "longitude": getattr(payload, "longitude", None),
+            "server_anchor": getattr(payload, "server_anchor", None),
+            "device_anchor": getattr(payload, "device_anchor", None),
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "created_at_local": _local_now().isoformat(),
+        }
+        collection = db.collection("punch_rejections")
+        # O reenvio da mesma batida (Tentar de novo na fila) regrava, nao duplica.
+        if client_id and _CLIENT_RECORD_ID_RE.fullmatch(client_id):
+            collection.document(f"{client_id}_{reason}").set(entry)
+        else:
+            collection.document().set(entry)
+    except Exception as exc:  # pragma: no cover - log apenas
+        logger.warning("Nao foi possivel guardar a batida recusada: %s", exc)
+
+def _reject_punch(db, user: dict, payload, source: str, reason: str, detail: str):
+    _log_punch_rejection(db, user, payload, source, reason, detail)
+    raise HTTPException(status_code=400, detail=detail)
+
+_CLOCK_CHANGED_DETAIL = (
+    "A hora do celular foi alterada: esta batida offline ficou antes do ultimo contato "
+    "com o servidor. Ela foi recusada e o gestor foi avisado. Peca ao gestor para lancar o horario certo."
+)
+
+def _offline_punch_moment(db, user: dict, payload, punched_at: datetime, server_now: datetime, source: str) -> tuple:
+    """(hora valida, campos para o ponto) da batida feita sem internet.
+
+    RELOGIO DA BATIDA OFFLINE (03/11/2026). Sem internet so ha o relogio do
+    celular, e ele pode ser mexido: atrasar a hora, bater a entrada e voltar a
+    hora certa. O app guarda a hora do servidor no ultimo contato e a do
+    celular no mesmo momento (server_anchor, device_anchor) e manda as duas com
+    a batida. Aqui:
+    - a diferenca entre elas e o erro do relogio do celular; a hora da batida e
+      corrigida por ela (celular 10 min atrasado: a batida vale 10 min depois);
+    - a batida veio depois daquele contato, entao nao pode ficar antes dele. Se
+      o app nao foi fechado, o app manda tambem o tempo que passou desde o
+      contato (anchor_elapsed_ms, cronometro que a hora do celular nao mexe), e
+      a batida nao pode ficar antes de contato + esse tempo;
+    - nada no futuro e no maximo 48 horas de atraso.
+    Recusada: vai para punch_rejections (aba Conferencia) e o app mostra o motivo.
+    Sem as ancoras (fila de app antigo): so a janela, e o ponto fica marcado
+    para conferencia (offline_without_anchor).
+
+    [punched_at] e [server_now] com fuso; a hora devolvida sai no fuso de
+    [punched_at]."""
+    fields: dict = {}
+    moment = punched_at
+    server_anchor = _parse_utc(getattr(payload, "server_anchor", None))
+    device_anchor = _parse_utc(getattr(payload, "device_anchor", None))
+    if server_anchor is None or device_anchor is None:
+        fields["offline_without_anchor"] = True
+    else:
+        if server_anchor > server_now + _CLOCK_TOLERANCE:
+            _reject_punch(db, user, payload, source, "invalid_anchor", _CLOCK_CHANGED_DETAIL)
+        skew = device_anchor - server_anchor
+        moment = punched_at - skew
+        floor = server_anchor
+        elapsed = getattr(payload, "anchor_elapsed_ms", None)
+        if isinstance(elapsed, int) and 0 <= elapsed <= _MAX_ANCHOR_ELAPSED.total_seconds() * 1000:
+            # O cronometro do navegador pode parar com o celular dormindo (conta
+            # menos, nunca mais): serve so de piso, nunca de teto.
+            floor = server_anchor + timedelta(milliseconds=elapsed)
+        if moment < floor - _CLOCK_TOLERANCE:
+            _reject_punch(db, user, payload, source, "clock_moved_back", _CLOCK_CHANGED_DETAIL)
+        if moment > server_now + _CLOCK_TOLERANCE:
+            _reject_punch(
+                db, user, payload, source, "clock_ahead",
+                "A hora do celular foi adiantada: esta batida offline ficou no futuro. "
+                "Ela foi recusada e o gestor foi avisado.",
+            )
+        if abs(skew) >= timedelta(seconds=60):
+            fields["clock_skew_seconds"] = int(skew.total_seconds())
+    delay = server_now - moment
+    if delay < -_OFFLINE_MAX_AHEAD:
+        _reject_punch(
+            db, user, payload, source, "future",
+            "O horario da batida offline esta no futuro (relogio do celular adiantado). "
+            "Ela foi recusada e o gestor foi avisado.",
+        )
+    if delay > _OFFLINE_MAX_DELAY:
+        _reject_punch(
+            db, user, payload, source, "too_old",
+            "A batida offline tem mais de 48 horas e nao pode mais ser enviada. Peca ao gestor para lancar o horario.",
+        )
+    return moment, fields
+
+# GPS OBRIGATORIO NA BATIDA (03/11/2026). Toda batida do app leva a localizacao
+# do celular, dentro do Brasil. Ficam de fora as que o servidor calcula (saida
+# esquecida, retorno automatico da pausa, fechar no horario programado) e as da
+# fila offline de app antigo (sem as ancoras do relogio), feitas quando o GPS
+# ainda era opcional.
+_BRAZIL_LATITUDE = (-34.0, 6.0)
+_BRAZIL_LONGITUDE = (-74.5, -28.0)
+
+def _location_required(payload) -> bool:
+    return not payload.offline or getattr(payload, "server_anchor", None) is not None
+
+def _require_punch_location(db, user: dict, payload, source: str) -> None:
+    latitude, longitude = payload.latitude, payload.longitude
+    if latitude is None or longitude is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Ative a localizacao (GPS) do celular e permita o acesso ao site para bater o ponto.",
+        )
+    try:
+        inside = (
+            _BRAZIL_LATITUDE[0] <= float(latitude) <= _BRAZIL_LATITUDE[1]
+            and _BRAZIL_LONGITUDE[0] <= float(longitude) <= _BRAZIL_LONGITUDE[1]
+        )
+    except (TypeError, ValueError):
+        inside = False
+    if not inside:
+        _reject_punch(
+            db, user, payload, source, "location_outside_brazil",
+            "A localizacao do celular esta fora do Brasil. Desligue apps de localizacao falsa e tente de novo.",
+        )
 
 @app.post("/work-schedule/punch")
 def schedule_controlled_punch_endpoint(
@@ -3264,6 +3468,9 @@ def schedule_controlled_punch_endpoint(
     attempted = _parse_in_zone(payload.timestamp, device_zone).astimezone(ZoneInfo(timezone_name))
     punched_at = attempted
     server_now = datetime.now(ZoneInfo(timezone_name))
+    clock_fields: dict = {}
+    if not payload.close_at_scheduled_end and _location_required(payload):
+        _require_punch_location(db, user, payload, "estagiario")
     if payload.close_at_scheduled_end:
         # A hora gravada sera o fim programado, conferido abaixo. So vale para a SAIDA: numa entrada pulava toda a
         # conferencia de horario (entrada num mes ja fechado, ou no futuro travando as proximas batidas).
@@ -3271,13 +3478,14 @@ def schedule_controlled_punch_endpoint(
             raise HTTPException(status_code=400, detail="Fechar no horario programado vale so para a saida.")
     elif payload.offline:
         # Batida feita sem internet: vale a hora do aparelho no momento da
-        # batida, que chega aqui horas ou dias depois. Futuro nao (relogio
-        # adiantado) e no maximo 7 dias de atraso.
-        delay = server_now - attempted
-        if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
-            raise HTTPException(status_code=400, detail="O horario da batida offline esta fora do periodo aceito.")
+        # batida (corrigida pelo erro do relogio no ultimo contato), que chega
+        # aqui horas depois. Futuro nao e no maximo 48 horas de atraso.
+        attempted, clock_fields = _offline_punch_moment(db, user, payload, attempted, server_now, "estagiario")
     elif abs((server_now - attempted).total_seconds()) > 15 * 60:
-        raise HTTPException(status_code=400, detail="O horario informado esta muito distante do relogio do servidor.")
+        _reject_punch(
+            db, user, payload, "estagiario", "clock_far_online",
+            "O horario informado esta muito distante do relogio do servidor.",
+        )
     else:
         # Online vale a hora do servidor, nao a do aparelho: com o relogio do celular mexido dava ate 15 min a mais
         # por batida. A do aparelho fica em device_timestamp quando difere (17/10/2026).
@@ -3362,11 +3570,17 @@ def schedule_controlled_punch_endpoint(
     }
     if payload.utc_offset_minutes is not None:
         record.update(_zone_fields(attempted, timezone_name))
+    record.update(clock_fields)
     if payload.offline:
         record["synced_from_offline"] = True
+        # Fechar no horario programado grava o fim programado: o atraso conta
+        # da hora do toque.
+        tapped = punched_at if payload.close_at_scheduled_end else attempted
         record["offline_delay_minutes"] = max(
-            0, int((server_now - punched_at).total_seconds() // 60)
+            0, int((server_now - tapped).total_seconds() // 60)
         )
+        if not payload.close_at_scheduled_end and abs((attempted - punched_at).total_seconds()) >= 60:
+            record["device_timestamp"] = _local_iso(punched_at)
     elif not payload.close_at_scheduled_end and abs((server_now - punched_at).total_seconds()) >= 60:
         record["device_timestamp"] = _local_iso(punched_at)
     record_ref.set(record)
@@ -3393,6 +3607,12 @@ class TimeRecordPunchRequest(BaseModel):
     # nome (America/Cuiaba). Sem eles (app antigo): Brasilia.
     utc_offset_minutes: Optional[int] = None
     time_zone: Optional[str] = None
+    # Relogio da batida offline (03/11/2026): hora do servidor (UTC) no ultimo
+    # contato antes da batida, a do celular naquele momento e, se o app nao
+    # foi fechado desde entao, quantos ms passaram ate a batida.
+    server_anchor: Optional[str] = None
+    device_anchor: Optional[str] = None
+    anchor_elapsed_ms: Optional[int] = None
 
 _PUNCH_TYPES = {"check_in", "check_out", "break_start", "break_end", "entry_3", "exit_3"}
 _BREAK_CLOSE_TYPE = {"break_start": "break_end", "entry_3": "exit_3"}
@@ -3453,14 +3673,20 @@ def time_record_punch_endpoint(
     # bateu (a do celular; 07:30 em MT, nao 08:30 de Brasilia). O estagiario
     # segue o fuso do horario dele, o mesmo da entrada e da saida.
     device_zone = _device_zone(payload.utc_offset_minutes)
+    records = _user_records_sorted(db, user_id)
+    shift_zone_locked = False
     if _is_intern_profile(user):
         zone_name = _resolve_effective_work_schedule(db, user)["timezone"]
         store_zone = ZoneInfo(zone_name)
     else:
         zone_name = payload.time_zone
         store_zone = device_zone
+        # Pausas e saida seguem o fuso da entrada do turno (_shift_zone).
+        shift_start = _open_shift_start(records) if record_type != "check_in" else None
+        if shift_start is not None:
+            store_zone, zone_name = _shift_zone(shift_start)
+            shift_zone_locked = True
 
-    records = _user_records_sorted(db, user_id)
     server_now = datetime.now(store_zone)
 
     if payload.kind == "auto_break_close":
@@ -3503,19 +3729,24 @@ def time_record_punch_endpoint(
         doc_id, record = _forgotten_exit(user_id, open_shift, payload.location, payload.notes)
         return existing_or_none(doc_id) or _save_punch(db, doc_id, record)
 
+    if _location_required(payload):
+        _require_punch_location(db, user, payload, "ponto")
     attempted = _parse_in_zone(payload.timestamp, device_zone).astimezone(store_zone)
     punched_at = attempted
+    clock_fields: dict = {}
     if payload.offline:
-        # Sem internet vale a hora do aparelho no momento da batida, como no
-        # estagiario: nada no futuro e no maximo 7 dias de atraso.
-        delay = server_now - attempted
-        if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
-            raise HTTPException(status_code=400, detail="O horario da batida offline esta fora do periodo aceito.")
+        # Sem internet vale a hora do aparelho no momento da batida, corrigida
+        # pelo erro do relogio no ultimo contato (_offline_punch_moment): nada
+        # no futuro e no maximo 48 horas de atraso.
+        attempted, clock_fields = _offline_punch_moment(db, user, payload, attempted, server_now, "ponto")
         records = _records_before_punch(records, {
             "user_id": user_id, "record_type": record_type, "timestamp": _local_iso(attempted),
         })
     elif abs((server_now - attempted).total_seconds()) > 15 * 60:
-        raise HTTPException(status_code=400, detail="O horario informado esta muito distante do relogio do servidor.")
+        _reject_punch(
+            db, user, payload, "ponto", "clock_far_online",
+            "O horario informado esta muito distante do relogio do servidor.",
+        )
     else:
         # Online vale a hora do servidor, nao a do celular.
         attempted = server_now
@@ -3546,11 +3777,18 @@ def time_record_punch_endpoint(
         "longitude": payload.longitude,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
-    if payload.utc_offset_minutes is not None:
+    if payload.utc_offset_minutes is not None or shift_zone_locked:
         record.update(_zone_fields(attempted, zone_name))
+    if shift_zone_locked and payload.utc_offset_minutes is not None:
+        # Celular em outro fuso que o da entrada: fica anotado para a conferencia.
+        if payload.utc_offset_minutes != record.get("utc_offset_minutes"):
+            record["device_utc_offset_minutes"] = payload.utc_offset_minutes
+    record.update(clock_fields)
     if payload.offline:
         record["synced_from_offline"] = True
-        record["offline_delay_minutes"] = max(0, int((server_now - punched_at).total_seconds() // 60))
+        record["offline_delay_minutes"] = max(0, int((server_now - attempted).total_seconds() // 60))
+        if abs((attempted - punched_at).total_seconds()) >= 60:
+            record["device_timestamp"] = _local_iso(punched_at)
     elif abs((server_now - punched_at).total_seconds()) >= 60:
         record["device_timestamp"] = _local_iso(punched_at)
     return _save_punch(db, payload.client_record_id, record)
@@ -3914,6 +4152,12 @@ class DailyEntryRequest(BaseModel):
     # nome (America/Cuiaba). Sem eles (app antigo): Brasilia.
     utc_offset_minutes: Optional[int] = None
     time_zone: Optional[str] = None
+    # Relogio da batida offline (03/11/2026): hora do servidor (UTC) no ultimo
+    # contato antes da batida, a do celular naquele momento e, se o app nao
+    # foi fechado desde entao, quantos ms passaram ate a batida.
+    server_anchor: Optional[str] = None
+    device_anchor: Optional[str] = None
+    anchor_elapsed_ms: Optional[int] = None
 
 # Periodo maximo de uma consulta de diarias (um ano e folga).
 _DAILY_ENTRIES_MAX_RANGE = timedelta(days=400)
@@ -3921,19 +4165,19 @@ _DAILY_ENTRIES_MAX_RANGE = timedelta(days=400)
 def _daily_entry_id(user_id: str, day: date) -> str:
     return f"{user_id}_{day.isoformat()}"
 
-def _daily_entry_moment(payload: DailyEntryRequest, now: datetime, zone=None) -> datetime:
-    """Hora local da diaria: agora, pelo relogio do servidor; a marcada
-    offline vale a hora do toque, de ate 7 dias atras e nao do futuro. [now]
-    e a hora de parede do fuso [zone] (o do celular; sem ele, Brasilia)."""
+def _daily_entry_moment(db, user: dict, payload: DailyEntryRequest, zone) -> tuple:
+    """(hora local, campos do relogio) da diaria: agora, pelo relogio do
+    servidor; a marcada offline vale a hora do toque, conferida como a batida
+    offline (_offline_punch_moment: ate 48 horas atras e nao do futuro). Hora
+    de parede do fuso [zone] (o do celular; sem ele, Brasilia)."""
+    server_now = datetime.now(zone)
     if not payload.offline:
-        return now
+        return server_now.replace(tzinfo=None), {}
     if not payload.timestamp:
         raise HTTPException(status_code=400, detail="Informe a hora da diaria offline.")
-    attempted = _parse_in_zone(payload.timestamp, zone or ZoneInfo(_LOCAL_TZ)).replace(tzinfo=None)
-    delay = now - attempted
-    if delay < -_OFFLINE_MAX_AHEAD or delay > _OFFLINE_MAX_DELAY:
-        raise HTTPException(status_code=400, detail="A diaria offline esta fora do periodo aceito.")
-    return attempted
+    tapped = _parse_in_zone(payload.timestamp, zone)
+    moment, fields = _offline_punch_moment(db, user, payload, tapped, server_now, "diaria")
+    return moment.replace(tzinfo=None), fields
 
 def _daily_entries_between(db, user_id: str, start: date, end: date) -> List[dict]:
     """Diarias de user_id de start a end (inclusive), em ordem de data. Le
@@ -3966,11 +4210,10 @@ def create_daily_entry_endpoint(
     # O dia da diaria e o do lugar onde a pessoa esta: em MT, 23:30 de segunda
     # ja e terca em Brasilia, e a diaria caia no dia seguinte.
     zone = _device_zone(payload.utc_offset_minutes)
-    now = datetime.now(zone).replace(tzinfo=None)
-    moment = _daily_entry_moment(payload, now, zone)
+    db = get_firestore_admin()
+    moment, clock_fields = _daily_entry_moment(db, user, payload, zone)
     day = moment.date()
 
-    db = get_firestore_admin()
     ref = db.collection("daily_entries").document(_daily_entry_id(user["id"], day))
     entry = {
         "user_id": user["id"],
@@ -3981,6 +4224,7 @@ def create_daily_entry_endpoint(
     }
     if payload.utc_offset_minutes is not None:
         entry.update(_zone_fields(datetime.now(zone), payload.time_zone))
+    entry.update(clock_fields)
     if payload.offline:
         entry["synced_from_offline"] = True
     try:
@@ -4788,6 +5032,65 @@ def delete_time_record_admin_endpoint(
         "created_at": firestore.SERVER_TIMESTAMP,
     })
     return {"status": "deleted", "id": record_id}
+
+_REVIEW_MAX_RECORDS = 200
+
+@app.post("/admin/time-records/review")
+def review_time_records_endpoint(
+    payload: AdminTimeRecordReviewRequest,
+    admin=Depends(require_admin_user),
+):
+    """Aba Conferencia (03/11/2026): o gestor olhou a batida suspeita (offline
+    muito depois, relogio do celular diferente, outro fuso, sem GPS) e a marca
+    como conferida; ela sai da lista. Fica no proprio ponto quem conferiu e
+    quando, e uma linha em time_record_audits."""
+    record_ids = list(dict.fromkeys(item.strip() for item in payload.record_ids if item and item.strip()))
+    if not record_ids:
+        raise HTTPException(status_code=400, detail="Informe as batidas conferidas.")
+    if len(record_ids) > _REVIEW_MAX_RECORDS:
+        raise HTTPException(status_code=400, detail=f"No maximo {_REVIEW_MAX_RECORDS} batidas por vez.")
+    db = get_firestore_admin()
+    reviewed = []
+    for record_id in record_ids:
+        if not _CLIENT_RECORD_ID_RE.fullmatch(record_id) and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", record_id):
+            continue
+        ref = db.collection("time_records").document(record_id)
+        if not ref.get().exists:
+            continue
+        ref.update({
+            "reviewed_at": firestore.SERVER_TIMESTAMP,
+            "reviewed_by": admin["id"],
+            "reviewed_by_name": admin.get("name", ""),
+        })
+        reviewed.append(record_id)
+    if reviewed:
+        db.collection("time_record_audits").document().set({
+            "action": "review",
+            "record_ids": reviewed,
+            "admin_id": admin["id"],
+            "admin_name": admin.get("name", ""),
+            "admin_email": admin.get("email", ""),
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+    return {"status": "reviewed", "count": len(reviewed), "ids": reviewed}
+
+@app.get("/admin/punch-rejections")
+def list_punch_rejections_endpoint(
+    days: int = 7,
+    admin=Depends(require_admin_user),
+):
+    """Batidas que o servidor recusou nos ultimos [days] dias (relogio do
+    celular mexido, offline com mais de 48 horas, GPS fora do Brasil), mais
+    novas primeiro. Para a aba Conferencia."""
+    days = max(1, min(int(days), 31))
+    since = (_local_now() - timedelta(days=days)).isoformat()
+    db = get_firestore_admin()
+    items = [
+        serialize_firestore_document(item)
+        for item in db.collection("punch_rejections").where("created_at_local", ">=", since).stream()
+    ]
+    items.sort(key=lambda item: str(item.get("created_at_local") or ""), reverse=True)
+    return {"items": items[:200]}
 
 def _resolve_user_ref(db, user_id: Optional[str], nome: Optional[str]):
     """Acha a pessoa pelo id (se vier) ou pelo nome (o que contem o texto, sem

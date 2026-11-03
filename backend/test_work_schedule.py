@@ -50,6 +50,10 @@ main = _import_main()
 needs_main = unittest.skipIf(main is None, "dependencias do main.py ausentes")
 
 
+# GPS de uma batida em Cuiaba (MT).
+CUIABA = {"latitude": -15.6, "longitude": -56.1}
+
+
 def _call(result):
     """Chama o endpoint como o FastAPI: os que so fazem trabalho bloqueante sao
     `def` (rodam fora do event loop); os que esperam HTTP sao `async def`."""
@@ -1457,7 +1461,7 @@ class DeviceTimeZoneTest(unittest.TestCase):
         return datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
 
     def punch(self, user=None, **fields):
-        values = {"record_type": "check_in", "client_record_id": f"punch{next(self.ids):04d}"}
+        values = {"record_type": "check_in", "client_record_id": f"punch{next(self.ids):04d}", **CUIABA}
         values.update(fields)
         return _call(main.time_record_punch_endpoint(main.TimeRecordPunchRequest(**values), user or self.employee))
 
@@ -1507,6 +1511,7 @@ class DeviceTimeZoneTest(unittest.TestCase):
             payload = main.SchedulePunchRequest(
                 record_type="check_in", timestamp=self.mt_now().isoformat(),
                 client_record_id="interno0001", utc_offset_minutes=-240, time_zone="America/Cuiaba",
+                **CUIABA,
             )
             result = _call(main.schedule_controlled_punch_endpoint(payload, self.intern))
         self.assertEqual(result["status"], "created")
@@ -1857,6 +1862,289 @@ class CpfAccessTest(unittest.TestCase):
         self.db.store["users"]["outro"] = {"cpf": VALID_CPF}
         self.assertEqual(self.status_of(self.update, uid, cpf=VALID_CPF)[0], 409)
         self.assertEqual(self.status_of(self.update, uid, cpf="12345678900")[0], 400)
+
+
+def _utc_iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@needs_main
+class PunchSecurityTest(unittest.TestCase):
+    """Seguranca da batida (03/11/2026): fuso preso ao turno, relogio da batida
+    offline conferido pelo ultimo contato com o servidor, janela de 48 horas,
+    GPS obrigatorio e a aba Conferencia."""
+
+    MT = timezone(timedelta(hours=-4))
+    employee = {"id": "u1", "role": "employee", "name": "Guilherme"}
+    intern = {"id": "u2", "role": "intern", "name": "Estagiario"}
+    admin = {"id": "a1", "role": "admin", "name": "Admin", "email": "a@x"}
+    manager = {"id": "g1", "role": "manager", "name": "Gestor"}
+
+    def setUp(self):
+        self.db = _FakeDb()
+        patches = [
+            mock.patch.object(main, "get_firestore_admin", return_value=self.db),
+            mock.patch.object(main, "firestore", types.SimpleNamespace(SERVER_TIMESTAMP="ts")),
+            mock.patch.object(main, "_create_user_notification", lambda *args, **kwargs: None),
+            mock.patch.object(main, "_send_user_push", lambda *args, **kwargs: None),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ids = itertools.count(1)
+
+    # --- auxiliares ---
+
+    def utc_now(self):
+        return datetime.now(timezone.utc)
+
+    def wall(self, moment: datetime, offset_minutes: int = -180) -> str:
+        """Hora de parede do celular (sem fuso), como o app manda."""
+        return moment.astimezone(timezone(timedelta(minutes=offset_minutes))).replace(tzinfo=None).isoformat()
+
+    def punch(self, user=None, **fields):
+        values = {
+            "record_type": "check_in", "client_record_id": f"punch{next(self.ids):04d}",
+            "utc_offset_minutes": -180, "time_zone": "America/Sao_Paulo", **CUIABA,
+        }
+        values.update(fields)
+        return _call(main.time_record_punch_endpoint(main.TimeRecordPunchRequest(**values), user or self.employee))
+
+    def offline(self, tapped: datetime, server_anchor=None, device_anchor=None, **fields):
+        """Batida offline feita em [tapped] (hora do relogio do celular)."""
+        values = {"offline": True, "timestamp": self.wall(tapped)}
+        if server_anchor is not None:
+            values["server_anchor"] = _utc_iso(server_anchor)
+            values["device_anchor"] = _utc_iso(device_anchor or server_anchor)
+        values.update(fields)
+        return self.punch(**values)
+
+    def refused(self, call, *args, **kwargs):
+        with self.assertRaises(main.HTTPException) as ctx:
+            call(*args, **kwargs)
+        self.assertEqual(ctx.exception.status_code, 400)
+        return ctx.exception.detail
+
+    def stored(self, doc_id):
+        return self.db.store["time_records"][doc_id]
+
+    def rejections(self):
+        return list(self.db.store.get("punch_rejections", {}).values())
+
+    def assert_near(self, value, expected, tolerance=timedelta(minutes=1)):
+        moment = datetime.fromisoformat(value)
+        self.assertLess(abs(moment - expected), tolerance, f"{value} longe de {expected}")
+
+    # --- GPS ---
+
+    def test_online_punch_without_gps_is_refused(self):
+        detail = self.refused(self.punch, latitude=None, longitude=None)
+        self.assertIn("localizacao", detail)
+        self.assertNotIn("time_records", {k: v for k, v in self.db.store.items() if v})
+        # Falta de GPS nao e suspeita: nao entra nas tentativas recusadas.
+        self.assertEqual(self.rejections(), [])
+
+    def test_gps_outside_brazil_is_refused_and_logged(self):
+        self.refused(self.punch, latitude=38.7, longitude=-9.1)  # Lisboa
+        self.refused(self.punch, latitude=0.0, longitude=0.0)
+        reasons = {item["reason"] for item in self.rejections()}
+        self.assertEqual(reasons, {"location_outside_brazil"})
+        self.assertEqual(self.rejections()[0]["user_name"], "Guilherme")
+
+    def test_intern_punch_needs_gps(self):
+        payload = main.SchedulePunchRequest(record_type="check_in", client_record_id="interno0001", utc_offset_minutes=-180)
+        with mock.patch.object(main, "_is_start_within_schedule", return_value=True):
+            detail = self.refused(lambda: _call(main.schedule_controlled_punch_endpoint(payload, self.intern)))
+        self.assertIn("localizacao", detail)
+        # Fila offline de app antigo (sem a ancora do relogio) nao pede GPS.
+        self.assertFalse(main._location_required(main.SchedulePunchRequest(record_type="check_in", offline=True)))
+        self.assertTrue(main._location_required(main.SchedulePunchRequest(
+            record_type="check_in", offline=True, server_anchor="2026-11-03T10:00:00Z")))
+
+    def test_old_offline_queue_without_anchor_passes_without_gps_but_is_flagged(self):
+        # Fila de app antigo (GPS ainda opcional, sem a ancora do relogio).
+        tapped = self.utc_now() - timedelta(hours=3)
+        result = self.offline(tapped, latitude=None, longitude=None)
+        record = self.stored(result["id"])
+        self.assertTrue(record["offline_without_anchor"])
+        self.assertTrue(record["synced_from_offline"])
+
+    def test_forgotten_exit_needs_no_gps(self):
+        entry = self.punch()
+        result = self.punch(record_type="check_out", kind="forgotten_exit", ref_record_id=entry["id"],
+                            latitude=None, longitude=None)
+        self.assertEqual(result["status"], "created")
+
+    # --- fuso preso ao turno ---
+
+    def test_exit_follows_the_time_zone_of_the_entry(self):
+        # Entrada em MT (UTC-4); antes da saida o celular vai para UTC-3.
+        now = self.utc_now()
+        self.punch(timestamp=self.wall(now, -240), utc_offset_minutes=-240, time_zone="America/Cuiaba")
+        exit_ = self.punch(record_type="check_out", timestamp=self.wall(now, -180))
+        record = self.stored(exit_["id"])
+        # Gravada na hora de MT, como a entrada: o turno nao ganha uma hora.
+        self.assert_near(record["timestamp"], now.astimezone(self.MT).replace(tzinfo=None))
+        self.assertEqual((record["utc_offset_minutes"], record["time_zone"]), (-240, "America/Cuiaba"))
+        self.assertEqual(record["device_utc_offset_minutes"], -180)
+
+    def test_break_of_a_brasilia_entry_stays_in_brasilia(self):
+        now = self.utc_now()
+        self.punch(timestamp=self.wall(now))
+        pause = self.punch(record_type="break_start", timestamp=self.wall(now, -240), utc_offset_minutes=-240)
+        record = self.stored(pause["id"])
+        self.assert_near(record["timestamp"], now.astimezone(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None))
+        self.assertEqual(record["utc_offset_minutes"], -180)
+        self.assertEqual(record["device_utc_offset_minutes"], -240)
+
+    def test_old_entry_without_zone_locks_to_brasilia(self):
+        now = self.utc_now()
+        sp_wall = self.wall(now)
+        self.db.store.setdefault("time_records", {})["velha"] = {
+            "user_id": "u1", "record_type": "check_in", "timestamp": self.wall(now - timedelta(hours=4)),
+        }
+        exit_ = self.punch(record_type="check_out", timestamp=self.wall(now, -300), utc_offset_minutes=-300)
+        self.assert_near(self.stored(exit_["id"])["timestamp"], datetime.fromisoformat(sp_wall))
+
+    # --- relogio da batida offline ---
+
+    def test_offline_punch_with_clock_set_back_after_last_contact_is_refused(self):
+        # Ultimo contato ha 1h; o celular foi atrasado e a "entrada" ficou ha 2h.
+        now = self.utc_now()
+        detail = self.refused(self.offline, now - timedelta(hours=2), server_anchor=now - timedelta(hours=1))
+        self.assertIn("hora do celular foi alterada", detail)
+        self.assertNotIn("time_records", {k: v for k, v in self.db.store.items() if v})
+        [rejection] = self.rejections()
+        self.assertEqual((rejection["reason"], rejection["source"], rejection["user_id"]), ("clock_moved_back", "ponto", "u1"))
+
+    def test_offline_punch_is_corrected_by_the_clock_error_seen_at_last_contact(self):
+        # Celular 10 min atrasado o tempo todo: a batida vale 10 min depois.
+        now = self.utc_now()
+        real = now - timedelta(minutes=30)
+        anchor = now - timedelta(hours=1)
+        result = self.offline(real - timedelta(minutes=10), server_anchor=anchor,
+                              device_anchor=anchor - timedelta(minutes=10))
+        record = self.stored(result["id"])
+        self.assert_near(record["timestamp"], datetime.fromisoformat(self.wall(real)))
+        self.assertEqual(record["clock_skew_seconds"], -600)
+        self.assert_near(record["device_timestamp"], datetime.fromisoformat(self.wall(real - timedelta(minutes=10))))
+        self.assertIn(record["offline_delay_minutes"], range(29, 32))
+        self.assertNotIn("offline_without_anchor", record)
+
+    def test_stopwatch_since_last_contact_catches_a_smaller_set_back(self):
+        # App aberto desde o contato de 3h atras; a batida foi ha 10 min, mas o
+        # celular foi atrasado 1h. So pela ancora passaria (continua depois do
+        # contato); o cronometro (2h50 desde o contato) mostra a diferenca.
+        now = self.utc_now()
+        anchor = now - timedelta(hours=3)
+        elapsed = int(timedelta(hours=2, minutes=50).total_seconds() * 1000)
+        self.refused(self.offline, now - timedelta(minutes=70), server_anchor=anchor, anchor_elapsed_ms=elapsed)
+        # Cronometro que parou com o celular dormindo (conta menos) nao recusa a batida certa.
+        lagging = int(timedelta(hours=1).total_seconds() * 1000)
+        result = self.offline(now - timedelta(minutes=10), server_anchor=anchor, anchor_elapsed_ms=lagging)
+        self.assertEqual(result["status"], "created")
+
+    def test_offline_punch_in_the_future_is_refused(self):
+        now = self.utc_now()
+        self.refused(self.offline, now + timedelta(minutes=10), server_anchor=now - timedelta(hours=1))
+        self.assertEqual(self.rejections()[0]["reason"], "clock_ahead")
+
+    def test_offline_window_is_48_hours(self):
+        now = self.utc_now()
+        detail = self.refused(self.offline, now - timedelta(hours=49), server_anchor=now - timedelta(hours=50))
+        self.assertIn("48 horas", detail)
+        self.assertEqual(self.rejections()[0]["reason"], "too_old")
+        result = self.offline(now - timedelta(hours=47), server_anchor=now - timedelta(hours=48))
+        self.assertEqual(result["status"], "created")
+
+    def test_anchor_from_the_future_is_refused(self):
+        now = self.utc_now()
+        self.refused(self.offline, now - timedelta(minutes=5), server_anchor=now + timedelta(hours=1))
+        self.assertEqual(self.rejections()[0]["reason"], "invalid_anchor")
+
+    def test_online_punch_far_from_server_clock_is_logged(self):
+        self.refused(self.punch, timestamp=self.wall(self.utc_now() - timedelta(hours=1)))
+        self.assertEqual(self.rejections()[0]["reason"], "clock_far_online")
+
+    def test_resent_rejection_overwrites_instead_of_duplicating(self):
+        now = self.utc_now()
+        for _ in range(2):
+            self.refused(self.offline, now - timedelta(hours=2), server_anchor=now - timedelta(hours=1),
+                         client_record_id="filaoffline1")
+        self.assertEqual(list(self.db.store["punch_rejections"]), ["filaoffline1_clock_moved_back"])
+
+    def test_intern_offline_punch_checks_the_clock_too(self):
+        now = self.utc_now()
+        payload = main.SchedulePunchRequest(
+            record_type="check_in", client_record_id="interno0002", offline=True,
+            timestamp=self.wall(now - timedelta(hours=2)), utc_offset_minutes=-180,
+            server_anchor=_utc_iso(now - timedelta(hours=1)), device_anchor=_utc_iso(now - timedelta(hours=1)),
+            **CUIABA,
+        )
+        with mock.patch.object(main, "_is_start_within_schedule", return_value=True):
+            self.refused(lambda: _call(main.schedule_controlled_punch_endpoint(payload, self.intern)))
+        self.assertEqual(self.rejections()[0]["source"], "estagiario")
+
+    def test_daily_entry_offline_checks_the_clock_too(self):
+        user = {"id": "u3", "role": "employee", "name": "Diarista", "daily_mode": True}
+        now = self.utc_now()
+        payload = main.DailyEntryRequest(
+            offline=True, timestamp=self.wall(now - timedelta(hours=2)), utc_offset_minutes=-180,
+            server_anchor=_utc_iso(now - timedelta(hours=1)), device_anchor=_utc_iso(now - timedelta(hours=1)),
+        )
+        self.refused(lambda: _call(main.create_daily_entry_endpoint(payload, user)))
+        self.assertEqual(self.rejections()[0]["source"], "diaria")
+        ok = main.DailyEntryRequest(
+            offline=True, timestamp=self.wall(now - timedelta(minutes=30)), utc_offset_minutes=-180,
+            server_anchor=_utc_iso(now - timedelta(hours=1)), device_anchor=_utc_iso(now - timedelta(hours=1)),
+        )
+        entry = _call(main.create_daily_entry_endpoint(ok, user))
+        self.assertEqual(entry["status"], "created")
+
+    # --- aba Conferencia ---
+
+    def test_review_marks_records_and_writes_audit(self):
+        first = self.punch()
+        second = self.punch(record_type="check_out")
+        payload = main.AdminTimeRecordReviewRequest(record_ids=[first["id"], second["id"], first["id"], "naoexiste1"])
+        result = _call(main.review_time_records_endpoint(payload, self.manager))
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(self.stored(first["id"])["reviewed_by"], "g1")
+        [audit] = self.db.store["time_record_audits"].values()
+        self.assertEqual((audit["action"], audit["record_ids"]), ("review", [first["id"], second["id"]]))
+        self.refused(lambda: _call(main.review_time_records_endpoint(
+            main.AdminTimeRecordReviewRequest(record_ids=[" "]), self.admin)))
+
+    def test_rejection_list_is_recent_first(self):
+        old = (main._local_now() - timedelta(days=10)).isoformat()
+        self.db.store["punch_rejections"] = {
+            "a": {"user_id": "u1", "reason": "too_old", "created_at_local": (main._local_now() - timedelta(days=2)).isoformat()},
+            "b": {"user_id": "u1", "reason": "clock_moved_back", "created_at_local": main._local_now().isoformat()},
+            "c": {"user_id": "u1", "reason": "future", "created_at_local": old},
+        }
+        items = _call(main.list_punch_rejections_endpoint(7, self.admin))["items"]
+        self.assertEqual([item["id"] for item in items], ["b", "a"])
+
+
+@needs_main
+class ServerTimeHeaderTest(unittest.TestCase):
+    """Toda resposta leva a hora do servidor (X-Server-Time), que o app guarda."""
+
+    def test_header_is_added(self):
+        sent = []
+
+        async def inner(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        async def collect(message):
+            sent.append(message)
+
+        asyncio.run(main._ServerTimeHeader(inner)({"type": "http"}, None, collect))
+        headers = dict(sent[0]["headers"])
+        stamp = datetime.fromisoformat(headers[b"x-server-time"].decode().replace("Z", "+00:00"))
+        self.assertLess(abs(stamp - datetime.now(timezone.utc)), timedelta(seconds=5))
+        self.assertEqual(sent[1]["body"], b"ok")
 
 
 if __name__ == "__main__":
