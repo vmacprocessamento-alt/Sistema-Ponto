@@ -11,6 +11,7 @@ import '../utils/cpf.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import 'daily_entries_admin_screen.dart';
+import 'punch_review_screen.dart';
 import 'team_records_screen.dart';
 import '../widgets/content_width.dart';
 
@@ -53,13 +54,16 @@ class _AdminScreenState extends State<AdminScreen> {
     }
 
     return DefaultTabController(
-      length: _isAdmin ? 5 : 4,
+      length: _isAdmin ? 6 : 5,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('PAINEL DO GESTOR',
               style:
                   TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2)),
           bottom: TabBar(
+            // Seis abas nao cabem no celular: rolam para o lado.
+            isScrollable: true,
+            tabAlignment: TabAlignment.center,
             labelColor: wineColor,
             unselectedLabelColor: Colors.grey,
             indicatorColor: wineColor,
@@ -67,6 +71,8 @@ class _AdminScreenState extends State<AdminScreen> {
               const Tab(icon: Icon(Icons.monitor_heart), text: 'Resumo'),
               const Tab(icon: Icon(Icons.people), text: 'Usuários'),
               const Tab(icon: Icon(Icons.list_alt), text: 'Registros'),
+              const Tab(
+                  icon: Icon(Icons.fact_check_outlined), text: 'Conferência'),
               const Tab(icon: Icon(Icons.access_time), text: 'Liberações'),
               if (_isAdmin)
                 const Tab(
@@ -79,6 +85,7 @@ class _AdminScreenState extends State<AdminScreen> {
             const _TeamStatusTab(),
             const _UsersListTab(),
             TeamRecordsScreen(canEdit: _isAdmin),
+            const PunchReviewScreen(),
             _ScheduleApprovalsTab(isAdmin: _isAdmin),
             if (_isAdmin) const _ManualEntryTab(),
           ],

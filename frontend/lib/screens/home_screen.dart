@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import '../services/api_service.dart';
+import '../services/server_clock.dart';
 import '../services/notification_service.dart';
 import '../services/update_service.dart';
 import '../utils/shift_records.dart';
@@ -779,9 +780,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Por que a ultima tentativa de localizacao falhou (para o aviso).
+  bool _locationBlocked = false;
+
   /// Posicao para a batida; null sem permissao ou sem sinal. Nunca lanca:
   /// pode ficar sem ninguem esperando (batida cancelada numa confirmacao).
   Future<Position?> _punchPosition() async {
+    _locationBlocked = false;
     try {
       var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
@@ -789,23 +794,66 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
       if (permission != LocationPermission.always &&
           permission != LocationPermission.whileInUse) {
+        _locationBlocked = true;
         return null;
       }
-      try {
-        return await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high,
-          timeLimit: const Duration(seconds: 5),
-        );
-      } catch (e) {
-        // Sem sinal no prazo a batida sai sem localizacao (o navegador nao
-        // tem "ultima posicao conhecida").
-        debugPrint('Localizacao atual indisponivel: $e');
-        return null;
+      // GPS obrigatorio (03/11/2026): mais prazo que os 5 s de antes. Primeiro
+      // o GPS; sem sinal (dentro de predio), a localizacao aproximada.
+      for (final attempt in const [
+        (LocationAccuracy.high, Duration(seconds: 12)),
+        (LocationAccuracy.low, Duration(seconds: 8)),
+      ]) {
+        try {
+          return await Geolocator.getCurrentPosition(
+            desiredAccuracy: attempt.$1,
+            timeLimit: attempt.$2,
+          );
+        } catch (e) {
+          debugPrint('Localizacao indisponivel (${attempt.$1}): $e');
+        }
       }
+      return null;
     } catch (e) {
       debugPrint('Erro ao obter localização: $e');
       return null;
     }
+  }
+
+  /// GPS OBRIGATORIO NA BATIDA (03/11/2026): sem a localizacao a batida nao
+  /// sai (o servidor recusa). Explica como ligar; true = tentar de novo.
+  Future<bool> _askForLocation() async {
+    final blocked = _locationBlocked;
+    final again = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Localização obrigatória'),
+        content: Text(blocked
+            ? 'Para bater o ponto é preciso a localização do celular, e o '
+                'navegador está bloqueando.\n\n'
+                'Android (Chrome): toque no cadeado ao lado do endereço do '
+                'site > Permissões > Localização > Permitir.\n\n'
+                'iPhone: Ajustes > Privacidade > Serviços de Localização > '
+                'Safari > Ao Usar o App.'
+            : 'Para bater o ponto é preciso a localização do celular, e ela '
+                'não veio a tempo.\n\n'
+                'Ligue a Localização (GPS) nas configurações rápidas do '
+                'celular. Em lugar fechado, chegue perto de uma porta ou '
+                'janela e tente de novo.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar', style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: wineColor),
+            child: const Text('Tentar de novo',
+                style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    return again == true;
   }
 
   Future<void> _registerPunch(
@@ -820,11 +868,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // A batida vale a hora do toque, nao a de depois da conferencia abaixo e
     // da localizacao (ate ~25s com sinal ruim): a saida tocada 19:34:50 ia
     // como 19:35:10, depois do limite, e pedia liberacao de hora extra.
-    final tappedAt = DateTime.now();
+    var tappedAt = DateTime.now();
     // GPS comeca ja, junto com a conferencia abaixo e as confirmacoes: antes
     // so comecava depois delas e somava ate 5 s a cada batida (dentro de
     // predio o sinal costuma gastar o prazo inteiro).
     final positionFuture = _punchPosition();
+    // Hora do servidor no ultimo contato, pega no toque: vai com a batida se
+    // ela cair na fila offline (ServerClock).
+    var clockAnchor = await ServerClock.anchorFields();
 
     // Confere de novo antes de QUALQUER batida: a tela pode estar velha (app
     // aberto desde ontem, ponto batido em outro aparelho). Ex.: o celular
@@ -922,8 +973,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() => _isLoading = true);
 
     try {
-      // 1. Localizacao (pedida no toque, ver _punchPosition)
-      final position = await positionFuture;
+      // 1. Localizacao (pedida no toque, ver _punchPosition). Obrigatoria,
+      // menos na saida esquecida (o servidor calcula a hora dela).
+      var position = await positionFuture;
+      while (position == null && !forgottenExit) {
+        if (!mounted) return;
+        setState(() => _isLoading = false);
+        if (!await _askForLocation() || !mounted) return;
+        setState(() => _isLoading = true);
+        position = await _punchPosition();
+        // A batida passa a valer a hora em que a localizacao chegou.
+        tappedAt = DateTime.now();
+        clockAnchor = await ServerClock.anchorFields();
+      }
 
       // 2. Estagiarios usam validacao autoritativa do backend na entrada/saida.
       final attemptedAt = timestamp ?? tappedAt;
@@ -944,6 +1006,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               latitude: position?.latitude,
               longitude: position?.longitude,
               id: punchId,
+              clockAnchor: clockAnchor,
             );
         // Batidas anteriores ainda na fila (a entrada das 13:30 feita sem
         // internet): esta vai atras delas, na ordem, em vez de chegar antes
@@ -1010,6 +1073,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           longitude: position?.longitude,
           punchKind: forgottenExit ? 'forgotten_exit' : null,
           refRecordId: forgottenShiftId,
+          clockAnchor: clockAnchor,
         );
       }
 

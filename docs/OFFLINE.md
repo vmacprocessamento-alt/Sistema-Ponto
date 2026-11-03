@@ -23,9 +23,16 @@ aparelho e sobem sozinhos quando o sinal volta.
 - **Primeira vez precisa de internet.** O cache so existe depois de uma
   abertura online completa (tela de ponto carregada). Oriente a equipe a abrir
   o app no escritorio antes de ir para o campo.
-- **A hora registrada e a do aparelho.** Igual ao modo online: o campo
-  `timestamp` vem do celular; `created_at` (hora do servidor) so e preenchido
-  quando o registro chega ao Firestore. Para auditar, compare os dois.
+- **A hora registrada e a do aparelho, conferida.** A batida offline vale a
+  hora do celular no toque, corrigida pelo erro do relogio visto no ultimo
+  contato com o servidor (`services/server_clock.dart`). O servidor recusa a
+  que ficar antes desse contato (relogio atrasado de proposito), no futuro ou
+  com mais de **48 horas**; a recusa aparece na fila do aparelho com o motivo
+  e na aba Conferencia da Gestao. Detalhes em ARCHITECTURE.md, "Seguranca da
+  batida".
+- **GPS obrigatorio, tambem offline.** O GPS do celular funciona sem
+  internet, mas pode demorar mais em lugar fechado; o app espera ate ~20 s e,
+  sem localizacao, explica como ligar e oferece "Tentar de novo".
 - **Instalar como app** (menu do navegador > "Adicionar a tela inicial") e
   recomendado: o navegador preserva melhor o cache de apps instalados.
 - Limpar os dados do site no navegador apaga o cache E a fila de pontos que

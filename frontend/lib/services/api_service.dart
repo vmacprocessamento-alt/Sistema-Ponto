@@ -12,6 +12,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_config.dart';
+import 'server_clock.dart';
 import '../utils/work_schedule_rules.dart' show isInternProfile;
 import '../utils/chat_timestamp.dart';
 import '../utils/cpf.dart';
@@ -93,6 +94,10 @@ class ApiService {
   static const int _recordsCacheDays = 15;
   static String get backendUrl => AppConfig.backendUrl;
 
+  /// Todo pedido ao backend passa por aqui: cada resposta traz a hora do
+  /// servidor, guardada para conferir a batida offline (server_clock.dart).
+  static final http.Client _api = ServerClockClient();
+
   Future<Map<String, String>> _authorizedHeaders() async {
     final user = _auth.currentUser;
     if (user == null) throw Exception('Usuario nao autenticado.');
@@ -121,7 +126,7 @@ class ApiService {
 
   Future<List<Map<String, dynamic>>> getSignatureDocuments(
       {required bool admin}) async {
-    final response = await http
+    final response = await _api
         .get(
           Uri.parse(admin
               ? '$backendUrl/admin/signature-documents'
@@ -267,7 +272,7 @@ class ApiService {
 
   Future<Map<String, dynamic>> refreshSignatureDocument(
       String documentId) async {
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/signature-documents/$documentId/refresh'),
           headers: await _authorizedHeaders(),
@@ -282,7 +287,7 @@ class ApiService {
   }
 
   Future<void> deleteSignatureDocument(String documentId) async {
-    final response = await http
+    final response = await _api
         .delete(
           Uri.parse('$backendUrl/admin/signature-documents/$documentId'),
           headers: await _authorizedHeaders(),
@@ -295,7 +300,7 @@ class ApiService {
   }
 
   Future<List<Map<String, dynamic>>> getSignatureNotifications() async {
-    final response = await http
+    final response = await _api
         .get(
           Uri.parse('$backendUrl/signature-notifications'),
           headers: await _authorizedHeaders(),
@@ -311,7 +316,7 @@ class ApiService {
   }
 
   Future<void> markSignatureNotificationsRead() async {
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/signature-notifications/read'),
           headers: await _authorizedHeaders(),
@@ -387,7 +392,7 @@ class ApiService {
     final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
     final mark = '$version|$device|$today';
     if (prefs.getString(_reportedAppVersionKey) == mark) return;
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/me/app-version'),
           headers: {
@@ -625,7 +630,7 @@ class ApiService {
 
     final http.Response response;
     try {
-      response = await http
+      response = await _api
           .post(
             Uri.parse('$backendUrl/auth/cpf-login'),
             headers: {'Content-Type': 'application/json'},
@@ -752,7 +757,7 @@ class ApiService {
   /// responde 400 "Informe a senha atual".
   Future<void> changeOwnPassword(String newPassword,
       {String? currentPassword}) async {
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/me/password'),
           headers: {
@@ -840,7 +845,7 @@ class ApiService {
     final value = loginId.trim();
     final http.Response response;
     try {
-      response = await http
+      response = await _api
           .post(
             Uri.parse('$backendUrl/auth/password-reset'),
             headers: {'Content-Type': 'application/json'},
@@ -1160,6 +1165,7 @@ class ApiService {
             // liberacao e ficava parada.
             closeAtScheduledEnd: record['close_at_scheduled_end'] == true,
             timeZoneFields: storedTimeZoneFields(record),
+            clockAnchor: ServerClock.storedAnchorFields(record),
           );
           if (result['status'] == 'approval_required') {
             // A saida depois do limite passa com a liberacao da hora extra. A
@@ -1176,7 +1182,8 @@ class ApiService {
             continue;
           }
           // Pelo backend, com a hora do aparelho no momento da batida (no
-          // maximo 7 dias). A entrada com um turno velho aberto antes dela
+          // maximo 48 horas, conferida pela hora do servidor no ultimo
+          // contato). A entrada com um turno velho aberto antes dela
           // fecha esse turno como saida esquecida la (o app fazia isso
           // gravando direto no Firestore).
           await _cacheSentRecord(await _sendPunch(record, offline: true));
@@ -1231,6 +1238,9 @@ class ApiService {
     String? punchKind,
     String? refRecordId,
     Map<String, dynamic>? extraFields,
+    // Hora do servidor no ultimo contato antes do toque (ServerClock), para
+    // a fila offline. Null: a de agora.
+    Map<String, dynamic>? clockAnchor,
   }) async {
     final currentUser = _auth.currentUser;
     final cachedUser = await getCachedCurrentUser();
@@ -1241,6 +1251,11 @@ class ApiService {
     }
     final now = DateTime.now();
     final recordTimestamp = timestamp ?? now.toIso8601String();
+    // Hora do servidor no ultimo contato antes do toque: se a batida for
+    // para a fila, o servidor confere o relogio do celular por ela.
+    final anchor = userId != null
+        ? const <String, dynamic>{}
+        : clockAnchor ?? await ServerClock.anchorFields();
 
     if (userId != null) {
       final recordData = {
@@ -1297,6 +1312,7 @@ class ApiService {
     }
     final offlineRecord = {
       ...punch,
+      ...anchor,
       'offline': true,
       'sync_status': 'pending',
       'created_at_local': now.toIso8601String(),
@@ -1324,7 +1340,7 @@ class ApiService {
         ref = id.substring(prefix.key.length);
       }
     }
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/time-records/punch'),
           headers: {
@@ -1346,6 +1362,8 @@ class ApiService {
             // Batida da fila de antes do fuso existir vai sem: o servidor
             // usa Brasilia, como antes.
             ...storedTimeZoneFields(punch),
+            // Hora do servidor no ultimo contato antes da batida offline.
+            if (offline) ...ServerClock.storedAnchorFields(punch),
           }),
         )
         .timeout(const Duration(seconds: 30));
@@ -1386,6 +1404,9 @@ class ApiService {
     double? longitude,
     String? id,
     bool closeAtScheduledEnd = false,
+    // Hora do servidor no ultimo contato antes do toque
+    // (ServerClock.anchorFields); null: a de agora.
+    Map<String, dynamic>? clockAnchor,
   }) async {
     final cachedUser = await getCachedCurrentUser();
     final userId = _auth.currentUser?.uid ?? cachedUser?['id']?.toString();
@@ -1406,6 +1427,7 @@ class ApiService {
       'longitude': longitude,
       if (closeAtScheduledEnd) 'close_at_scheduled_end': true,
       ...deviceTimeZoneFields(now),
+      ...(clockAnchor ?? await ServerClock.anchorFields()),
       'offline': true,
       'sync_status': 'pending',
       'created_at_local': now.toIso8601String(),
@@ -1834,8 +1856,10 @@ class ApiService {
       (error is _DailyEntryHttpException && error.temporary);
 
   Future<Map<String, dynamic>> _postDailyEntry(
-      {DateTime? offlineAt, Map<String, dynamic>? timeZoneFields}) async {
-    final response = await http
+      {DateTime? offlineAt,
+      Map<String, dynamic>? timeZoneFields,
+      Map<String, dynamic>? clockAnchor}) async {
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/daily-entries'),
           headers: {
@@ -1847,6 +1871,7 @@ class ApiService {
             if (offlineAt != null) 'timestamp': offlineAt.toIso8601String(),
             // O dia da diaria e o do lugar onde a pessoa esta.
             ...(timeZoneFields ?? deviceTimeZoneFields(offlineAt)),
+            if (offlineAt != null) ...?clockAnchor,
           }),
         )
         .timeout(const Duration(seconds: 20));
@@ -1862,6 +1887,7 @@ class ApiService {
   /// no aparelho; syncPendingDailyEntries envia depois).
   Future<Map<String, dynamic>> addDailyEntry() async {
     final tappedAt = DateTime.now();
+    final clockAnchor = await ServerClock.anchorFields();
     try {
       final entry = await _postDailyEntry();
       await _cacheDailyEntries([entry]);
@@ -1869,7 +1895,7 @@ class ApiService {
     } catch (e) {
       if (!_isTemporaryDailyFailure(e)) rethrow;
       debugPrint('Diaria guardada no aparelho para enviar depois: $e');
-      return _queueDailyEntry(tappedAt);
+      return _queueDailyEntry(tappedAt, clockAnchor);
     }
   }
 
@@ -1893,7 +1919,8 @@ class ApiService {
     await prefs.setString(key, jsonEncode(items));
   }
 
-  Future<Map<String, dynamic>> _queueDailyEntry(DateTime at) async {
+  Future<Map<String, dynamic>> _queueDailyEntry(
+      DateTime at, Map<String, dynamic> clockAnchor) async {
     final uid = await _localUserId();
     if (uid == null) {
       throw Exception(
@@ -1904,6 +1931,7 @@ class ApiService {
       'date': dailyDayKey(at),
       'registered_at': at.toIso8601String(),
       ...deviceTimeZoneFields(at),
+      ...clockAnchor,
     };
     final queued = await _readJsonList(_pendingDailyEntriesKey);
     // Uma por dia tambem na fila: outro toque sem internet nao vira outra.
@@ -1934,7 +1962,7 @@ class ApiService {
   }
 
   /// Envia as diarias guardadas no aparelho. Devolve as que o servidor
-  /// recusou (ex.: mais de 7 dias sem internet), ja fora da fila e com o
+  /// recusou (ex.: mais de 48 horas sem internet), ja fora da fila e com o
   /// motivo em 'sync_error', para a tela avisar. Sem internet ou com o
   /// servidor fora do ar, as diarias continuam guardadas.
   Future<List<Map<String, dynamic>>> syncPendingDailyEntries() =>
@@ -1951,7 +1979,9 @@ class ApiService {
         }
         await _cacheDailyEntries([
           await _postDailyEntry(
-              offlineAt: at, timeZoneFields: storedTimeZoneFields(pending))
+              offlineAt: at,
+              timeZoneFields: storedTimeZoneFields(pending),
+              clockAnchor: ServerClock.storedAnchorFields(pending))
         ]);
       } catch (e) {
         if (_isTemporaryDailyFailure(e)) break;
@@ -2031,7 +2061,7 @@ class ApiService {
   /// direto do servidor. Outra pessoa: so admin ou gestor.
   Future<List<Map<String, dynamic>>> getDailyEntries(
       {required DateTime start, required DateTime end, String? userId}) async {
-    final response = await http
+    final response = await _api
         .get(
           Uri.parse('$backendUrl/daily-entries').replace(queryParameters: {
             'start': dailyDayKey(start),
@@ -2085,7 +2115,7 @@ class ApiService {
       {required String userId,
       required DateTime day,
       required String reason}) async {
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/admin/daily-entries'),
           headers: {
@@ -2109,7 +2139,7 @@ class ApiService {
   /// Admin apaga a diaria [entryId]; a copia fica na auditoria.
   Future<void> adminDeleteDailyEntry(
       {required String entryId, required String reason}) async {
-    final response = await http
+    final response = await _api
         .delete(
           Uri.parse(
               '$backendUrl/admin/daily-entries/${Uri.encodeComponent(entryId)}'),
@@ -2171,7 +2201,7 @@ class ApiService {
     required double dailyHours,
     bool dailyMode = false,
   }) async {
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/admin/users'),
           headers: {
@@ -2212,7 +2242,7 @@ class ApiService {
     Map<String, dynamic>? workScheduleOverride,
     bool dailyMode = false,
   }) async {
-    final response = await http
+    final response = await _api
         .put(
           Uri.parse('$backendUrl/admin/users/${userId.toString()}'),
           headers: {
@@ -2264,7 +2294,7 @@ class ApiService {
   }
 
   Future<List<Map<String, dynamic>>> getUserNotifications() async {
-    final response = await http
+    final response = await _api
         .get(
           Uri.parse('$backendUrl/notifications'),
           headers: await _authorizedHeaders(),
@@ -2297,7 +2327,7 @@ class ApiService {
   }
 
   Future<void> markUserNotificationsRead() async {
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/notifications/read'),
           headers: await _authorizedHeaders(),
@@ -2345,7 +2375,7 @@ class ApiService {
       final uri = Uri.parse('$backendUrl/work-schedule/effective').replace(
           queryParameters:
               shiftDay == null ? null : {'shift_day': shiftDayKey});
-      final response = await http
+      final response = await _api
           .get(uri, headers: await _authorizedHeaders())
           .timeout(const Duration(seconds: 20));
       final Map<String, dynamic> state;
@@ -2433,10 +2463,12 @@ class ApiService {
     // Fuso da batida. Null: o do celular agora (batida na hora). A fila
     // passa o que guardou (vazio para batida de antes do campo existir).
     Map<String, dynamic>? timeZoneFields,
+    // Batida da fila: a hora do servidor no ultimo contato antes dela.
+    Map<String, dynamic>? clockAnchor,
   }) async {
     // clientRecordId vira o id do ponto e torna o reenvio idempotente;
     // offline = batida feita sem internet e enviada agora (vale a hora dela).
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/work-schedule/punch'),
           headers: {
@@ -2454,6 +2486,7 @@ class ApiService {
             if (clientRecordId != null) 'client_record_id': clientRecordId,
             'offline': offline,
             ...(timeZoneFields ?? deviceTimeZoneFields()),
+            if (offline) ...?clockAnchor,
           }),
         )
         .timeout(const Duration(seconds: 30));
@@ -2517,7 +2550,7 @@ class ApiService {
     if (observation.length > 500) {
       throw Exception('A observacao deve ter no maximo 500 caracteres.');
     }
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse('$backendUrl/work-schedule/approval-requests'),
           headers: {
@@ -2559,7 +2592,7 @@ class ApiService {
       {String? status}) async {
     final uri = Uri.parse('$backendUrl/admin/work-schedule/approval-requests')
         .replace(queryParameters: status == null ? null : {'status': status});
-    final response = await http
+    final response = await _api
         .get(uri, headers: await _authorizedHeaders())
         .timeout(const Duration(seconds: 30));
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -2581,7 +2614,7 @@ class ApiService {
     String? reason,
   }) async {
     final action = approve ? 'approve' : 'reject';
-    final response = await http
+    final response = await _api
         .post(
           Uri.parse(
               '$backendUrl/admin/work-schedule/approval-requests/$requestId/$action'),
@@ -2607,7 +2640,7 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getGlobalWorkSchedule() async {
-    final response = await http
+    final response = await _api
         .get(
           Uri.parse('$backendUrl/admin/work-schedule/settings'),
           headers: await _authorizedHeaders(),
@@ -2626,7 +2659,7 @@ class ApiService {
 
   Future<Map<String, dynamic>> updateGlobalWorkSchedule(
       Map<String, dynamic> schedule) async {
-    final response = await http
+    final response = await _api
         .put(
           Uri.parse('$backendUrl/admin/work-schedule/settings'),
           headers: {
@@ -3103,7 +3136,7 @@ class ApiService {
     }
 
     final token = await currentUser.getIdToken();
-    final response = await http.delete(
+    final response = await _api.delete(
       Uri.parse('$backendUrl/admin/users/$targetId'),
       headers: {
         'Authorization': 'Bearer $token',
@@ -3179,7 +3212,7 @@ class ApiService {
   /// pelo backend: a copia do registro fica na auditoria com o motivo.
   Future<void> deleteTimeRecordAdmin(
       {required String recordId, required String reason}) async {
-    final response = await http
+    final response = await _api
         .delete(
           Uri.parse(
               '$backendUrl/admin/time-records/${Uri.encodeComponent(recordId)}'),
@@ -3193,6 +3226,48 @@ class ApiService {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(_apiError(response));
     }
+  }
+
+  /// Aba Conferencia: marca as batidas que o gestor ja conferiu (saem da
+  /// lista). Devolve quantas foram marcadas.
+  Future<int> reviewTimeRecords(List<String> recordIds) async {
+    final response = await _api
+        .post(
+          Uri.parse('$backendUrl/admin/time-records/review'),
+          headers: {
+            ...await _authorizedHeaders(),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'record_ids': recordIds}),
+        )
+        .timeout(const Duration(seconds: 60));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    return (decoded is Map ? decoded['count'] as num? : null)?.toInt() ?? 0;
+  }
+
+  /// Batidas que o servidor recusou nos ultimos [days] dias (relogio do
+  /// celular mexido, offline velha, GPS fora do Brasil), mais novas primeiro.
+  Future<List<Map<String, dynamic>>> getPunchRejections({int days = 7}) async {
+    final response = await _api
+        .get(
+          Uri.parse('$backendUrl/admin/punch-rejections')
+              .replace(queryParameters: {'days': '$days'}),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    final items = decoded is Map ? decoded['items'] : null;
+    if (items is! List) return [];
+    return items
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
   }
 
   Future<void> updateTimeRecordAdmin({

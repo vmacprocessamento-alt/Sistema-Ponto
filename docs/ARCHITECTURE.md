@@ -35,7 +35,7 @@ porta aberta para a internet; o acesso chega pelo túnel da Cloudflare
 
 | Dado | Quem grava | Por quê |
 |---|---|---|
-| Batida de ponto (todos) | **backend** (`/time-records/punch`, `/work-schedule/punch`) | hora do servidor online, até 7 dias de atraso offline, confere o turno aberto. As regras do Firestore não deixam o app gravar ponto. |
+| Batida de ponto (todos) | **backend** (`/time-records/punch`, `/work-schedule/punch`) | hora do servidor online, até 48 horas de atraso offline (relógio conferido), GPS obrigatório, confere o turno aberto. As regras do Firestore não deixam o app gravar ponto. |
 | Lançamento em lote do gestor | app, direto no Firestore | regra: só admin e gestor |
 | Edição de ponto | app do admin, direto (transação com auditoria) | regra: só admin |
 | Cadastro e edição de usuário, senha | **backend** (Admin SDK) | cria a conta no Auth com senha temporária aleatória |
@@ -85,6 +85,37 @@ de `firestore.rules`.
    campos (app antigo), vale Brasília. O fechamento automático de pausa mede a
    pausa no fuso dela, e a Gestão mostra o fuso das batidas feitas fora de
    Brasília.
+6. **Segurança da batida** (03/11/2026, versão 0.7):
+   - **Fuso preso ao turno.** A entrada define o fuso; pausas e saída do mesmo
+     turno gravam no fuso dela, qualquer que seja o do celular (trocar o fuso no
+     meio do turno rendia uma hora). O fuso do celular, se diferente, fica em
+     `device_utc_offset_minutes`.
+   - **Relógio da batida offline.** Toda resposta do backend leva
+     `X-Server-Time` (UTC). O app (`services/server_clock.dart`) guarda a do
+     último contato e a hora do celular no mesmo momento, e a batida offline
+     leva as duas (`server_anchor`, `device_anchor`) e, se o app não foi
+     fechado, o cronômetro desde o contato (`anchor_elapsed_ms`). O servidor
+     (`_offline_punch_moment`) corrige a hora pelo erro do relógio
+     (`clock_skew_seconds`) e recusa a batida que ficar antes do contato (ou
+     antes de contato + cronômetro), no futuro ou com mais de **48 horas**.
+     Fila de app antigo, sem as âncoras: só a janela, e o ponto fica com
+     `offline_without_anchor`.
+   - **GPS obrigatório**, dentro do Brasil. Sem ele o app não bate (explica como
+     ligar) e o servidor recusa. Ficam de fora a saída esquecida, o retorno
+     automático da pausa, o fechar no horário programado e a fila de app antigo.
+     A diária não pede GPS.
+   - **Tentativas recusadas** suspeitas (relógio mexido, offline velha, GPS fora
+     do Brasil, hora longe do servidor) vão para `punch_rejections`.
+   - **Aba Conferência** na Gestão (`screens/punch_review_screen.dart`): lista as
+     batidas para olhar (regras em `utils/punch_review.dart`: offline enviada 30
+     min+ depois, relógio 5 min+ diferente, entrada fora de Brasília, fuso
+     trocado no turno, sem GPS) com link do mapa, e as tentativas recusadas.
+     "Conferido" (`POST /admin/time-records/review`) grava `reviewed_at` e
+     `reviewed_by` no ponto e uma linha em `time_record_audits`.
+   - Limite que fica: sem internet não há relógio confiável. Adiantar a hora do
+     celular, bater a saída offline e só sincronizar depois que a hora real
+     passar não é provado pelo servidor; essa batida aparece na Conferência
+     (offline enviada muito depois).
 
 ### Autenticação no backend
 Toda rota autenticada recebe o token do Firebase (`Authorization: Bearer`).
