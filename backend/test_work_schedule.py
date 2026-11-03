@@ -2044,6 +2044,19 @@ class PunchSecurityTest(unittest.TestCase):
         result = self.offline(now - timedelta(minutes=10), server_anchor=anchor, anchor_elapsed_ms=lagging)
         self.assertEqual(result["status"], "created")
 
+    def test_clock_fixed_by_itself_after_last_contact_is_not_refused(self):
+        # No contato o celular estava 10 min adiantado; depois a hora automatica
+        # acertou. A batida de 1 min atras chega com a hora certa: corrigida
+        # pelo erro antigo ficaria antes do contato, mas a do celular faz sentido.
+        now = self.utc_now()
+        anchor = now - timedelta(minutes=5)
+        result = self.offline(now - timedelta(minutes=1), server_anchor=anchor,
+                              device_anchor=anchor + timedelta(minutes=10))
+        record = self.stored(result["id"])
+        self.assert_near(record["timestamp"], datetime.fromisoformat(self.wall(now - timedelta(minutes=1))))
+        self.assertEqual(record["clock_skew_seconds"], 600)
+        self.assertEqual(self.rejections(), [])
+
     def test_offline_punch_in_the_future_is_refused(self):
         now = self.utc_now()
         self.refused(self.offline, now + timedelta(minutes=10), server_anchor=now - timedelta(hours=1))

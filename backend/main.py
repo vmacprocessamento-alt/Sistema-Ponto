@@ -3352,6 +3352,8 @@ def _offline_punch_moment(db, user: dict, payload, punched_at: datetime, server_
       contato (anchor_elapsed_ms, cronometro que a hora do celular nao mexe), e
       a batida nao pode ficar antes de contato + esse tempo;
     - nada no futuro e no maximo 48 horas de atraso.
+    Se a hora corrigida nao fecha mas a do celular sim, vale a do celular (ele
+    acertou a hora sozinho depois do contato). So recusa quando nenhuma fecha.
     Recusada: vai para punch_rejections (aba Conferencia) e o app mostra o motivo.
     Sem as ancoras (fila de app antigo): so a janela, e o ponto fica marcado
     para conferencia (offline_without_anchor).
@@ -3375,14 +3377,23 @@ def _offline_punch_moment(db, user: dict, payload, punched_at: datetime, server_
             # O cronometro do navegador pode parar com o celular dormindo (conta
             # menos, nunca mais): serve so de piso, nunca de teto.
             floor = server_anchor + timedelta(milliseconds=elapsed)
-        if moment < floor - _CLOCK_TOLERANCE:
-            _reject_punch(db, user, payload, source, "clock_moved_back", _CLOCK_CHANGED_DETAIL)
-        if moment > server_now + _CLOCK_TOLERANCE:
-            _reject_punch(
-                db, user, payload, source, "clock_ahead",
-                "A hora do celular foi adiantada: esta batida offline ficou no futuro. "
-                "Ela foi recusada e o gestor foi avisado.",
-            )
+        def plausible(when: datetime) -> bool:
+            return floor - _CLOCK_TOLERANCE <= when <= server_now + _CLOCK_TOLERANCE
+
+        if not plausible(moment):
+            if plausible(punched_at):
+                # O celular acertou a hora sozinho (hora automatica) entre o
+                # contato e a batida: o erro visto no contato ja nao vale e a
+                # hora dele e a certa. Recusar aqui puniria quem nao mexeu.
+                moment = punched_at
+            elif moment > server_now + _CLOCK_TOLERANCE:
+                _reject_punch(
+                    db, user, payload, source, "clock_ahead",
+                    "A hora do celular foi adiantada: esta batida offline ficou no futuro. "
+                    "Ela foi recusada e o gestor foi avisado.",
+                )
+            else:
+                _reject_punch(db, user, payload, source, "clock_moved_back", _CLOCK_CHANGED_DETAIL)
         if abs(skew) >= timedelta(seconds=60):
             fields["clock_skew_seconds"] = int(skew.total_seconds())
     delay = server_now - moment
