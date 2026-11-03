@@ -9,7 +9,7 @@ import '../widgets/content_width.dart';
 
 /// ABA CONFERENCIA DA GESTAO (03/11/2026). Batidas que passaram mas merecem um
 /// olhar (offline enviada muito depois, relogio do celular diferente, outro
-/// fuso, sem GPS: utils/punch_review.dart) e as que o servidor recusou
+/// fuso: utils/punch_review.dart) e as que o servidor recusou
 /// (relogio mexido, offline velha, GPS fora do Brasil). O gestor confere e
 /// marca "Conferido"; a batida sai da lista.
 class PunchReviewScreen extends StatefulWidget {
@@ -220,9 +220,10 @@ class _PunchReviewScreenState extends State<PunchReviewScreen> {
       children: [
         const Text(
           'Batidas para conferir: offline enviadas muito depois, relógio do '
-          'celular diferente, outro fuso ou sem GPS. Olhe cada uma (hora, '
-          'local no mapa) e toque em Conferido. O que dá para provar que é '
-          'jeitinho o servidor já recusa e aparece em Tentativas recusadas.',
+          'celular diferente ou outro fuso. Olhe cada uma (hora, local no '
+          'mapa) e toque em Conferido. Conferir é opcional: as batidas já '
+          'contam na folha. O que dá para provar que é jeitinho o servidor '
+          'já recusa e aparece em Tentativas recusadas.',
           style: TextStyle(color: Colors.grey, fontSize: 13),
         ),
         const SizedBox(height: 8),

@@ -47,7 +47,12 @@ void main() {
       },
       {
         'id': 'nogps001', 'user_id': 'u2', 'record_type': 'check_out',
-        'timestamp': at(17),
+        'timestamp': at(17), 'clock_skew_seconds': 600,
+      },
+      // Sem GPS (antiga ou Fechar ponto do estagiario): nao aparece.
+      {
+        'id': 'close001', 'user_id': 'u2', 'record_type': 'check_out',
+        'timestamp': at(19),
       },
       // Normal: nao aparece.
       {
@@ -74,7 +79,8 @@ void main() {
     expect(find.text('Batida offline enviada 3h10 depois'), findsOneWidget);
     expect(find.text('Relógio do celular 15 min atrasado'), findsOneWidget);
     expect(find.text('Fora do fuso de Brasília: Cuiaba (UTC-4)'), findsOneWidget);
-    expect(find.text('Sem localização (GPS)'), findsOneWidget);
+    expect(find.text('Relógio do celular 10 min adiantado'), findsOneWidget);
+    expect(find.text('Sem localização (GPS)'), findsNothing);
     // Mapa so para quem tem GPS.
     expect(find.text('Ver no mapa'), findsOneWidget);
 

@@ -74,9 +74,15 @@ void main() {
         isEmpty);
   });
 
-  test('sem GPS', () {
-    expect(reviewReasons({'id': 'abc12345', 'timestamp': '2026-11-03T07:30:00'}),
-        ['Sem localização (GPS)']);
+  test('sem GPS nao entra (antiga ou o Fechar ponto do estagiario)', () {
+    expect(
+        reviewReasons({
+          'id': 'abc12345',
+          'record_type': 'check_out',
+          'timestamp': '2026-10-30T19:30:00',
+          'location': 'App (horario programado)',
+        }),
+        isEmpty);
   });
 
   test('conferida, do gestor ou do sistema nao entra', () {

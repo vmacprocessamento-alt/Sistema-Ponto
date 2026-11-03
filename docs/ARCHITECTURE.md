@@ -109,7 +109,10 @@ de `firestore.rules`.
    - **Aba Conferência** na Gestão (`screens/punch_review_screen.dart`): lista as
      batidas para olhar (regras em `utils/punch_review.dart`: offline enviada 30
      min+ depois, relógio 5 min+ diferente, entrada fora de Brasília, fuso
-     trocado no turno, sem GPS) com link do mapa, e as tentativas recusadas.
+     trocado no turno) com link do mapa, e as tentativas recusadas. Sem GPS não
+     entra: o servidor já recusa, e as que ficam sem ele são antigas ou do
+     "Fechar ponto" do estagiário. Conferir é opcional: a batida conta na folha
+     de qualquer jeito.
      "Conferido" (`POST /admin/time-records/review`) grava `reviewed_at` e
      `reviewed_by` no ponto e uma linha em `time_record_audits`.
    - Limite que fica: sem internet não há relógio confiável. Adiantar a hora do

@@ -8,7 +8,11 @@ import 'time_zone.dart';
 /// ultimo contato, offline com mais de 48 horas, GPS fora do Brasil). Aqui
 /// fica o que passou mas pode esconder um "jeitinho": batida offline enviada
 /// muito depois, relogio do celular diferente do servidor, outro fuso, fuso
-/// trocado no meio do turno, sem localizacao.
+/// trocado no meio do turno.
+///
+/// Sem GPS nao entra: o servidor ja recusa batida sem localizacao, e as que
+/// ficam sem ela sao de antes da 0.7 (GPS opcional) ou feitas pelo sistema (o
+/// "Fechar ponto" no horario programado do estagiario); apareciam todo dia.
 List<String> reviewReasons(Map<String, dynamic> record) {
   if (record['reviewed_at'] != null) return const [];
   final id = record['id']?.toString() ?? '';
@@ -52,9 +56,6 @@ List<String> reviewReasons(Map<String, dynamic> record) {
       : null;
   if (zone != null) {
     reasons.add('Fora do fuso de Brasília: $zone');
-  }
-  if (record['latitude'] == null || record['longitude'] == null) {
-    reasons.add('Sem localização (GPS)');
   }
   return reasons;
 }
