@@ -2057,6 +2057,42 @@ class PunchSecurityTest(unittest.TestCase):
         self.assertEqual(record["clock_skew_seconds"], 600)
         self.assertEqual(self.rejections(), [])
 
+    def add(self, doc_id, record_type, moment, **extra):
+        self.db.store.setdefault("time_records", {})[doc_id] = {
+            "user_id": "u1", "record_type": record_type, "timestamp": self.wall(moment), **extra,
+        }
+
+    def test_real_break_return_from_offline_queue_replaces_the_automatic_one(self):
+        # Pausa as 03:58; o retorno das 04:50 ficou na fila offline e chegou
+        # depois de o sistema fechar a pausa sozinho (04:58, 1h): vale o real.
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=8))
+        self.add("pausa001", "break_start", now - timedelta(hours=4))
+        self.add("autoclose_pausa001", "break_end", now - timedelta(hours=3), auto_closed=True)
+        result = self.offline(now - timedelta(hours=3, minutes=8), server_anchor=now - timedelta(hours=5),
+                              record_type="break_end")
+        records = self.db.store["time_records"]
+        self.assertIn(result["id"], records)
+        self.assertNotIn("autoclose_pausa001", records)
+        [audit] = self.db.store["time_record_audits"].values()
+        self.assertEqual((audit["action"], audit["record_id"]), ("delete", "autoclose_pausa001"))
+
+    def test_real_break_return_after_the_automatic_one_also_replaces_it(self):
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=8))
+        self.add("pausa001", "break_start", now - timedelta(hours=5))
+        self.add("autoclose_pausa001", "break_end", now - timedelta(hours=4), auto_closed=True)
+        self.offline(now - timedelta(hours=1), server_anchor=now - timedelta(hours=6), record_type="break_end")
+        self.assertNotIn("autoclose_pausa001", self.db.store["time_records"])
+
+    def test_offline_return_without_automatic_one_changes_nothing_else(self):
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=3))
+        self.add("pausa001", "break_start", now - timedelta(hours=1))
+        self.offline(now - timedelta(minutes=10), server_anchor=now - timedelta(hours=2), record_type="break_end")
+        self.assertEqual(len(self.db.store["time_records"]), 3)
+        self.assertNotIn("time_record_audits", self.db.store)
+
     def test_offline_punch_in_the_future_is_refused(self):
         now = self.utc_now()
         self.refused(self.offline, now + timedelta(minutes=10), server_anchor=now - timedelta(hours=1))

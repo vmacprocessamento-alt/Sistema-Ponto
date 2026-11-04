@@ -8,6 +8,7 @@ import '../services/server_clock.dart';
 import '../services/notification_service.dart';
 import '../services/update_service.dart';
 import '../utils/shift_records.dart';
+import '../widgets/punch_confirm_dialog.dart';
 import '../widgets/startup_loading.dart';
 import '../widgets/user_notification_bell.dart';
 
@@ -942,29 +943,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     }
 
-    if (type == 'check_in' && _closedShiftToday) {
-      final confirm = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Novo Turno'),
-          content: const Text(
-              'Você já encerrou um turno hoje. Tem certeza que deseja iniciar um novo?'),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context, false),
-                child: const Text('Cancelar',
-                    style: TextStyle(color: Colors.grey))),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(context, true),
-              style: ElevatedButton.styleFrom(backgroundColor: wineColor),
-              child: const Text('Sim, Continuar',
-                  style: TextStyle(color: Colors.white)),
-            ),
-          ],
-        ),
+    // Toda batida pede confirmacao (toque sem querer no botao: widgets/
+    // punch_confirm_dialog.dart), menos a saida do turno de outro dia, ja
+    // confirmada no aviso acima (_confirmCarriedShiftExit).
+    if (!(type == 'check_out' && _carriedOpenShiftStart != null)) {
+      final confirmed = await confirmPunch(
+        context,
+        label: _getRecordLabel(type),
+        at: tappedAt,
+        warning: type == 'check_in' && _closedShiftToday
+            ? 'Você já encerrou um turno hoje. Confirme só se está '
+                'começando um novo turno agora.'
+            : null,
       );
       if (!mounted) return;
-      if (confirm != true) {
+      if (!confirmed) {
         setState(() => _punchInFlight = false);
         return;
       }

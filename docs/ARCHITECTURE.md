@@ -115,6 +115,13 @@ de `firestore.rules`.
      de qualquer jeito.
      "Conferido" (`POST /admin/time-records/review`) grava `reviewed_at` e
      `reviewed_by` no ponto e uma linha em `time_record_audits`.
+   - **Confirmação da batida** (04/11/2026, `widgets/punch_confirm_dialog.dart`):
+     toda batida pede um segundo toque mostrando o tipo e a hora (toque sem
+     querer abria turno). A saída do turno de outro dia já é confirmada no aviso
+     "Finalizar turno aberto".
+   - **Retorno real substitui o automático** (04/11/2026): o retorno da pausa que
+     chega da fila offline depois de o sistema fechar a pausa sozinho apaga o
+     retorno automático (`autoclose_<pausa>`, cópia em `time_record_audits`).
    - Limite que fica: sem internet não há relógio confiável. Adiantar a hora do
      celular, bater a saída offline e só sincronizar depois que a hora real
      passar não é provado pelo servidor; essa batida aparece na Conferência

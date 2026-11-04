@@ -3742,6 +3742,7 @@ def time_record_punch_endpoint(
 
     if _location_required(payload):
         _require_punch_location(db, user, payload, "ponto")
+    replaced_auto_close: Optional[str] = None
     attempted = _parse_in_zone(payload.timestamp, device_zone).astimezone(store_zone)
     punched_at = attempted
     clock_fields: dict = {}
@@ -3753,6 +3754,7 @@ def time_record_punch_endpoint(
         records = _records_before_punch(records, {
             "user_id": user_id, "record_type": record_type, "timestamp": _local_iso(attempted),
         })
+        replaced_auto_close = _auto_close_replaced_by(records, record_type)
     elif abs((server_now - attempted).total_seconds()) > 15 * 60:
         _reject_punch(
             db, user, payload, "ponto", "clock_far_online",
@@ -3802,7 +3804,51 @@ def time_record_punch_endpoint(
             record["device_timestamp"] = _local_iso(punched_at)
     elif abs((server_now - punched_at).total_seconds()) >= 60:
         record["device_timestamp"] = _local_iso(punched_at)
-    return _save_punch(db, payload.client_record_id, record)
+    saved = _save_punch(db, payload.client_record_id, record)
+    if replaced_auto_close:
+        _drop_auto_close(db, replaced_auto_close, payload.client_record_id)
+    return saved
+
+def _auto_close_replaced_by(records: List[dict], record_type: str) -> Optional[str]:
+    """Id do retorno automatico que o retorno real [record_type], vindo da fila
+    offline, substitui. [records]: os pontos de antes da batida.
+
+    RETORNO REAL SUBSTITUI O AUTOMATICO (04/11/2026). O retorno da pausa feito
+    sem internet chega horas depois; se nesse meio tempo a pausa passou de 3h,
+    o sistema ja fechou ela com 1h (autoclose_<pausa>) e o dia ficava com dois
+    retornos. Vale o real: o automatico sai (copia na auditoria)."""
+    if not records:
+        return None
+    last = records[-1]
+    last_id = str(last.get("id") or "")
+    # Retorno real depois do automatico: o automatico e o ultimo antes dele.
+    if last.get("auto_closed") and last_id.startswith("autoclose_") and last.get("record_type") == record_type:
+        return last_id
+    # Retorno real antes do automatico: a pausa ainda aberta e a ultima.
+    if last_id and _BREAK_CLOSE_TYPE.get(last.get("record_type")) == record_type:
+        return f"autoclose_{last_id}"
+    return None
+
+def _drop_auto_close(db, auto_id: str, real_id: str) -> None:
+    ref = db.collection("time_records").document(auto_id)
+    snapshot = ref.get()
+    if not snapshot.exists:
+        return
+    record = serialize_firestore_document(snapshot)
+    ref.delete()
+    db.collection("time_record_audits").document().set({
+        "action": "delete",
+        "record_id": auto_id,
+        "record_user_id": record.get("user_id"),
+        "record_type": record.get("record_type"),
+        "old_timestamp": record.get("timestamp"),
+        "deleted_record": record,
+        "reason": f"Retorno real da pausa chegou da fila offline ({real_id}) e substitui o retorno automatico",
+        "admin_id": "sistema",
+        "admin_name": "Sistema",
+        "deleted_at": firestore.SERVER_TIMESTAMP,
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
 
 def _save_punch(db, doc_id: str, record: dict) -> dict:
     db.collection("time_records").document(doc_id).set(record)
