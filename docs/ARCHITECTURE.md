@@ -122,6 +122,16 @@ de `firestore.rules`.
    - **Retorno real substitui o automático** (04/11/2026): o retorno da pausa que
      chega da fila offline depois de o sistema fechar a pausa sozinho apaga o
      retorno automático (`autoclose_<pausa>`, cópia em `time_record_audits`).
+   - **Jornada sem limite** (09/11/2026): o servidor grava em toda batida feita
+     com turno aberto o `shift_entry_id` (a entrada do turno); a saída do
+     "Esqueci" e o retorno automático da pausa também, e o lote do gestor liga os
+     pontos à entrada do lote. Ponto ligado é do turno na folha
+     (`groupRecordsByWorkDay`), no Dash e no Resumo, mesmo passando de 16h
+     (deslocamento). O aviso de turno aberto sempre oferece "Registrar saída
+     agora". A saída com mais de 16h leva `long_shift_minutes` e aparece na
+     Conferência. Ponto antigo, sem a ligação, segue a regra das 16h
+     (`maxShiftSpan`): a folha de meses passados não muda. No lote, mais de 16h
+     pede confirmação em vez de recusar.
    - Limite que fica: sem internet não há relógio confiável. Adiantar a hora do
      celular, bater a saída offline e só sincronizar depois que a hora real
      passar não é provado pelo servidor; essa batida aparece na Conferência

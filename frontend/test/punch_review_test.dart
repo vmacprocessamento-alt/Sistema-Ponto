@@ -74,6 +74,11 @@ void main() {
         isEmpty);
   });
 
+  test('jornada de mais de 16h', () {
+    expect(reviewReasons(punch({'record_type': 'check_out', 'long_shift_minutes': 1180})),
+        ['Jornada de 19h40 da entrada à saída (mais de 16h): confira se foi deslocamento']);
+  });
+
   test('sem GPS nao entra (antiga ou o Fechar ponto do estagiario)', () {
     expect(
         reviewReasons({

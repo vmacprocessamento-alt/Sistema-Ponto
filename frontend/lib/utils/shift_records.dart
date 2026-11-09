@@ -4,11 +4,29 @@
 // pode atravessar a meia-noite: quem entra 19:30 e sai 07:00 trabalhou um
 // turno so, que pertence ao dia em que comecou.
 
-/// Maior distancia entre a entrada e um ponto do dia seguinte para os dois
-/// ainda serem do mesmo turno. Passou disso e saida esquecida, nao turno: com
-/// 24h, entrada 08:00 esquecida e saida 07:50 do dia seguinte viravam um turno
-/// de 22h pago (7h a 100%).
+/// Maior distancia entre a entrada e um ponto do dia seguinte nas regras que
+/// ADIVINHAM o turno a partir dos lancamentos do gestor (noite do lote antigo,
+/// saida repetida que corrige o turno, volta da refeicao) e no aviso do lote.
+///
+/// JORNADA SEM LIMITE (09/11/2026): o ponto ligado ao turno aberto
+/// ([belongsToShift]) e dele, mesmo passando de 16h (deslocamento que
+/// atravessa a noite). Antes, passou de 16h, a saida caia solta no dia
+/// seguinte e o app so deixava "Fechar sem horas". A pessoa escolhe no aviso
+/// do turno aberto se trabalhou ate agora ou se esqueceu, e a jornada acima de
+/// 16h aparece na Conferencia da Gestao (long_shift_minutes). Ponto antigo,
+/// sem a ligacao, segue a regra das 16h: a folha de meses ja fechados nao muda
+/// (a entrada 08:00 esquecida e a saida 07:50 do dia seguinte nao viram 24h).
 const Duration maxShiftSpan = Duration(hours: 16);
+
+/// O ponto [record] e do turno aberto pela entrada [entryId]? O servidor grava
+/// shift_entry_id em toda batida feita com turno aberto (09/11/2026), e o lote
+/// do gestor tambem; a saida do "Esqueci" tem o id forgot_<entrada> (o gestor
+/// corrige o horario nela).
+bool belongsToShift(Map<dynamic, dynamic> record, String? entryId) {
+  if (entryId == null || entryId.isEmpty) return false;
+  return record['shift_entry_id']?.toString() == entryId ||
+      record['id']?.toString() == 'forgot_$entryId';
+}
 
 /// Intervalo entre dois turnos que conta como refeicao: ate 2h, o maximo do
 /// intervalo de refeicao da CLT. Quem bate saida 11:00 e entrada 12:00 ja
@@ -400,8 +418,10 @@ Map<String, dynamic>? dayStartWithoutShift(
 /// data de cada ponto deixava a entrada 19:30 sozinha num dia e a saida 07:00
 /// no outro, e nenhum dos dois somava horas.
 ///
-/// Pontos sem turno aberto, ou a mais de [maxShiftSpan] da entrada, ficam no
-/// proprio dia, assim como o turno da noite do lote antigo do gestor. Dentro
+/// Pontos sem turno aberto, ou a mais de [maxShiftSpan] da entrada sem estar
+/// ligados a ela ([belongsToShift]), ficam no proprio dia, assim como o turno
+/// da noite do lote antigo do gestor. O ponto ligado ao turno e dele, qualquer
+/// que seja a distancia (jornada sem limite, 09/11/2026). Dentro
 /// de cada dia a ordem e cronologica. O lote novo (data real) segue a regra
 /// comum, como o app.
 ///
@@ -455,6 +475,7 @@ Map<String, List<Map<String, dynamic>>> groupRecordsByWorkDay(
   final grouped = <String, List<Map<String, dynamic>>>{};
   String? openDay;
   DateTime? openAt;
+  String? openId;
   // Turno que acabou de fechar (ate a proxima entrada): dia de trabalho,
   // entrada e saida.
   String? closedDay;
@@ -489,6 +510,7 @@ Map<String, List<Map<String, dynamic>>> groupRecordsByWorkDay(
       }
       openDay = closed ? null : day;
       openAt = closed ? null : at;
+      openId = closed ? null : record['id']?.toString();
       closedDay = null;
       closedEntryAt = null;
       closedExitAt = null;
@@ -496,7 +518,11 @@ Map<String, List<Map<String, dynamic>>> groupRecordsByWorkDay(
         openAt != null &&
         day != openDay &&
         !nightMorning.contains(i)) {
-      if (at != null && at.difference(openAt) <= maxShiftSpan) day = openDay;
+      if (at != null &&
+          (at.difference(openAt) <= maxShiftSpan ||
+              belongsToShift(record, openId))) {
+        day = openDay;
+      }
     } else if (_pauseTypes.contains(type) &&
         !nightMorning.contains(i) &&
         nextMark[i] != null &&
@@ -526,6 +552,7 @@ Map<String, List<Map<String, dynamic>>> groupRecordsByWorkDay(
         }
         openDay = null;
         openAt = null;
+        openId = null;
       }
     }
     grouped.putIfAbsent(day, () => []).add(record);

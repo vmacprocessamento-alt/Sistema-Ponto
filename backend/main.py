@@ -1842,6 +1842,7 @@ def _run_auto_close_breaks(window: timedelta = _AUTO_CLOSE_WINDOW) -> bool:
                 "notes": "Retorno automatico (pausa excedeu 3h; ajustado para 1h) [servidor]",
                 "auto_closed": True,
                 **_copy_zone_fields(last),
+                **({"shift_entry_id": last["shift_entry_id"]} if last.get("shift_entry_id") else {}),
                 "created_at": firestore.SERVER_TIMESTAMP,
             })
             _create_user_notification(
@@ -3579,6 +3580,8 @@ def schedule_controlled_punch_endpoint(
         "schedule_snapshot": schedule if _is_intern_profile(user) else None,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
+    if payload.record_type == "check_out":
+        record.update(_shift_link_fields(open_shift, attempted, "check_out"))
     if payload.utc_offset_minutes is not None:
         record.update(_zone_fields(attempted, timezone_name))
     record.update(clock_fields)
@@ -3629,6 +3632,25 @@ _PUNCH_TYPES = {"check_in", "check_out", "break_start", "break_end", "entry_3", 
 _BREAK_CLOSE_TYPE = {"break_start": "break_end", "entry_3": "exit_3"}
 _FORGOTTEN_EXIT_NOTES = "Saida esquecida: o gestor precisa lancar o horario real"
 
+def _shift_link_fields(open_shift: Optional[dict], moment: Optional[datetime], record_type: str) -> dict:
+    """Liga a batida a entrada do turno aberto (JORNADA SEM LIMITE, 09/11/2026).
+
+    O app agrupa os pontos pelo turno: antes, passou de 16h da entrada, o ponto
+    caia solto no dia seguinte e o app so deixava "Fechar sem horas". Agora o
+    ponto ligado a entrada (shift_entry_id) e do turno, qualquer que seja a
+    distancia; o antigo, sem a ligacao, segue a regra das 16h (a folha de meses
+    passados nao muda). A saida com mais de 16h da entrada leva
+    long_shift_minutes, para a aba Conferencia (deslocamento ou esquecimento?)."""
+    if not open_shift or not open_shift.get("id"):
+        return {}
+    fields = {"shift_entry_id": open_shift["id"]}
+    opened = _to_local_naive(str(open_shift.get("timestamp")))
+    if record_type == "check_out" and opened is not None and moment is not None:
+        span = moment.replace(tzinfo=None) - opened
+        if span > _MAX_SHIFT_SPAN:
+            fields["long_shift_minutes"] = int(span.total_seconds() // 60)
+    return fields
+
 def _forgotten_exit(user_id: str, open_shift: dict, location: Optional[str], notes: Optional[str]) -> tuple:
     """(id, ponto) da saida esquecida que fecha o turno [open_shift] sem horas.
     Id fixo pela entrada: "Esqueci" em dois aparelhos grava a mesma saida."""
@@ -3641,6 +3663,7 @@ def _forgotten_exit(user_id: str, open_shift: dict, location: Optional[str], not
         "timestamp": _local_iso(opened + timedelta(seconds=1)),
         "latitude": None,
         "longitude": None,
+        "shift_entry_id": open_shift["id"],
         "created_at": firestore.SERVER_TIMESTAMP,
     }
 
@@ -3722,6 +3745,7 @@ def time_record_punch_endpoint(
             "notes": "Retorno automatico (pausa excedeu 3h; ajustado para 1h)",
             "auto_closed": True,
             **_copy_zone_fields(last),
+            **({"shift_entry_id": last["shift_entry_id"]} if last.get("shift_entry_id") else {}),
             "created_at": firestore.SERVER_TIMESTAMP,
         })
 
@@ -3790,6 +3814,8 @@ def time_record_punch_endpoint(
         "longitude": payload.longitude,
         "created_at": firestore.SERVER_TIMESTAMP,
     }
+    if record_type != "check_in":
+        record.update(_shift_link_fields(open_shift, attempted, record_type))
     if payload.utc_offset_minutes is not None or shift_zone_locked:
         record.update(_zone_fields(attempted, zone_name))
     if shift_zone_locked and payload.utc_offset_minutes is not None:

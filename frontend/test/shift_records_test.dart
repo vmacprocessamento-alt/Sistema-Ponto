@@ -325,6 +325,50 @@ void main() {
       expect(_ids(grouped['2026-10-15']), ['out', 'next']);
     });
 
+    test('jornada sem limite: ponto ligado ao turno passa de 16h e fica nele',
+        () {
+      // Deslocamento 21:00 ate 17:00 do dia seguinte (20h): a pausa 15:00 e a
+      // saida vem com shift_entry_id (o servidor grava, 09/11/2026).
+      final grouped = groupRecordsByWorkDay([
+        _punch('in', 'check_in', '2026-11-03T21:00:00'),
+        {
+          ..._punch('p1', 'break_start', '2026-11-04T15:00:00'),
+          'shift_entry_id': 'in',
+        },
+        {
+          ..._punch('p2', 'break_end', '2026-11-04T15:30:00'),
+          'shift_entry_id': 'in',
+        },
+        {
+          ..._punch('out', 'check_out', '2026-11-04T17:00:00'),
+          'shift_entry_id': 'in',
+        },
+      ]);
+      expect(_ids(grouped['2026-11-03']), ['in', 'p1', 'p2', 'out']);
+      expect(grouped['2026-11-04'], isNull);
+    });
+
+    test('saida do Esqueci corrigida pelo gestor para mais de 16h fica no turno',
+        () {
+      final grouped = groupRecordsByWorkDay([
+        _punch('in1', 'check_in', '2026-11-03T21:24:42'),
+        _punch('forgot_in1', 'check_out', '2026-11-04T15:00:00'),
+      ]);
+      expect(_ids(grouped['2026-11-03']), ['in1', 'forgot_in1']);
+    });
+
+    test('ponto ligado a outra entrada nao entra no turno aberto', () {
+      final grouped = groupRecordsByWorkDay([
+        _punch('in', 'check_in', '2026-10-14T08:00:00'),
+        {
+          ..._punch('out', 'check_out', '2026-10-15T07:50:00'),
+          'shift_entry_id': 'outra',
+        },
+      ]);
+      expect(_ids(grouped['2026-10-14']), ['in']);
+      expect(_ids(grouped['2026-10-15']), ['out']);
+    });
+
     test('noites seguidas no lote do gestor ficam cada uma no seu dia', () {
       // Lote grava saida 07:00 e entrada 19:30 na mesma data escolhida.
       final grouped = groupRecordsByWorkDay([

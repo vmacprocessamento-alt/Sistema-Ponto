@@ -2093,6 +2093,41 @@ class PunchSecurityTest(unittest.TestCase):
         self.assertEqual(len(self.db.store["time_records"]), 3)
         self.assertNotIn("time_record_audits", self.db.store)
 
+    def test_punches_are_linked_to_the_open_shift_and_long_exit_is_flagged(self):
+        # Jornada sem limite (09/11/2026): deslocamento de 20h.
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=20))
+        pause = self.punch(record_type="break_start", timestamp=self.wall(now))
+        self.assertEqual(self.stored(pause["id"])["shift_entry_id"], "entrada1")
+        self.assertNotIn("long_shift_minutes", self.stored(pause["id"]))
+        back = self.punch(record_type="break_end", timestamp=self.wall(now))
+        exit_ = self.punch(record_type="check_out", timestamp=self.wall(now))
+        record = self.stored(exit_["id"])
+        self.assertEqual(record["shift_entry_id"], "entrada1")
+        self.assertIn(record["long_shift_minutes"], range(1199, 1202))
+        self.assertEqual(self.stored(back["id"])["shift_entry_id"], "entrada1")
+        # A entrada nao e ligada a nada.
+        entry = self.punch(timestamp=self.wall(now))
+        self.assertNotIn("shift_entry_id", self.stored(entry["id"]))
+
+    def test_normal_exit_is_linked_but_not_flagged(self):
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=9))
+        exit_ = self.punch(record_type="check_out", timestamp=self.wall(now))
+        record = self.stored(exit_["id"])
+        self.assertEqual(record["shift_entry_id"], "entrada1")
+        self.assertNotIn("long_shift_minutes", record)
+
+    def test_forgotten_exit_and_auto_return_keep_the_link(self):
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=10))
+        self.add("pausa001", "break_start", now - timedelta(hours=4), shift_entry_id="entrada1")
+        self.assertTrue(main._run_auto_close_breaks())
+        self.assertEqual(self.stored("autoclose_pausa001")["shift_entry_id"], "entrada1")
+        result = self.punch(record_type="check_out", kind="forgotten_exit", ref_record_id="entrada1",
+                            latitude=None, longitude=None)
+        self.assertEqual(self.stored(result["id"])["shift_entry_id"], "entrada1")
+
     def test_offline_punch_in_the_future_is_refused(self):
         now = self.utc_now()
         self.refused(self.offline, now + timedelta(minutes=10), server_anchor=now - timedelta(hours=1))

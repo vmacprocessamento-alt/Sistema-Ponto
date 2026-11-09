@@ -1128,7 +1128,9 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
   /// ponto hoje" as 02:00 e com 00h00 depois da saida das 07:00.
   /// Se hoje ja tem entrada, o turno de ontem acabou e o resumo segue o
   /// turno novo (os pontos da madrugada sao do turno de ontem). Sem ponto
-  /// hoje ate [maxShiftSpan] depois da entrada e saida esquecida, nao turno.
+  /// hoje ate [maxShiftSpan] depois da entrada e saida esquecida, nao turno;
+  /// o ponto de hoje ligado ao turno (belongsToShift) segue nele, como na
+  /// folha (jornada sem limite, 09/11/2026).
   List<Map<String, dynamic>> _currentShiftRecords(
     List<Map<String, dynamic>> yesterday,
     List<Map<String, dynamic>> today,
@@ -1140,7 +1142,9 @@ class _TeamStatusTabState extends State<_TeamStatusTab> {
     final next = today.isEmpty
         ? now
         : DateTime.tryParse(today.first['timestamp'].toString()) ?? now;
-    if (next.difference(openAt) > maxShiftSpan) return today;
+    final linked = today.isNotEmpty &&
+        belongsToShift(today.first, open['id']?.toString());
+    if (next.difference(openAt) > maxShiftSpan && !linked) return today;
 
     final firstCheckIn =
         today.indexWhere((record) => record['record_type'] == 'check_in');
@@ -2454,6 +2458,34 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
   };
 
   /// Pede a confirmacao dos horarios que vao para o dia seguinte.
+  Future<bool> _confirmLongBatch(Duration span) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Jornada longa'),
+        content: Text('Do primeiro ao último horário são ${span.inHours}h'
+            '${(span.inMinutes % 60).toString().padLeft(2, '0')}, mais que '
+            '${maxShiftSpan.inHours}h. Confira os horários: o que vem antes da '
+            'entrada, ou do primeiro horário sem entrada, vai para o dia '
+            'seguinte (saída igual à entrada também).\n\n'
+            'Se foi isso mesmo (ex.: deslocamento), pode lançar.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Corrigir'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            style: ElevatedButton.styleFrom(backgroundColor: wineColor),
+            child: const Text('Lançar assim',
+                style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
+  }
+
   Future<bool> _confirmNextDay(List<BatchPunch> nextDay) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -2514,15 +2546,13 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
       _showError('Preencha pelo menos um horário');
       return;
     }
-    if (batchTooLong(punches)) {
-      final span = batchShiftSpan(punches)!;
-      _showError('Do primeiro ao último horário são ${span.inHours}h'
-          '${(span.inMinutes % 60).toString().padLeft(2, '0')}, mais que '
-          '${maxShiftSpan.inHours}h. Confira os horários (o que vem antes '
-          'da entrada, ou do primeiro horário sem entrada, vai para o dia '
-          'seguinte; saída igual à entrada também).');
+    // Mais de 16h costuma ser horario digitado errado, mas pode ser um
+    // deslocamento de verdade: pede confirmacao em vez de recusar (09/11/2026).
+    if (batchTooLong(punches) &&
+        !await _confirmLongBatch(batchShiftSpan(punches)!)) {
       return;
     }
+    if (!mounted) return;
     final nextDay = punches.where((punch) => punch.nextDay).toList();
     if (nextDay.isNotEmpty && !await _confirmNextDay(nextDay)) return;
     if (!mounted) return;
@@ -2530,8 +2560,15 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
     setState(() => _isSaving = true);
     try {
       int count = 0;
-      for (final punch in punches) {
-        await _apiService.createTimeRecord(
+      // Os pontos depois da entrada do lote ficam ligados a ela: jornada
+      // acima de 16h (deslocamento) continua um turno so na folha.
+      String? entryId;
+      // A entrada vai primeiro, para os outros ja saberem o id dela.
+      for (final punch in [
+        ...punches.where((punch) => punch.recordType == 'check_in'),
+        ...punches.where((punch) => punch.recordType != 'check_in'),
+      ]) {
+        final saved = await _apiService.createTimeRecord(
           recordType: punch.recordType,
           userId: _selectedUserId,
           timestamp: punch.at.toIso8601String(),
@@ -2539,8 +2576,13 @@ class _ManualEntryTabState extends State<_ManualEntryTab> {
           location: 'Manual (Lote Gestor)',
           // Marca o ponto com a data real: as regras da noite do lote antigo
           // (saida antes da entrada na mesma data) nao valem para ele.
-          extraFields: batchRecordFields,
+          extraFields: {
+            ...batchRecordFields,
+            if (punch.recordType != 'check_in' && entryId != null)
+              'shift_entry_id': entryId,
+          },
         );
+        if (punch.recordType == 'check_in') entryId = saved['id']?.toString();
         count++;
       }
 

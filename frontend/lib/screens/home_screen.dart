@@ -1138,27 +1138,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   /// Saida de um turno que comecou em outro dia. Turno da noite e saida
   /// esquecida tem a mesma cara na tela; so quem bateu sabe qual foi, entao o
-  /// app pergunta. Acima de [maxShiftSpan] so resta fechar sem horas.
+  /// app pergunta. Sem limite de horas (09/11/2026): o deslocamento que passa
+  /// de 16h fecha normalmente e aparece na Conferencia da Gestao. Antes,
+  /// acima de 16h so restava fechar sem horas.
   /// Estagiario nao tem a opcao "esqueci": o backend recusa saida retroativa,
   /// e ele ja tem "Fechar no horario programado".
   Future<_CarriedExit?> _confirmCarriedShiftExit(DateTime shiftStart) {
     final now = DateTime.now();
-    final tooLong = now.difference(shiftStart) > maxShiftSpan;
+    final open = now.difference(shiftStart);
     final allowForgot = !_isInternUser;
     final format = DateFormat('dd/MM/yyyy \'às\' HH:mm');
     final started = 'Seu turno começou em ${format.format(shiftStart)}';
+    final openFor = open > maxShiftSpan
+        ? ' e está aberto há ${open.inHours}h'
+            '${(open.inMinutes % 60).toString().padLeft(2, '0')}'
+        : '';
     final String message;
     if (!allowForgot) {
-      message = '$started e a saída será registrada agora, '
+      message = '$started$openFor e a saída será registrada agora, '
           '${format.format(now)}.';
-    } else if (tooLong) {
-      message = '$started e está aberto há mais de ${maxShiftSpan.inHours} '
-          'horas. O turno será fechado sem contar horas: avise o gestor para '
-          'lançar o horário real em que você saiu.';
     } else {
-      message = '$started.\n\nSe você trabalhou até agora, registre a saída '
-          '(${format.format(now)}). Se esqueceu de bater a saída, escolha '
-          '"Esqueci": o turno fecha sem horas e o gestor lança o horário real.';
+      message = '$started$openFor.\n\nSe você trabalhou até agora, registre '
+          'a saída (${format.format(now)}). Se esqueceu de bater a saída, '
+          'escolha "Esqueci": o turno fecha sem horas e o gestor lança o '
+          'horário real.';
     }
     return showDialog<_CarriedExit>(
       context: context,
@@ -1173,11 +1176,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           if (allowForgot)
             TextButton(
               onPressed: () => Navigator.pop(context, _CarriedExit.forgot),
-              child: Text(tooLong ? 'Fechar sem horas' : 'Esqueci',
-                  style: const TextStyle(color: wineColor)),
+              child: const Text('Esqueci', style: TextStyle(color: wineColor)),
             ),
-          if (!allowForgot || !tooLong)
-            ElevatedButton(
+          ElevatedButton(
               onPressed: () => Navigator.pop(context, _CarriedExit.now),
               style: ElevatedButton.styleFrom(backgroundColor: wineColor),
               child: const Text('Registrar saída agora',

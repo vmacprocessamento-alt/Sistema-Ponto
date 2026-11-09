@@ -941,4 +941,25 @@ void main() {
       });
     });
   });
+
+  test('deslocamento de 20h ligado ao turno soma tudo no dia da entrada', () {
+    // 09/11/2026: jornada sem limite. 21:00 de terca ate 17:00 de quarta, com
+    // pausa 15:00-15:30; os pontos depois da entrada vem com shift_entry_id.
+    Map<String, dynamic> linked(String id, String type, String ts) =>
+        {..._punch(id, type, ts), 'shift_entry_id': 'in'};
+    final days = _workDays([
+      _punch('in', 'check_in', '2026-11-03T21:00:00'),
+      linked('p1', 'break_start', '2026-11-04T15:00:00'),
+      linked('p2', 'break_end', '2026-11-04T15:30:00'),
+      linked('out', 'check_out', '2026-11-04T17:00:00'),
+    ]);
+    expect(days.keys, ['2026-11-03']);
+    expect(days['2026-11-03']!['total_hours'], 19.5);
+    // Sem a ligacao (ponto antigo), a saida 20h depois nao fecha o turno.
+    final old = _workDays([
+      _punch('in', 'check_in', '2026-11-03T21:00:00'),
+      _punch('out', 'check_out', '2026-11-04T17:00:00'),
+    ]);
+    expect(old['2026-11-03']!['total_hours'], 0);
+  });
 }

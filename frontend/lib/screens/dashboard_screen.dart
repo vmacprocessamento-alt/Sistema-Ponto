@@ -209,14 +209,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
     var paused = false;
     var resumedByAutomaticEnd = false;
 
-    // Desenha o trecho aberto ate [at]. Passadas [maxShiftSpan] da entrada
-    // e saida esquecida, nao turno: o trecho para ali.
-    void closeSegment(DateTime at, {bool? pause}) {
+    String? shiftId;
+
+    // Desenha o trecho aberto ate [at]. Passadas [maxShiftSpan] da entrada e
+    // saida esquecida, nao turno: o trecho para ali, menos quando o ponto que
+    // fecha o trecho e ligado ao turno (jornada sem limite, como na folha:
+    // belongsToShift).
+    void closeSegment(DateTime at, {bool? pause, bool linked = false}) {
       final start = shiftStart;
       final from = segmentStart;
       if (start == null || from == null) return;
       final limit = start.add(maxShiftSpan);
-      paint(from, at.isAfter(limit) ? limit : at, pause ?? paused);
+      paint(from, !linked && at.isAfter(limit) ? limit : at, pause ?? paused);
     }
 
     for (final (at, record) in _timelineMarks([...previousDay, ...dayRecords])) {
@@ -224,13 +228,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
         case 'check_in':
           closeSegment(at);
           shiftStart = at;
+          shiftId = record['id']?.toString();
           segmentStart = at;
           paused = false;
           resumedByAutomaticEnd = false;
         case 'break_start':
         case 'entry_3':
           if (shiftStart == null || paused) break;
-          closeSegment(at);
+          closeSegment(at, linked: belongsToShift(record, shiftId));
           segmentStart = at;
           paused = true;
           resumedByAutomaticEnd = false;
@@ -251,7 +256,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           paused = false;
           resumedByAutomaticEnd = automatic;
         case 'check_out':
-          closeSegment(at);
+          closeSegment(at, linked: belongsToShift(record, shiftId));
           shiftStart = null;
           segmentStart = null;
           paused = false;

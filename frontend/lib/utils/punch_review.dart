@@ -44,6 +44,11 @@ List<String> reviewReasons(Map<String, dynamic> record) {
           '(${_hhmm(record['device_timestamp'])})');
     }
   }
+  final longShift = record['long_shift_minutes'];
+  if (longShift is num && longShift > 0) {
+    reasons.add('Jornada de ${_duration(longShift.toInt())} da entrada à '
+        'saída (mais de 16h): confira se foi deslocamento');
+  }
   final deviceOffset = record['device_utc_offset_minutes'];
   if (deviceOffset is num) {
     reasons.add('Fuso do celular trocado durante o turno '
