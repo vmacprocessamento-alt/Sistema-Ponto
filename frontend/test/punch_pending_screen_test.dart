@@ -3,6 +3,41 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ponto_app/screens/punch_pending_screen.dart';
 
 class _FakeSource extends PunchPendingSource {
+  final created = <Map<String, dynamic>>[];
+  final edited = <Map<String, dynamic>>[];
+  final deleted = <String>[];
+  final reviewed = <String>[];
+
+  @override
+  Future<String?> createPunch({
+    required String userId,
+    required String type,
+    required DateTime at,
+    required String notes,
+    String? shiftEntryId,
+  }) async {
+    created.add({'user': userId, 'type': type, 'at': at, 'notes': notes, 'shift': shiftEntryId});
+    return 'novo${created.length}';
+  }
+
+  @override
+  Future<void> editPunch({
+    required String recordId,
+    required DateTime at,
+    required String reason,
+    String? notes,
+    String? newType,
+  }) async {
+    edited.add({'id': recordId, 'at': at, 'reason': reason, 'type': newType});
+  }
+
+  @override
+  Future<void> deletePunch(String recordId, String reason) async =>
+      deleted.add(recordId);
+
+  @override
+  Future<void> markReviewed(List<String> ids) async => reviewed.addAll(ids);
+
   @override
   Future<List<Map<String, dynamic>>> users() async => [
         {'id': 'u1', 'name': 'Guilherme', 'role': 'employee'},
@@ -42,18 +77,81 @@ class _FakeSource extends PunchPendingSource {
 
 /// Aba Pendencias (15/11/2026) num celular de 360 px.
 void main() {
-  Future<void> open(WidgetTester tester) async {
+  Future<_FakeSource> open(WidgetTester tester, {bool admin = true}) async {
     tester.view.physicalSize = const Size(360, 740);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
+    final source = _FakeSource();
     await tester.pumpWidget(MaterialApp(
       home: PunchPendingScreen(
-        source: _FakeSource(),
+        isAdmin: admin,
+        source: source,
         clock: () => DateTime(2026, 11, 13, 20),
       ),
     ));
     await tester.pumpAndSettle();
+    return source;
   }
+
+  Future<void> tapVisible(WidgetTester tester, Finder finder) async {
+    await tester.ensureVisible(finder);
+    await tester.pumpAndSettle();
+    await tester.tap(finder);
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('Fechar turno lanca a saida ligada a entrada', (tester) async {
+    final source = await open(tester);
+    await tapVisible(tester, find.text('Guilherme'));
+    await tapVisible(tester, find.text('Fechar turno').first);
+    // Sugestao: 8h depois da entrada de 09/11 08:00, com o motivo pronto.
+    expect(find.text('16:00'), findsOneWidget);
+    await tapVisible(tester, find.widgetWithText(ElevatedButton, 'Fechar turno'));
+    expect(source.created, [
+      {
+        'user': 'u1',
+        'type': 'check_out',
+        'at': DateTime(2026, 11, 9, 16),
+        'notes': 'Saída não batida; lançada pelo gestor',
+        'shift': 'g9',
+      },
+    ]);
+  });
+
+  testWidgets('Lancar saida real do Esqueci edita a propria saida',
+      (tester) async {
+    final source = await open(tester);
+    await tapVisible(tester, find.text('Crysnamurt'));
+    await tapVisible(tester, find.text('Lançar saída real'));
+    await tapVisible(tester, find.widgetWithText(ElevatedButton, 'Salvar'));
+    expect(source.edited.single['id'], 'forgot_c1');
+    final at = source.edited.single['at'] as DateTime;
+    expect(at.isAfter(DateTime(2026, 11, 10, 21, 24)), isTrue);
+    expect(at.isBefore(DateTime(2026, 11, 12, 8)), isTrue);
+  });
+
+  testWidgets('dia sem ponto: Lancar ponto cria entrada e saida', (tester) async {
+    final source = await open(tester);
+    await tapVisible(tester, find.text('Crysnamurt'));
+    await tapVisible(tester, find.text('Lançar ponto'));
+    await tapVisible(tester, find.widgetWithText(ElevatedButton, 'Lançar'));
+    expect([for (final punch in source.created) punch['type']],
+        ['check_in', 'check_out']);
+    expect(source.created.first['at'], DateTime(2026, 11, 9, 8));
+    expect(source.created.last['at'], DateTime(2026, 11, 9, 17));
+    expect(source.created.last['shift'], 'novo1');
+  });
+
+  testWidgets('gestor fecha turno, mas nao edita nem apaga', (tester) async {
+    await open(tester, admin: false);
+    await tapVisible(tester, find.text('Crysnamurt'));
+    expect(find.text('Lançar saída real'), findsNothing);
+    expect(find.text('Apagar'), findsNothing);
+    expect(find.text('Lançar ponto'), findsOneWidget);
+    await tapVisible(tester, find.text('Guilherme'));
+    expect(find.text('Fechar turno'), findsWidgets);
+    expect(find.text('Apagar entrada'), findsNothing);
+  });
 
   testWidgets('lista quem tem pendencia e conta quem esta em dia',
       (tester) async {

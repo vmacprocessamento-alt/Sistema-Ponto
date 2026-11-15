@@ -138,6 +138,12 @@ de `firestore.rules`.
      real, pausa sem retorno, batida solta, jornada de mais de 16h e dia útil sem
      nenhuma batida. Segue o agrupamento da folha; dia com o lote antigo do gestor
      fica de fora; modo diária e gestor que não bate ponto não entram.
+     Correção ali mesmo: "Fechar turno" (saída ligada à entrada), "Lançar
+     retorno" e "Lançar ponto" do dia sem batida (admin e gestor, como o lote);
+     "Lançar saída real" do Esqueci, "Ajustar retorno", "Editar"/"Apagar" batida
+     solta e "Editar saída/entrada" da jornada longa (só admin, com motivo e
+     auditoria); "Está certo" na pausa sem retorno e na jornada longa marca o
+     ponto como conferido.
    - Limite que fica: sem internet não há relógio confiável. Adiantar a hora do
      celular, bater a saída offline e só sincronizar depois que a hora real
      passar não é provado pelo servidor; essa batida aparece na Conferência

@@ -26,13 +26,37 @@ enum PunchIssueKind {
 }
 
 class PunchIssue {
-  const PunchIssue(this.kind, this.at, this.text);
+  const PunchIssue(
+    this.kind,
+    this.at,
+    this.text, {
+    this.record,
+    this.entry,
+    this.pause,
+    this.notBefore,
+    this.notAfter,
+  });
 
   final PunchIssueKind kind;
 
   /// Dia (e hora, quando ha) a que a pendencia se refere.
   final DateTime at;
   final String text;
+
+  /// O ponto a corrigir: a saida do "Esqueci", o retorno automatico, a batida
+  /// solta ou a saida da jornada longa.
+  final Map<String, dynamic>? record;
+
+  /// A entrada do turno (turno sem saida, "Esqueci", jornada longa, pausa).
+  final Map<String, dynamic>? entry;
+
+  /// O inicio da pausa sem retorno.
+  final Map<String, dynamic>? pause;
+
+  /// Janela da correcao: a hora certa fica depois de [notBefore] e antes de
+  /// [notAfter] (a proxima entrada, a saida do turno ou agora).
+  final DateTime? notBefore;
+  final DateTime? notAfter;
 }
 
 /// Nome curto do tipo, para os resumos.
@@ -87,9 +111,33 @@ List<PunchIssue> findPunchIssues(
 }) {
   final start = _dateOnly(from);
   final issues = <PunchIssue>[];
-  void add(PunchIssueKind kind, DateTime at, String text) {
-    if (!at.isBefore(start)) issues.add(PunchIssue(kind, at, text));
+  void add(
+    PunchIssueKind kind,
+    DateTime at,
+    String text, {
+    Map<String, dynamic>? record,
+    Map<String, dynamic>? entry,
+    Map<String, dynamic>? pause,
+    DateTime? notBefore,
+    DateTime? notAfter,
+  }) {
+    if (at.isBefore(start)) return;
+    issues.add(PunchIssue(kind, at, text,
+        record: record,
+        entry: entry,
+        pause: pause,
+        notBefore: notBefore,
+        notAfter: notAfter));
   }
+
+  // Entradas da pessoa, em ordem: a saida que falta fica antes da proxima.
+  final entryTimes = [
+    for (final record in records)
+      if (record['record_type'] == 'check_in')
+        if (_at(record) case final at?) at,
+  ]..sort();
+  DateTime nextEntryOrNow(DateTime after) =>
+      entryTimes.firstWhere((at) => at.isAfter(after), orElse: () => now);
 
   final grouped = groupRecordsByWorkDay(records);
   final dayKeys = grouped.keys.toList()..sort();
@@ -111,7 +159,8 @@ List<PunchIssue> findPunchIssues(
         if (open != null && openAt != null) {
           add(PunchIssueKind.openShift, openAt,
               'Entrada de ${_dayHour.format(openAt)} sem saída: depois veio '
-              'outra entrada (${_dayHour.format(at)}).');
+              'outra entrada (${_dayHour.format(at)}).',
+              entry: open, notBefore: openAt, notAfter: at);
         }
         open = record;
         openAt = at;
@@ -120,7 +169,8 @@ List<PunchIssue> findPunchIssues(
       } else if (_pauseStarts.contains(type)) {
         if (open == null) {
           add(PunchIssueKind.loosePunch, at,
-              'Início de pausa às ${_dayHour.format(at)} sem turno aberto.');
+              'Início de pausa às ${_dayHour.format(at)} sem turno aberto.',
+              record: record);
         } else {
           pause ??= record;
         }
@@ -128,7 +178,8 @@ List<PunchIssue> findPunchIssues(
         if (open == null) {
           if (!isAutomaticBreakEnd(record)) {
             add(PunchIssueKind.loosePunch, at,
-                'Retorno de pausa às ${_dayHour.format(at)} sem turno aberto.');
+                'Retorno de pausa às ${_dayHour.format(at)} sem turno aberto.',
+                record: record);
           }
           continue;
         }
@@ -136,12 +187,20 @@ List<PunchIssue> findPunchIssues(
         if (started == null || _pauseEndOf[started['record_type']] != type) {
           continue;
         }
+        // O gestor ja ajustou (editou) ou conferiu esse retorno: esta certo.
         if (isAutomaticBreakEnd(record) &&
+            record['edited_by_admin'] != true &&
+            record['reviewed_at'] == null &&
             !_realReturnFollows(ordered, i, type)) {
           final pauseAt = _at(started) ?? at;
           add(PunchIssueKind.autoBreakReturn, pauseAt,
               'Pausa de ${_dayHour.format(pauseAt)} sem retorno: o sistema '
-              'fechou com 1h.');
+              'fechou com 1h.',
+              record: record,
+              entry: open,
+              pause: started,
+              notBefore: pauseAt,
+              notAfter: _nextMarkAfter(ordered, i) ?? nextEntryOrNow(at));
         }
         pause = null;
       } else if (type == 'check_out') {
@@ -152,7 +211,8 @@ List<PunchIssue> findPunchIssues(
           // (vale a ultima); sem turno nenhum antes, e solta.
           if (!hadShift) {
             add(PunchIssueKind.loosePunch, at,
-                'Saída às ${_dayHour.format(at)} sem entrada.');
+                'Saída às ${_dayHour.format(at)} sem entrada.',
+                record: record);
           }
           continue;
         }
@@ -161,19 +221,35 @@ List<PunchIssue> findPunchIssues(
           if (!_laterExitFollows(ordered, i)) {
             add(PunchIssueKind.forgottenExit, entryAt,
                 'Turno de ${_dayHour.format(entryAt)} fechado no "Esqueci" '
-                '(0h): falta lançar o horário real da saída.');
+                '(0h): falta lançar o horário real da saída.',
+                record: record,
+                entry: entry,
+                notBefore: entryAt,
+                notAfter: nextEntryOrNow(entryAt));
           }
-        } else if (span > maxShiftSpan) {
+        } else if (span > maxShiftSpan &&
+            record['reviewed_at'] == null &&
+            record['edited_by_admin'] != true &&
+            record['created_by_admin'] != true) {
+          // Saida que o gestor lancou, corrigiu ou conferiu ja foi olhada.
           add(PunchIssueKind.longShift, entryAt,
               'Jornada de ${_span(span)}: entrada ${_dayHour.format(entryAt)}, '
-              'saída ${_dayHour.format(at)}. Deslocamento ou esqueceu a saída?');
+              'saída ${_dayHour.format(at)}. Deslocamento ou esqueceu a saída?',
+              record: record,
+              entry: entry,
+              notBefore: entryAt,
+              notAfter: nextEntryOrNow(at));
         }
         if (pause != null) {
           final pauseAt = _at(pause);
           if (pauseAt != null) {
             add(PunchIssueKind.autoBreakReturn, pauseAt,
                 'Pausa de ${_dayHour.format(pauseAt)} sem retorno até a saída '
-                '(${_hour.format(at)}).');
+                '(${_hour.format(at)}).',
+                entry: entry,
+                pause: pause,
+                notBefore: pauseAt,
+                notAfter: at);
           }
         }
         open = null;
@@ -191,7 +267,10 @@ List<PunchIssue> findPunchIssues(
             isLastDay
                 ? 'Turno aberto desde ${_dayHour.format(openAt)} (há '
                     '${_span(openFor)}): ainda trabalhando ou esqueceu a saída?'
-                : 'Entrada de ${_dayHour.format(openAt)} sem saída.');
+                : 'Entrada de ${_dayHour.format(openAt)} sem saída.',
+            entry: open,
+            notBefore: openAt,
+            notAfter: nextEntryOrNow(openAt));
       }
     }
   }
@@ -232,6 +311,18 @@ bool _realReturnFollows(
     if (next == type && !isAutomaticBreakEnd(ordered[j])) return true;
   }
   return false;
+}
+
+/// Hora do proximo ponto que fecha a pausa de [index] por fora: saida,
+/// entrada ou outro inicio de pausa. Null se nao houver no dia.
+DateTime? _nextMarkAfter(List<Map<String, dynamic>> ordered, int index) {
+  for (var j = index + 1; j < ordered.length; j++) {
+    final next = ordered[j]['record_type']?.toString();
+    if (next == 'check_in' || next == 'check_out' || _pauseStarts.contains(next)) {
+      return _at(ordered[j]);
+    }
+  }
+  return null;
 }
 
 /// Depois da saida em [index], antes de outra entrada, vem outra saida (o

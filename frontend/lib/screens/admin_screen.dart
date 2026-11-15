@@ -89,7 +89,7 @@ class _AdminScreenState extends State<AdminScreen> {
             const _UsersListTab(),
             TeamRecordsScreen(canEdit: _isAdmin),
             const PunchReviewScreen(),
-            const PunchPendingScreen(),
+            PunchPendingScreen(isAdmin: _isAdmin),
             _ScheduleApprovalsTab(isAdmin: _isAdmin),
             if (_isAdmin) const _ManualEntryTab(),
           ],
