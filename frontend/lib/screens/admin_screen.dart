@@ -11,6 +11,7 @@ import '../utils/cpf.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import 'daily_entries_admin_screen.dart';
+import 'punch_pending_screen.dart';
 import 'punch_review_screen.dart';
 import 'team_records_screen.dart';
 import '../widgets/content_width.dart';
@@ -54,7 +55,7 @@ class _AdminScreenState extends State<AdminScreen> {
     }
 
     return DefaultTabController(
-      length: _isAdmin ? 6 : 5,
+      length: _isAdmin ? 7 : 6,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('PAINEL DO GESTOR',
@@ -73,6 +74,8 @@ class _AdminScreenState extends State<AdminScreen> {
               const Tab(icon: Icon(Icons.list_alt), text: 'Registros'),
               const Tab(
                   icon: Icon(Icons.fact_check_outlined), text: 'Conferência'),
+              const Tab(
+                  icon: Icon(Icons.pending_actions), text: 'Pendências'),
               const Tab(icon: Icon(Icons.access_time), text: 'Liberações'),
               if (_isAdmin)
                 const Tab(
@@ -86,6 +89,7 @@ class _AdminScreenState extends State<AdminScreen> {
             const _UsersListTab(),
             TeamRecordsScreen(canEdit: _isAdmin),
             const PunchReviewScreen(),
+            const PunchPendingScreen(),
             _ScheduleApprovalsTab(isAdmin: _isAdmin),
             if (_isAdmin) const _ManualEntryTab(),
           ],

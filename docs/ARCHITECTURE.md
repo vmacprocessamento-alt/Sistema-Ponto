@@ -132,6 +132,12 @@ de `firestore.rules`.
      Conferência. Ponto antigo, sem a ligação, segue a regra das 16h
      (`maxShiftSpan`): a folha de meses passados não muda. No lote, mais de 16h
      pede confirmação em vez de recusar.
+   - **Aba Pendências** (15/11/2026, `screens/punch_pending_screen.dart`, regras
+     em `utils/punch_issues.dart`): por pessoa, nos últimos 7, 15 ou 30 dias,
+     turno sem saída (inclusive de um dia para o outro), "Esqueci" sem o horário
+     real, pausa sem retorno, batida solta, jornada de mais de 16h e dia útil sem
+     nenhuma batida. Segue o agrupamento da folha; dia com o lote antigo do gestor
+     fica de fora; modo diária e gestor que não bate ponto não entram.
    - Limite que fica: sem internet não há relógio confiável. Adiantar a hora do
      celular, bater a saída offline e só sincronizar depois que a hora real
      passar não é provado pelo servidor; essa batida aparece na Conferência
