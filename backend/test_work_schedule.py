@@ -2128,6 +2128,39 @@ class PunchSecurityTest(unittest.TestCase):
                             latitude=None, longitude=None)
         self.assertEqual(self.stored(result["id"])["shift_entry_id"], "entrada1")
 
+    def test_queued_auto_return_of_a_closed_pause_does_not_block_the_queue(self):
+        # 15/11/2026: o job ja fechou a pausa; o retorno automatico que o app
+        # guardou sem internet chega depois e devolve o do job.
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=10))
+        self.add("pausa001", "break_start", now - timedelta(hours=5))
+        self.add("autoclose_pausa001", "break_end", now - timedelta(hours=4), auto_closed=True)
+        result = self.punch(record_type="break_end", kind="auto_break_close", ref_record_id="pausa001",
+                            offline=True, timestamp=self.wall(now - timedelta(hours=4)),
+                            latitude=None, longitude=None)
+        self.assertEqual((result["status"], result["id"]), ("created", "autoclose_pausa001"))
+        # Pausa fechada pelo retorno batido (sem automatico): nada a fazer.
+        self.db.store["time_records"].pop("autoclose_pausa001")
+        self.add("volta001", "break_end", now - timedelta(hours=4, minutes=30))
+        result = self.punch(record_type="break_end", kind="auto_break_close", ref_record_id="pausa001",
+                            offline=True, timestamp=self.wall(now - timedelta(hours=4)),
+                            latitude=None, longitude=None)
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(len(self.db.store["time_records"]), 3)
+
+    def test_queued_forgotten_exit_of_a_closed_shift_is_skipped(self):
+        now = self.utc_now()
+        self.add("entrada1", "check_in", now - timedelta(hours=10))
+        self.add("saida001", "check_out", now - timedelta(hours=2))
+        result = self.punch(record_type="check_out", kind="forgotten_exit", ref_record_id="entrada1",
+                            offline=True, latitude=None, longitude=None)
+        self.assertEqual(result["status"], "skipped")
+        # Na hora (online) segue o aviso de antes.
+        with self.assertRaises(main.HTTPException) as ctx:
+            self.punch(record_type="check_out", kind="forgotten_exit", ref_record_id="entrada1",
+                       latitude=None, longitude=None)
+        self.assertEqual(ctx.exception.status_code, 409)
+
     def test_offline_punch_in_the_future_is_refused(self):
         now = self.utc_now()
         self.refused(self.offline, now + timedelta(minutes=10), server_anchor=now - timedelta(hours=1))

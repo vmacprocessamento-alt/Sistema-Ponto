@@ -113,6 +113,22 @@ void main() {
     expect(found.single.text, startsWith('Jornada de 20h00'));
   });
 
+  test('jornada de mais de 24h aparece mesmo corrigida pelo gestor', () {
+    // Data trocada na correcao: 09/11 08:00 ate 10/11 16:30 (32h30).
+    final found = issues([
+      _p('in', 'check_in', '2026-11-09T08:00:00'),
+      _p('forgot_in', 'check_out', '2026-11-10T16:30:00', {'edited_by_admin': true}),
+    ]);
+    expect(_kinds(found), [PunchIssueKind.longShift]);
+    // Ate 24h, a correcao do gestor ja foi olhada.
+    expect(
+        issues([
+          _p('in', 'check_in', '2026-11-09T08:00:00'),
+          _p('forgot_in', 'check_out', '2026-11-10T07:00:00', {'edited_by_admin': true}),
+        ]),
+        isEmpty);
+  });
+
   test('saida sem entrada e solta', () {
     expect(_kinds(issues([_p('o', 'check_out', '2026-11-12T17:00:00')])),
         [PunchIssueKind.loosePunch]);

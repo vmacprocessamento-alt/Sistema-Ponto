@@ -962,4 +962,32 @@ void main() {
     ]);
     expect(old['2026-11-03']!['total_hours'], 0);
   });
+
+  test('saida corrigida pelo gestor fecha o turno aberto mesmo apos 16h', () {
+    // 15/11/2026, Crysnamurt: entrada 14/11 10:04, pausa 17:12 com retorno
+    // automatico 18:12 e a saida 15/11 07:00 corrigida pelo admin.
+    final records = [
+      _punch('in', 'check_in', '2026-11-14T10:04:12'),
+      _punch('p1', 'break_start', '2026-11-14T17:12:51'),
+      {
+        ..._punch('autoclose_p1', 'break_end', '2026-11-14T18:12:51'),
+        'auto_closed': true,
+      },
+      {
+        ..._punch('out', 'check_out', '2026-11-15T07:00:00'),
+        'edited_by_admin': true,
+      },
+    ];
+    final days = _workDays(records);
+    expect(days.keys, ['2026-11-14']);
+    // 10:00 ate 07:00 (21h) menos a pausa (jantar) e o almoco automatico.
+    expect(days['2026-11-14']!['total_hours'], 19.0);
+    // A saida lancada no lote novo (Pendencias) tambem fecha.
+    final batch = _workDays([
+      records.first,
+      _batch('out2', 'check_out', '2026-11-15T07:00:00.000'),
+    ]);
+    // Sem pausa batida: almoco e jantar automaticos.
+    expect(batch['2026-11-14']!['total_hours'], 19.0);
+  });
 }

@@ -22,10 +22,18 @@ const Duration maxShiftSpan = Duration(hours: 16);
 /// shift_entry_id em toda batida feita com turno aberto (09/11/2026), e o lote
 /// do gestor tambem; a saida do "Esqueci" tem o id forgot_<entrada> (o gestor
 /// corrige o horario nela).
+///
+/// O ponto que o gestor lancou (lote novo, Pendencias) ou corrigiu com o turno
+/// aberto tambem e dele: e decisao do gestor (15/11/2026). A saida 07:00 do dia
+/// seguinte, corrigida para fechar o turno das 10:04 que ficou aberto, caia
+/// solta pela regra das 16h e o dia ficava sem horas.
 bool belongsToShift(Map<dynamic, dynamic> record, String? entryId) {
   if (entryId == null || entryId.isEmpty) return false;
   return record['shift_entry_id']?.toString() == entryId ||
-      record['id']?.toString() == 'forgot_$entryId';
+      record['id']?.toString() == 'forgot_$entryId' ||
+      record['edited_by_admin'] == true ||
+      (record['created_by_admin'] == true &&
+          record[batchRealDatesField] == true);
 }
 
 /// Intervalo entre dois turnos que conta como refeicao: ate 2h, o maximo do

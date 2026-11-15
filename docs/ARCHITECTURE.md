@@ -144,6 +144,15 @@ de `firestore.rules`.
      solta e "Editar saída/entrada" da jornada longa (só admin, com motivo e
      auditoria); "Está certo" na pausa sem retorno e na jornada longa marca o
      ponto como conferido.
+   - **Fila que não trava** (15/11/2026): o retorno automático da pausa que o
+     app guardou sem internet, e a saída do "Esqueci" da fila, quando chegam com
+     a pausa ou o turno já fechados (pelo job, pela pessoa ou pelo gestor),
+     voltam `status: skipped` em vez de recusa: antes a recusa segurava na fila
+     as batidas de verdade que vinham depois.
+   - **Ponto do gestor fecha o turno aberto** (15/11/2026): o que o gestor lançou
+     (lote novo, Pendências) ou corrigiu com o turno aberto é do turno mesmo
+     passando de 16h (`belongsToShift`). Na aba Pendências, jornada de mais de
+     24h aparece mesmo corrigida pelo gestor (data trocada?).
    - Limite que fica: sem internet não há relógio confiável. Adiantar a hora do
      celular, bater a saída offline e só sincronizar depois que a hora real
      passar não é provado pelo servidor; essa batida aparece na Conferência

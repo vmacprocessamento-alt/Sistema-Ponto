@@ -3724,17 +3724,27 @@ def time_record_punch_endpoint(
     server_now = datetime.now(store_zone)
 
     if payload.kind == "auto_break_close":
+        # FILA TRAVADA (15/11/2026). Sem internet o app grava o proprio retorno
+        # automatico da pausa; quando ele chega, o job do servidor ja fechou a
+        # pausa (ou a pessoa voltou, ou o gestor corrigiu). O servidor recusava
+        # ("A pausa ja foi encerrada") e a recusa segurava na fila as batidas de
+        # verdade que vinham depois. O retorno automatico do app so serve com a
+        # pausa ainda aberta e vencida; fora disso nao ha o que fazer, e a fila
+        # segue (status "skipped").
         break_id = (payload.ref_record_id or "").strip()
-        if not break_id or not records or records[-1].get("id") != break_id:
-            raise HTTPException(status_code=409, detail="A pausa ja foi encerrada.")
-        last = records[-1]
-        if last.get("record_type") not in _BREAK_CLOSE_TYPE:
-            raise HTTPException(status_code=409, detail="A pausa ja foi encerrada.")
+        if break_id and _CLIENT_RECORD_ID_RE.fullmatch(break_id):
+            done = existing_or_none(f"autoclose_{break_id}")
+            if done:
+                return done
+        last = records[-1] if records else None
+        if (not break_id or last is None or last.get("id") != break_id
+                or last.get("record_type") not in _BREAK_CLOSE_TYPE):
+            return {"status": "skipped", "detail": "A pausa ja foi encerrada."}
         started = _to_local_naive(str(last.get("timestamp")))
         # A pausa se mede no fuso em que foi batida.
         wall_now = _record_wall_now(last, server_now.replace(tzinfo=None))
         if started is None or wall_now - started < _AUTO_CLOSE_AFTER:
-            raise HTTPException(status_code=409, detail="A pausa ainda nao passou de 3 horas.")
+            return {"status": "skipped", "detail": "A pausa ainda nao passou de 3 horas."}
         doc_id = f"autoclose_{break_id}"
         # Mesmo id do job do backend que fecha pausas: os dois gravam o mesmo ponto.
         return existing_or_none(doc_id) or _save_punch(db, doc_id, {
@@ -3760,6 +3770,10 @@ def time_record_punch_endpoint(
                 return done
         open_shift = _open_shift_start(records)
         if open_shift is None:
+            # Da fila offline: o turno ja foi fechado (em outro aparelho, pelo
+            # gestor). Nada a fazer, e a recusa nao segura as outras batidas.
+            if payload.offline:
+                return {"status": "skipped", "detail": "Nao existe turno aberto."}
             raise HTTPException(status_code=409, detail="Nao existe turno aberto.")
         doc_id, record = _forgotten_exit(user_id, open_shift, payload.location, payload.notes)
         return existing_or_none(doc_id) or _save_punch(db, doc_id, record)

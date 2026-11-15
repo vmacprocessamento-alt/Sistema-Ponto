@@ -229,9 +229,11 @@ List<PunchIssue> findPunchIssues(
           }
         } else if (span > maxShiftSpan &&
             record['reviewed_at'] == null &&
-            record['edited_by_admin'] != true &&
-            record['created_by_admin'] != true) {
-          // Saida que o gestor lancou, corrigiu ou conferiu ja foi olhada.
+            (span > const Duration(hours: 24) ||
+                (record['edited_by_admin'] != true &&
+                    record['created_by_admin'] != true))) {
+          // Saida que o gestor lancou, corrigiu ou conferiu ja foi olhada; a
+          // de mais de 24h aparece mesmo assim (data trocada na correcao?).
           add(PunchIssueKind.longShift, entryAt,
               'Jornada de ${_span(span)}: entrada ${_dayHour.format(entryAt)}, '
               'saída ${_dayHour.format(at)}. Deslocamento ou esqueceu a saída?',
