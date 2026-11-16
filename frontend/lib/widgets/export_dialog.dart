@@ -2,6 +2,16 @@ import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/export_service.dart';
 
+/// A folha de [data] (exportTimesheet ou a do modo diaria) tem o que mostrar?
+/// No lote fica de fora quem nao bateu ponto no periodo (16/11/2026): o admin
+/// que nao bate ponto saia com uma folha em branco no meio das outras. Quem
+/// esta no modo diaria conta pelas diarias.
+bool timesheetHasContent(Map<String, dynamic> data) {
+  final key = data['daily_mode'] == true ? 'daily_dates' : 'daily_records';
+  final items = data[key];
+  return items is List && items.isNotEmpty;
+}
+
 class ExportDialog extends StatefulWidget {
   final Map<String, dynamic>? initialUser;
   final bool isScratch;
@@ -118,6 +128,8 @@ class _ExportDialogState extends State<ExportDialog> {
     }
 
     setState(() => _isProcessing = true);
+    // Quem ficou fora do lote por nao ter ponto no periodo (aviso no fim).
+    final leftOut = <String>[];
     try {
       // Quando ha periodo, o mes/ano de referencia (nome do arquivo) e o do FIM.
       final DateTime refDate = usePeriod ? _periodEnd! : _selectedDate;
@@ -175,6 +187,10 @@ class _ExportDialogState extends State<ExportDialog> {
                 ? await _dailyModeExport(user, start, end)
                 : await _apiService.exportTimesheet(
                     startDate: start, endDate: end, userId: user['id']);
+            if (!timesheetHasContent(data)) {
+              leftOut.add(user['name']?.toString() ?? 'Sem nome');
+              continue;
+            }
             reports.add({
               ...data,
               'custom_role': _exportJobTitle(user),
@@ -186,6 +202,11 @@ class _ExportDialogState extends State<ExportDialog> {
               'period_start': periodStart,
               'period_end': periodEnd,
             });
+          }
+          if (reports.isEmpty) {
+            _showError('Ninguém bateu ponto no período: nenhuma folha para '
+                'gerar.');
+            return;
           }
           if (widget.htmlOnly) {
             await _exportService.exportBatchToHtml(
@@ -227,8 +248,11 @@ class _ExportDialogState extends State<ExportDialog> {
 
       if (mounted) {
         Navigator.pop(context);
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Exportação concluída!'),
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(leftOut.isEmpty
+                ? 'Exportação concluída!'
+                : 'Exportação concluída! Sem ponto no período (fora do lote): '
+                    '${leftOut.join(', ')}.'),
             backgroundColor: Colors.green));
       }
     } catch (e) {
