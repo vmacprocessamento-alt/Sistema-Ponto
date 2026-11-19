@@ -17,6 +17,7 @@ import '../utils/work_schedule_rules.dart' show isInternProfile;
 import '../utils/chat_timestamp.dart';
 import '../utils/cpf.dart';
 import '../utils/daily_entries.dart';
+import '../utils/login_reason.dart';
 import '../utils/shift_records.dart';
 import '../utils/timesheet.dart';
 import '../utils/time_zone.dart';
@@ -834,7 +835,91 @@ class ApiService {
   Future<void> clearToken() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_cachedUserKey);
+    // A pessoa tocou em Sair: no proximo login nao conta como sessao perdida.
+    await prefs.setBool(_logoutByUserKey, true);
     await _auth.signOut();
+  }
+
+  static const String _logoutByUserKey = 'logout_by_user';
+
+  /// Por que o login apareceu neste navegador (utils/login_reason.dart).
+  Future<String> detectLoginReason() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return loginReasonFrom(
+        logoutByUser: prefs.getBool(_logoutByUserKey) == true,
+        cachedUser: prefs.getString(_cachedUserKey),
+        lastLogin: prefs.getString(_lastLoginKey),
+      );
+    } catch (_) {
+      return 'new_browser';
+    }
+  }
+
+  /// Conta ao servidor por que o login apareceu (aba Usuarios da Gestao).
+  /// Falha nao atrapalha o login.
+  Future<void> reportLoginContext({
+    required String reason,
+    required String device,
+    bool? storagePersisted,
+    String? appVersion,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_logoutByUserKey);
+      await _api
+          .post(
+            Uri.parse('$backendUrl/me/login-context'),
+            headers: {
+              ...await _authorizedHeaders(),
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'reason': reason,
+              'device': device,
+              'storage_persisted': storagePersisted,
+              'app_version': appVersion,
+            }),
+          )
+          .timeout(const Duration(seconds: 20));
+    } catch (e) {
+      debugPrint('Motivo do login nao informado: $e');
+    }
+  }
+
+  /// Pede ao gestor para voltar a senha para a padrao (quem entra pelo CPF
+  /// nao tem e-mail para o link). Devolve a mensagem para mostrar.
+  Future<String> requestPasswordHelp(String cpf) async {
+    final response = await _api
+        .post(
+          Uri.parse('$backendUrl/auth/password-help'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'cpf': cpfDigits(cpf)}),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    return (decoded is Map ? decoded['message']?.toString() : null) ??
+        'Pedido enviado ao gestor.';
+  }
+
+  /// Admin: volta a senha da pessoa para a padrao. Devolve a senha padrao.
+  Future<String> resetUserPassword(String userId) async {
+    final response = await _api
+        .post(
+          Uri.parse(
+              '$backendUrl/admin/users/${Uri.encodeComponent(userId)}/reset-password'),
+          headers: await _authorizedHeaders(),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(_apiError(response));
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    return (decoded is Map ? decoded['temporary_password']?.toString() : null) ??
+        legacyDefaultPassword;
   }
 
   /// Link de nova senha por CPF ou e-mail. Vai pelo backend: o

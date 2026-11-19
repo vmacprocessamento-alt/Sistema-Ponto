@@ -62,6 +62,27 @@ de `firestore.rules`.
    Fora do primeiro acesso, trocar a senha exige a senha atual
    (`current_password`).
 
+### Login perdido e senha esquecida (19/11/2026)
+Guilherme e Lilian (Android) caíram no login sem tocar em Sair e não lembravam
+a senha criada no primeiro acesso (o log mostrou 6-7 senhas erradas seguidas).
+- **Dados protegidos:** na abertura o app pede `navigator.storage.persist()`
+  (`services/storage_persistence*.dart`). Sem isso o Chrome do Android apaga os
+  dados do site com pouco espaço no celular: a sessão e a fila offline.
+- **Por que o login apareceu:** lido antes do login (`utils/login_reason.dart`):
+  `manual_logout` (Sair), `session_lost` (perfil guardado, sessão sumiu) ou
+  `new_browser` (nenhum dado do app). Depois do login vai para
+  `POST /api/me/login-context` com o aparelho e se os dados estão protegidos;
+  fica no cadastro (`last_login_reason`...) e em `login_events`.
+- **Login no cadastro:** o `/auth/cpf-login` anota `last_login_at` e as senhas
+  erradas (`login_failed_count`, `login_failed_at`, `login_failed_reason`). A
+  aba Usuários mostra.
+- **Pedir nova senha ao gestor:** depois de 2 senhas erradas (ou no "Esqueci a
+  senha"), `POST /api/auth/password-help` com o CPF avisa os admins
+  (notificação e push) e marca `password_help_requested_at`. Resposta igual com
+  ou sem cadastro; até 3 pedidos por hora por CPF.
+- **Voltar senha padrão com um toque:** em Usuários,
+  `POST /api/admin/users/{id}/reset-password` (só admin).
+
 ### Bater ponto
 1. Toque no botão: o GPS começa na hora, junto com a conferência dos pontos.
 2. Estagiário, entrada/saída: `POST /api/work-schedule/punch` (horário

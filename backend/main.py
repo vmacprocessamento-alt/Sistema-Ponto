@@ -4609,6 +4609,22 @@ class CpfLoginRequest(BaseModel):
     cpf: str
     password: str
 
+def _note_login(db, user_id: str, fields: dict) -> None:
+    """Anota no cadastro o ultimo login certo ou errado (19/11/2026), para a
+    aba Usuarios: o admin ve na hora que a pessoa errou a senha, sem abrir o
+    log do servidor. Falha ao gravar nao muda a resposta do login."""
+    try:
+        db.collection("users").document(user_id).update(fields)
+    except Exception as exc:  # pragma: no cover - log apenas
+        logger.warning("Nao foi possivel anotar o login de %s: %s", user_id, exc)
+
+def _failed_login_fields(digits: str, now: datetime, reason: str) -> dict:
+    return {
+        "login_failed_at": firestore.SERVER_TIMESTAMP,
+        "login_failed_reason": reason,
+        "login_failed_count": len(_recent_login_failures(f"cpf:{digits}", now)),
+    }
+
 @app.post("/auth/cpf-login")
 async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
     """Login por CPF: com a senha certa, devolve o e-mail da conta para o app
@@ -4639,16 +4655,88 @@ async def cpf_login_endpoint(payload: CpfLoginRequest, request: Request):
         _register_login_failure(keys, now)
         raise invalid
 
+    user_id = matches[0].id
     result = await _check_firebase_password(email, payload.password)
     if result == "disabled":
+        await asyncio.to_thread(_note_login, db, user_id, {
+            "login_failed_at": firestore.SERVER_TIMESTAMP,
+            "login_failed_reason": "conta desativada",
+        })
         raise HTTPException(status_code=403, detail="Esta conta foi desativada.")
     if result == "throttled":
+        await asyncio.to_thread(_note_login, db, user_id, {
+            "login_failed_at": firestore.SERVER_TIMESTAMP,
+            "login_failed_reason": "muitas tentativas (bloqueio do Google)",
+        })
         raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde um pouco e tente de novo.")
     if result != "ok":
         _register_login_failure(keys, now)
+        await asyncio.to_thread(_note_login, db, user_id, _failed_login_fields(digits, now, "senha incorreta"))
         raise invalid
     _login_failures.pop(f"cpf:{digits}", None)
+    await asyncio.to_thread(_note_login, db, user_id, {
+        "last_login_at": firestore.SERVER_TIMESTAMP,
+        "login_failed_count": 0,
+    })
     return {"email": email}
+
+class PasswordHelpRequest(BaseModel):
+    cpf: str
+
+# Pedidos de nova senha por CPF e por IP (memoria; reinicia com o servidor).
+_password_help_requests: Dict[str, List[datetime]] = {}
+_PASSWORD_HELP_WINDOW = timedelta(hours=1)
+_PASSWORD_HELP_MAX = {"cpf": 3, "ip": 10}
+# Mesma resposta com ou sem cadastro, para nao revelar quem tem conta.
+_PASSWORD_HELP_REPLY = {
+    "status": "ok",
+    "message": "Pedido enviado ao gestor. Quando ele voltar sua senha para a "
+               "padrão, entre com ela e crie uma nova.",
+}
+
+def _password_help_allowed(keys: List[str], now: datetime) -> bool:
+    for key in keys:
+        recent = [at for at in _password_help_requests.get(key, []) if now - at < _PASSWORD_HELP_WINDOW]
+        _password_help_requests[key] = recent
+        if len(recent) >= _PASSWORD_HELP_MAX[key.split(":", 1)[0]]:
+            return False
+    for key in keys:
+        _password_help_requests[key].append(now)
+    return True
+
+@app.post("/auth/password-help")
+def password_help_endpoint(payload: PasswordHelpRequest, request: Request):
+    """PEDIR NOVA SENHA AO GESTOR (19/11/2026). Quem entra pelo CPF nao tem
+    e-mail para o link de nova senha, e quem esqueceu a senha mandava mensagem
+    para o gestor, que procurava o cadastro. Daqui o pedido vira notificacao
+    (e push) para os admins, e o cadastro fica marcado em Usuarios com o botao
+    "Voltar senha padrao"."""
+    digits = cpf_digits(payload.cpf)
+    if len(digits) != 11:
+        raise HTTPException(status_code=400, detail="Informe o CPF completo.")
+    now = _local_now()
+    if not _password_help_allowed([f"cpf:{digits}", f"ip:{_client_ip(request)}"], now):
+        return _PASSWORD_HELP_REPLY
+    db = get_firestore_admin()
+    matches = _users_with_cpf(db, digits, False)
+    if len(matches) != 1:
+        return _PASSWORD_HELP_REPLY
+    target = matches[0]
+    data = target.to_dict() or {}
+    if data.get("disabled"):
+        return _PASSWORD_HELP_REPLY
+    name = (data.get("name") or "Alguém").strip()
+    db.collection("users").document(target.id).update({
+        "password_help_requested_at": firestore.SERVER_TIMESTAMP,
+    })
+    title = "Pedido de nova senha"
+    body = f"{name} não consegue entrar e pediu para voltar à senha padrão (Gestão > Usuários)."
+    for admin_doc in db.collection("users").where("role", "==", "admin").stream():
+        if admin_doc.id == target.id:
+            continue
+        _create_user_notification(db, admin_doc.id, title, body, "password_help", target.id)
+        _send_user_push(admin_doc.id, title, body, {"type": "password_help", "user_id": target.id})
+    return _PASSWORD_HELP_REPLY
 
 class PasswordResetRequest(BaseModel):
     login: str
@@ -4915,6 +5003,87 @@ async def report_app_version_endpoint(
     })
     return {"status": "success"}
 
+
+@app.post("/admin/users/{user_id}/reset-password")
+def reset_user_password_endpoint(
+    user_id: str,
+    admin=Depends(require_admin_user),
+):
+    """Volta a senha da pessoa para a padrao (19/11/2026), com um toque em
+    Usuarios: ela entra com a padrao e cria uma nova (must_change_password).
+    Tira o aviso de pedido de nova senha."""
+    if admin.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode voltar a senha padrao.")
+    db = get_firestore_admin()
+    ref = db.collection("users").document(user_id.strip())
+    if not user_id.strip() or not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado.")
+    temporary_password = _temporary_password()
+    try:
+        firebase_auth.update_user(ref.id, password=temporary_password)
+    except firebase_auth.UserNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Conta nao encontrada no Firebase Authentication.") from exc
+    ref.update({
+        "must_change_password": True,
+        "password_help_requested_at": None,
+        "login_failed_count": 0,
+    })
+    _forget_user_tokens(ref.id)
+    db.collection("system_audits").document().set({
+        "action": "reset_password_admin",
+        "target_user_id": ref.id,
+        "admin_id": admin["id"],
+        "admin_name": admin.get("name", ""),
+        "admin_email": admin.get("email", ""),
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "success", "id": ref.id, "temporary_password": temporary_password}
+
+class LoginContextReport(BaseModel):
+    # manual_logout: a pessoa tocou em Sair; session_lost: estava logada neste
+    # navegador e o app abriu no login; new_browser: navegador sem nenhum dado
+    # do app (dados apagados, outro navegador ou primeiro acesso nele).
+    reason: str
+    device: Optional[str] = None
+    standalone: Optional[bool] = None
+    storage_persisted: Optional[bool] = None
+    app_version: Optional[str] = None
+
+_LOGIN_CONTEXT_REASONS = {"manual_logout", "session_lost", "new_browser"}
+
+@app.post("/me/login-context")
+def report_login_context_endpoint(
+    payload: LoginContextReport,
+    user=Depends(require_user_pending_password_change),
+):
+    """SESSAO PERDIDA (19/11/2026). Guilherme e Lilian (Android) foram parar no
+    login sem tocar em Sair e nao lembravam a senha. O app conta, no login, por
+    que ele apareceu, com o aparelho, se e o app instalado e se o navegador
+    guarda os dados de forma permanente. Fica no cadastro (aba Usuarios) e em
+    login_events, para achar o padrao."""
+    reason = (payload.reason or "").strip()
+    if reason not in _LOGIN_CONTEXT_REASONS:
+        raise HTTPException(status_code=400, detail="Motivo invalido.")
+    device = " ".join((payload.device or "").split())[:60]
+    version = (payload.app_version or "").strip()
+    version = version if _APP_VERSION_RE.match(version) else ""
+    fields = {
+        "last_login_reason": reason,
+        "last_login_device": device,
+        "last_login_standalone": payload.standalone,
+        "last_login_storage_persisted": payload.storage_persisted,
+    }
+    db = get_firestore_admin()
+    db.collection("users").document(user["id"]).update(fields)
+    db.collection("login_events").document().set({
+        "user_id": user["id"],
+        "user_name": user.get("name", ""),
+        **fields,
+        "app_version": version,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "created_at_local": _local_now().isoformat(),
+    })
+    return {"status": "success"}
 
 @app.put("/admin/users/{user_id}")
 def update_user_admin_endpoint(

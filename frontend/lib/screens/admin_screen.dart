@@ -206,6 +206,86 @@ class _UsersListTabState extends State<_UsersListTab> {
     return parts.join(' · ');
   }
 
+  static DateTime? _asDate(Object? value) {
+    if (value is Timestamp) return value.toDate();
+    if (value is DateTime) return value;
+    return DateTime.tryParse(value?.toString() ?? '');
+  }
+
+  /// Ultimo login e por que o login apareceu (19/11/2026): quem caiu no login
+  /// sem tocar em Sair, e se o navegador protege os dados do app.
+  String? _loginLine(dynamic user) {
+    final parts = <String>[];
+    final last = _asDate(user['last_login_at']);
+    if (last != null) {
+      parts.add('Último login ${DateFormat('dd/MM HH:mm').format(last)}');
+    }
+    final reason = switch (user['last_login_reason']) {
+      'session_lost' => 'caiu no login sem tocar em Sair',
+      'manual_logout' => 'tinha saído pelo Sair',
+      'new_browser' => 'navegador sem dados do app',
+      _ => null,
+    };
+    if (reason != null) parts.add(reason);
+    if (user['last_login_storage_persisted'] == false) {
+      parts.add('dados do app sem proteção');
+    }
+    return parts.isEmpty ? null : parts.join(' · ');
+  }
+
+  /// Senhas erradas desde o ultimo login certo.
+  String? _loginFailureLine(dynamic user) {
+    final count = user['login_failed_count'];
+    if (count is! num || count <= 0) return null;
+    final at = _asDate(user['login_failed_at']);
+    final reason = user['login_failed_reason']?.toString() ?? 'senha incorreta';
+    final when = at == null ? '' : ' (${DateFormat('dd/MM HH:mm').format(at)})';
+    return reason == 'senha incorreta'
+        ? 'Errou a senha ${count.toInt()} ${count == 1 ? 'vez' : 'vezes'}$when'
+        : 'Login recusado: $reason$when';
+  }
+
+  Future<void> _resetPassword(dynamic user) async {
+    final name = user['name']?.toString() ?? '';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Voltar senha padrão'),
+        content: Text('A senha de $name volta para a padrão. A pessoa entra '
+            'com o CPF e a senha padrão e cria uma nova. Se estiver logada em '
+            'algum aparelho, precisa entrar de novo.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            style: ElevatedButton.styleFrom(backgroundColor: wineColor),
+            child: const Text('Voltar senha padrão',
+                style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final password =
+          await _apiService.resetUserPassword(user['id'].toString());
+      messenger.showSnackBar(SnackBar(
+        content: Text('Senha de $name voltou para a padrão ($password). Avise '
+            'a pessoa: ela entra com o CPF e essa senha e cria uma nova.'),
+        backgroundColor: Colors.green,
+        duration: const Duration(seconds: 10),
+      ));
+      await _fetchUsers(forceRefresh: true);
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(
+          content: Text('Não foi possível: $e'), backgroundColor: wineColor));
+    }
+  }
+
   /// Topo da lista: quantas pessoas ativas estao com o app desatualizado.
   /// Some num build de teste (sem numero de versao para comparar).
   Widget? _appVersionSummary() {
@@ -288,6 +368,9 @@ class _UsersListTabState extends State<_UsersListTab> {
             final firstAccess = user['must_change_password'] == true
                 ? ' • Aguardando primeiro acesso'
                 : '';
+            final loginLine = _loginLine(user);
+            final failureLine = _loginFailureLine(user);
+            final helpAt = _asDate(user['password_help_requested_at']);
 
             return Container(
               decoration: BoxDecoration(
@@ -323,6 +406,40 @@ class _UsersListTabState extends State<_UsersListTab> {
                         fontWeight: appOutdated ? FontWeight.w600 : null,
                       ),
                     ),
+                    if (loginLine != null)
+                      Text(loginLine,
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.grey)),
+                    if (failureLine != null)
+                      Text(failureLine,
+                          style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.orange.shade800,
+                              fontWeight: FontWeight.w600)),
+                    if (helpAt != null)
+                      Text(
+                          'Pediu nova senha em '
+                          '${DateFormat('dd/MM HH:mm').format(helpAt)}',
+                          style: const TextStyle(
+                              fontSize: 12,
+                              color: wineColor,
+                              fontWeight: FontWeight.bold)),
+                    if (_isAdmin &&
+                        (helpAt != null ||
+                            ((user['login_failed_count'] as num?) ?? 0) >= 2))
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          onPressed: () => _resetPassword(user),
+                          style: TextButton.styleFrom(
+                            foregroundColor: wineColor,
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                          ),
+                          icon: const Icon(Icons.lock_reset, size: 18),
+                          label: const Text('Voltar senha padrão'),
+                        ),
+                      ),
                   ],
                 ),
                 trailing: Row(

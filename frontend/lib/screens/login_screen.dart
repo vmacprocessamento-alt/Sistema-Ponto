@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/app_version.dart';
+import '../services/device_info.dart';
+import '../services/storage_state.dart';
 import '../utils/cpf.dart';
 import 'main_screen.dart';
 
@@ -21,11 +23,48 @@ class _LoginScreenState extends State<LoginScreen> {
   // O acesso e pelo CPF. O e-mail fica de reserva: conta antiga sem CPF no
   // cadastro (ex.: admin) ou backend fora do ar (o login por CPF passa por ele).
   bool _useEmail = false;
+  // Senhas erradas nesta tela: a partir da 2a, o aviso oferece pedir nova
+  // senha ao gestor (19/11/2026).
+  int _wrongPasswords = 0;
+  // Por que o login apareceu (lido antes do login, que regrava o perfil).
+  late final Future<String> _loginReason;
 
   @override
   void initState() {
     super.initState();
+    _loginReason = _apiService.detectLoginReason();
     _fillLastLogin();
+  }
+
+  Future<void> _reportLoginContext() async {
+    await _apiService.reportLoginContext(
+      reason: await _loginReason,
+      device: currentDeviceLabel(),
+      storagePersisted: StorageState.persisted,
+      appVersion: reportedAppVersion,
+    );
+  }
+
+  /// Pede ao gestor para voltar a senha para a padrao (aviso no app dele).
+  Future<void> _askPasswordHelp(String cpf) async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (cpfDigits(cpf).length != 11) {
+      messenger.showSnackBar(const SnackBar(
+          content: Text('Informe o CPF completo.'),
+          backgroundColor: Colors.red));
+      return;
+    }
+    try {
+      final message = await _apiService.requestPasswordHelp(cpf);
+      messenger.showSnackBar(SnackBar(
+          content: Text(message),
+          backgroundColor: Colors.green,
+          duration: const Duration(seconds: 8)));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(
+          content: Text(e.toString().replaceFirst('Exception: ', '')),
+          backgroundColor: Colors.red));
+    }
   }
 
   // Abre com o ultimo CPF (ou e-mail) usado neste aparelho ja preenchido.
@@ -59,6 +98,7 @@ class _LoginScreenState extends State<LoginScreen> {
         _loginController.text,
         _passwordController.text,
       );
+      _reportLoginContext();
 
       if (mounted) {
         Navigator.of(context).pushReplacement(
@@ -67,14 +107,34 @@ class _LoginScreenState extends State<LoginScreen> {
       }
     } catch (e) {
       debugPrint('ERRO NO LOGIN: $e');
+      final message = e.toString().replaceAll('Exception:', '').trim();
+      final lower = message.toLowerCase();
+      if (lower.contains('incorret')) _wrongPasswords++;
+      final offerHelp = !_useEmail &&
+          (_wrongPasswords >= 2 || lower.contains('muitas tentativas'));
       if (mounted) {
+        final cpf = _loginController.text;
         showDialog(
           context: context,
-          builder: (context) => AlertDialog(
+          builder: (dialogContext) => AlertDialog(
             title: const Text('Falha no Acesso'),
-            content: Text(e.toString().replaceAll('Exception:', '').trim()),
+            content: Text(offerHelp
+                ? '$message\n\nEsqueceu a senha? Peça ao gestor para voltar '
+                    'sua senha para a padrão; ao entrar com ela, você cria '
+                    'uma nova.'
+                : message),
             actions: [
-              TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+              if (offerHelp)
+                TextButton(
+                  onPressed: () {
+                    Navigator.pop(dialogContext);
+                    _askPasswordHelp(cpf);
+                  },
+                  child: const Text('Pedir nova senha ao gestor'),
+                ),
+              TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('OK')),
             ],
           ),
         );
@@ -97,8 +157,9 @@ class _LoginScreenState extends State<LoginScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Fale com o administrador: ele volta a sua senha para a senha '
-                'padrão e, ao entrar, você cria uma nova.',
+                'Toque em "Pedir ao gestor": ele recebe o aviso no app e volta '
+                'a sua senha para a padrão. Ao entrar com ela, você cria uma '
+                'nova.',
               ),
               const SizedBox(height: 16),
               const Text(
@@ -122,6 +183,20 @@ class _LoginScreenState extends State<LoginScreen> {
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Fechar'),
+          ),
+          TextButton(
+            onPressed: () {
+              final value = emailController.text.trim();
+              if (value.contains('@') || cpfDigits(value).length != 11) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('Para pedir ao gestor, informe o CPF.'),
+                    backgroundColor: Colors.red));
+                return;
+              }
+              Navigator.pop(dialogContext);
+              _askPasswordHelp(value);
+            },
+            child: const Text('Pedir ao gestor'),
           ),
           ElevatedButton(
             onPressed: () async {

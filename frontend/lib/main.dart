@@ -13,6 +13,7 @@ import 'screens/login_screen.dart';
 import 'screens/main_screen.dart';
 import 'services/api_service.dart';
 import 'services/session_service.dart';
+import 'services/storage_state.dart';
 import 'services/theme_service.dart';
 import 'services/update_service.dart';
 import 'widgets/startup_loading.dart';
@@ -26,6 +27,9 @@ void main() {
     UpdateService.instance
       ..addBusyCheck(() => ApiService.offlineSyncRunning)
       ..start();
+    // Pede ao navegador para nao apagar os dados do app (sessao e fila
+    // offline) quando o celular fica com pouco espaco.
+    unawaited(StorageState.init());
   }
   runApp(const AppBootstrap());
 }

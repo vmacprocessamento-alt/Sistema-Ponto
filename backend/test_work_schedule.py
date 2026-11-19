@@ -1793,6 +1793,75 @@ class CpfAccessTest(unittest.TestCase):
         # Bloqueado mesmo com a senha certa, e de outro aparelho (por CPF).
         self.assertEqual(self.status_of(self.login, VALID_CPF, TEMP_PASSWORD, ip="9.9.9.9")[0], 429)
 
+    def test_login_outcome_is_noted_on_the_user(self):
+        # 19/11/2026: a aba Usuarios mostra a senha errada sem abrir o log.
+        uid = self.create()["id"]
+        for _ in range(2):
+            self.status_of(self.login, VALID_CPF, "errada")
+        profile = self.db.store["users"][uid]
+        self.assertEqual((profile["login_failed_reason"], profile["login_failed_count"]), ("senha incorreta", 2))
+        self.login(VALID_CPF, TEMP_PASSWORD)
+        profile = self.db.store["users"][uid]
+        self.assertEqual((profile["last_login_at"], profile["login_failed_count"]), ("ts", 0))
+        self.auth.accounts[uid]["disabled"] = True
+        self.status_of(self.login, VALID_CPF, TEMP_PASSWORD)
+        self.assertEqual(self.db.store["users"][uid]["login_failed_reason"], "conta desativada")
+
+    def help(self, cpf, ip="1.2.3.4"):
+        request = types.SimpleNamespace(headers={"x-real-ip": ip}, client=None)
+        return main.password_help_endpoint(main.PasswordHelpRequest(cpf=cpf), request)
+
+    def test_password_help_notifies_admins_once_an_hour(self):
+        main._password_help_requests.clear()
+        self.addCleanup(main._password_help_requests.clear)
+        uid = self.create(name="Guilherme")["id"]
+        self.db.store["users"]["adm1"] = {"name": "Rodrigo", "role": "admin"}
+        self.db.store["users"]["ger1"] = {"name": "Gestor", "role": "manager"}
+        pushes = []
+        with mock.patch.object(main, "_send_user_push", lambda uid_, *args, **kwargs: pushes.append(uid_)):
+            reply = self.help("529.982.247-25")
+            self.assertEqual(reply, main._PASSWORD_HELP_REPLY)
+            self.assertEqual(self.db.store["users"][uid]["password_help_requested_at"], "ts")
+            [note] = self.db.store["user_notifications"].values()
+            self.assertEqual((note["user_id"], note["type"], note["request_id"]), ("adm1", "password_help", uid))
+            self.assertIn("Guilherme", note["body"])
+            self.assertEqual(pushes, ["adm1"])
+            # CPF sem cadastro: mesma resposta, nada gravado.
+            self.assertEqual(self.help("11144477735"), main._PASSWORD_HELP_REPLY)
+            # Ate 3 pedidos por hora do mesmo CPF.
+            for _ in range(3):
+                self.help(VALID_CPF, ip="5.5.5.5")
+            self.assertEqual(len(self.db.store["user_notifications"]), 3)
+        with self.assertRaises(main.HTTPException):
+            self.help("123")
+
+    def test_admin_resets_password_with_one_tap(self):
+        uid = self.create()["id"]
+        self.db.store["users"][uid].update({"must_change_password": False, "password_help_requested_at": "ts"})
+        self.auth.accounts[uid]["password"] = "outra123"
+        result = main.reset_user_password_endpoint(uid, self.admin)
+        self.assertEqual(result["temporary_password"], TEMP_PASSWORD)
+        self.assertEqual(self.auth.accounts[uid]["password"], TEMP_PASSWORD)
+        profile = self.db.store["users"][uid]
+        self.assertTrue(profile["must_change_password"])
+        self.assertIsNone(profile["password_help_requested_at"])
+        manager = {"id": "g1", "role": "manager", "name": "Gestor"}
+        self.assertEqual(self.status_of(main.reset_user_password_endpoint, uid, manager)[0], 403)
+        self.assertEqual(self.status_of(main.reset_user_password_endpoint, "naoexiste", self.admin)[0], 404)
+
+    def test_login_context_is_stored(self):
+        uid = self.create()["id"]
+        user = {"id": uid, **self.db.store["users"][uid]}
+        payload = main.LoginContextReport(reason="session_lost", device="Android · Chrome", standalone=True,
+                                          storage_persisted=False, app_version="0.12")
+        main.report_login_context_endpoint(payload, user)
+        profile = self.db.store["users"][uid]
+        self.assertEqual((profile["last_login_reason"], profile["last_login_storage_persisted"]), ("session_lost", False))
+        [event] = self.db.store["login_events"].values()
+        self.assertEqual((event["user_id"], event["app_version"]), (uid, "0.12"))
+        bad = main.LoginContextReport(reason="qualquer")
+        self.assertEqual(self.status_of(main.report_login_context_endpoint, bad, user)[0], 400)
+
     def change(self, user, password, current=None):
         payload = main.OwnPasswordChangeRequest(new_password=password, current_password=current)
         return _call(main.change_own_password_endpoint(payload, user))
